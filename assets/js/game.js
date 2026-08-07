@@ -188,7 +188,7 @@
     // The box score is the heaviest view; render it only when it can be seen.
     if (activeTab === 'boxscore') renderBoxscore();
     if (activeTab === 'plays') renderPlays();
-    if (activeTab === 'props' && window.Props) window.Props.render($('#props-wrap'), gd());
+    if (activeTab === 'props' && window.Props) window.Props.render($('#props-wrap'), feed);
     renderStatusLine();
   }
 
@@ -352,6 +352,12 @@
       row.appendChild(info);
       atBat.appendChild(row);
 
+      // A compact version of the two-sided model is visible without opening
+      // the Props tab. It remains a pre-plate-appearance forecast, so the
+      // current count never changes the estimate mid-at-bat.
+      const forecast = liveHitForecast(matchup);
+      if (forecast) atBat.appendChild(forecast);
+
       /* count + outs */
       const countWrap = UI.el('div', 'count-wrap');
       countWrap.appendChild(UI.countDots(count.balls, count.strikes, count.outs));
@@ -461,6 +467,67 @@
         `${ls.teams.home.hits} hits, ${ls.teams.home.errors} errors`));
     }
     return wrap;
+  }
+
+  /* --------------------------------------- compact live two-sided forecast */
+
+  function gameSeason() {
+    const season = gd().game && gd().game.season;
+    return /^\d{4}$/.test(String(season || '')) ? String(season) : null;
+  }
+
+  /**
+   * Put the model where fans need it most: directly below the active batter.
+   * The element is intentionally local to the render, so a delayed response
+   * from an older at-bat cannot overwrite a newer matchup after a poll.
+   */
+  function liveHitForecast(matchup) {
+    const batter = matchup && matchup.batter;
+    const pitcher = matchup && matchup.pitcher;
+    if (!batter || !batter.id || !pitcher || !pitcher.id ||
+        !window.Props || !window.Props.getHitPrediction) return null;
+
+    const bHand = matchup.batSide && matchup.batSide.code;
+    const pHand = matchup.pitchHand && matchup.pitchHand.code;
+    const key = `${batter.id}:${pitcher.id}:${bHand || ''}:${pHand || ''}`;
+    const forecast = UI.el('div', 'live-hit-forecast loading', '', {
+      'aria-live': 'polite',
+      'data-matchup-key': key,
+    });
+    forecast.appendChild(UI.el('span', 'live-hit-label', 'Two-sided hit forecast'));
+    forecast.appendChild(UI.el('span', 'live-hit-value', 'Loading…'));
+
+    window.Props.getHitPrediction(batter.id, pitcher.id, bHand, pHand, gameSeason())
+      .then((model) => {
+        if (!forecast.isConnected || forecast.dataset.matchupKey !== key) return;
+        forecast.replaceChildren();
+        forecast.classList.remove('loading');
+        forecast.classList.add(`model-${model.coverage}`);
+
+        const heading = UI.el('div', 'live-hit-heading');
+        heading.appendChild(UI.el('span', 'live-hit-label', 'Two-sided hit forecast'));
+        heading.appendChild(UI.el('strong', 'live-hit-value', `${model.prob}%`));
+        forecast.appendChild(heading);
+
+        const details = UI.el('div', 'live-hit-details');
+        const batterSignal = model.batter.available ? model.batter.rate.toFixed(3) : '—';
+        const pitcherSignal = model.pitcher.available ? model.pitcher.rate.toFixed(3) : '—';
+        details.appendChild(UI.el('span', '', `Batter ${batterSignal}`));
+        details.appendChild(UI.el('span', '', `Pitcher ${pitcherSignal}`));
+        details.appendChild(UI.el('span', '', `No hit ${model.noHitProb}%`));
+        forecast.appendChild(details);
+        forecast.appendChild(UI.el('div', 'live-hit-coverage', model.coverageLabel));
+        forecast.title = `Pre-plate-appearance forecast: ${window.Props.describeHitModel
+          ? window.Props.describeHitModel(model)
+          : model.coverageLabel}`;
+      })
+      .catch(() => {
+        if (!forecast.isConnected || forecast.dataset.matchupKey !== key) return;
+        forecast.classList.remove('loading');
+        forecast.replaceChildren(UI.el('span', 'live-hit-label', 'Hit forecast unavailable'));
+      });
+
+    return forecast;
   }
 
   /* -------------------------------------------------------------- linescore */
@@ -706,45 +773,64 @@
   }
 
   /**
-   * Compute and paint the pre-at-bat hit probability for each finished at-bat.
-   * Batters' statcast/season stats are fetched once and cached in Props, so
-   * re-renders (polling) resolve instantly from cache.
+   * Compute and paint the pre-at-bat hit forecast for each completed plate
+   * appearance. Both hitter and pitcher data are warmed once per game-season;
+   * cache hits make later polling renders effectively free.
    */
   async function enrichPlayHitProb(items) {
-    if (!items.length || !window.Props || !window.Props.fetchPlayerStats) return;
+    if (!items.length || !window.Props || !window.Props.fetchPlayerStats ||
+        !window.Props.getCachedPlayerStats || !window.Props.modelHitProbability) return;
 
-    const ids = [...new Set(
+    const batterIds = [...new Set(
       items.map((it) => it.play.matchup && it.play.matchup.batter && it.play.matchup.batter.id)
-            .filter(Boolean)
+        .filter(Boolean)
     )];
+    const pitcherIds = [...new Set(
+      items.map((it) => it.play.matchup && it.play.matchup.pitcher && it.play.matchup.pitcher.id)
+        .filter(Boolean)
+    )];
+    const season = gameSeason();
 
-    // Warm the cache (no-op for already-cached batters).
     try {
-      await Promise.all(ids.map((id) => window.Props.fetchPlayerStats(id)));
-    } catch (_) { /* ignore — individual failures are handled below */ }
+      await Promise.all([
+        ...batterIds.map((id) => window.Props.fetchPlayerStats(id, 'hitting', season)),
+        ...pitcherIds.map((id) => window.Props.fetchPlayerStats(id, 'pitching', season)),
+      ]);
+    } catch (_) { /* individual fetch failures fall back to the league baseline */ }
 
     items.forEach(({ play, chip, bHand, pHand }) => {
-      const id = play.matchup && play.matchup.batter && play.matchup.batter.id;
-      const data = id ? window.Props.getCachedPlayerStats(id) : null;
-      if (!data) {
-        chip.textContent = 'Hit —';
-        chip.classList.remove('loading');
-        chip.title = 'Hit probability unavailable (no stat data)';
-        return;
-      }
-      const stats = window.Props.parseStatcast(data);
-      const model = window.Props.modelHitProbability(stats, bHand, pHand);
+      // A new poll may have rebuilt the play list while requests were pending.
+      if (!chip.isConnected) return;
+
+      const matchup = play.matchup || {};
+      const batterId = matchup.batter && matchup.batter.id;
+      const pitcherId = matchup.pitcher && matchup.pitcher.id;
+      const batterData = batterId
+        ? window.Props.getCachedPlayerStats(batterId, 'hitting', season)
+        : null;
+      const pitcherData = pitcherId
+        ? window.Props.getCachedPlayerStats(pitcherId, 'pitching', season)
+        : null;
+      const batterStats = window.Props.parseBatterStats
+        ? window.Props.parseBatterStats(batterData)
+        : window.Props.parseStatcast(batterData);
+      const pitcherStats = window.Props.parsePitcherStats
+        ? window.Props.parsePitcherStats(pitcherData)
+        : null;
+      const model = window.Props.modelHitProbability(batterStats, pitcherStats, bHand, pHand);
       const gotHit = atBatWasHit(play);
 
-      chip.textContent = '';
+      chip.replaceChildren();
       chip.classList.remove('loading');
-      chip.classList.add(gotHit ? 'hit-yes' : 'hit-no');
+      chip.classList.add(gotHit ? 'hit-yes' : 'hit-no', `model-${model.coverage}`);
       chip.appendChild(UI.el('span', 'hp-label', 'Hit'));
       chip.appendChild(UI.el('span', 'hp-val', `${model.prob}%`));
       chip.appendChild(UI.el('span', 'hp-mark', gotHit ? '✓' : '✗'));
-      chip.title = `Implied hit probability before this at-bat: ${model.prob}% ` +
-        `(model: base ${model.baseBa} ${pHand && bHand ? `· ${bHand} vs ${pHand}` : ''} ` +
-        `± platoon ${model.platoonAdv}) · ${gotHit ? 'got the hit' : 'no hit'}`;
+      const modelDetail = window.Props.describeHitModel
+        ? window.Props.describeHitModel(model)
+        : model.coverageLabel;
+      chip.title = `Pre-at-bat hit forecast: ${model.prob}% · ${modelDetail} · ` +
+        (gotHit ? 'got the hit' : 'no hit');
     });
   }
 
@@ -798,14 +884,14 @@
       chips.appendChild(strip);
     }
 
-    /* pre-at-bat hit probability (finished at-bats that are real plate appearances) */
+    /* two-sided pre-at-bat forecast (completed plate appearances only) */
     if (window.Props && window.Props.modelHitProbability && probItems &&
         isFinishedAtBat(play) && pitches.length &&
         play.matchup && play.matchup.batter && play.matchup.batSide) {
-      const bHand = play.matchup.batSide.code || 'R';
-      const pHand = play.matchup.pitchHand ? play.matchup.pitchHand.code : 'R';
+      const bHand = play.matchup.batSide.code || '';
+      const pHand = play.matchup.pitchHand ? play.matchup.pitchHand.code : '';
       const chip = UI.el('span', 'chip-hitprob loading', 'Hit …');
-      chip.title = 'Pre-at-bat implied hit probability (model)';
+      chip.title = 'Loading two-sided pre-at-bat hit forecast';
       chips.appendChild(chip);
       probItems.push({ play, chip, bHand, pHand });
     }
@@ -904,7 +990,7 @@
     // Lazy rendering keeps live updates fast on the default play-by-play view.
     if (feed && tab === 'boxscore') renderBoxscore();
     if (feed && tab === 'plays') renderPlays();
-    if (feed && tab === 'props' && window.Props) window.Props.render($('#props-wrap'), gd());
+    if (feed && tab === 'props' && window.Props) window.Props.render($('#props-wrap'), feed);
   }
 
   /* ------------------------------------------------------------ status line */
