@@ -6,7 +6,7 @@ window.Props = (() => {
 
   async function fetchPlayerStats(playerId) {
     if (CACHE[playerId]) return CACHE[playerId];
-    
+
     const url = `https://statsapi.mlb.com/api/v1/people/${playerId}/stats?stats=statcast,expectedStatistics,season&group=hitting`;
     try {
       const res = await fetch(url);
@@ -15,18 +15,24 @@ window.Props = (() => {
       return data;
     } catch (e) {
       console.warn('Props: failed to fetch stats for', playerId);
+      CACHE[playerId] = null;
       return null;
     }
+  }
+
+  // Synchronous read of the per-player stats cache (null until fetched).
+  function getCachedPlayerStats(playerId) {
+    return CACHE[playerId] || null;
   }
 
   function getPitcherArsenal(allPlays, pitcherId) {
     const arsenal = {};
     let total = 0;
-    
+
     (allPlays || []).forEach(play => {
       const pId = play.matchup?.pitcher?.id;
       if (pId !== pitcherId) return;
-      
+
       (play.playEvents || []).forEach(event => {
         if (event.isPitch && event.details?.type?.code) {
           const type = event.details.type;
@@ -36,7 +42,7 @@ window.Props = (() => {
           }
           arsenal[code].count++;
           total++;
-          
+
           if (event.pitchData?.startSpeed) {
             arsenal[code].veloSum += event.pitchData.startSpeed;
             arsenal[code].veloCount++;
@@ -44,7 +50,7 @@ window.Props = (() => {
         }
       });
     });
-    
+
     const mix = [];
     for (const code in arsenal) {
       const a = arsenal[code];
@@ -55,7 +61,7 @@ window.Props = (() => {
         avgVelo: a.veloCount > 0 ? (a.veloSum / a.veloCount).toFixed(1) : '-'
       });
     }
-    
+
     mix.sort((a, b) => b.pct - a.pct);
     return { totalPitches: total, mix };
   }
@@ -63,7 +69,7 @@ window.Props = (() => {
   function parseStatcast(statsData) {
     const result = { xBA: '-', exitVelo: '-', hardHit: '-', launchAngle: '-', avg: '-', ops: '-' };
     if (!statsData || !statsData.stats) return result;
-    
+
     statsData.stats.forEach(group => {
       if (group.type?.displayName === 'expectedStatistics' && group.splits?.[0]?.stat) {
         result.xBA = group.splits[0].stat.estimatedBaUsingSpeedangle || result.xBA;
@@ -80,20 +86,45 @@ window.Props = (() => {
     return result;
   }
 
+  /**
+   * Implied pre-at-bat hit probability — the same model the Props tab uses,
+   * exposed so the play-by-play timeline can show the probability that was in
+   * effect for each finished at-bat (before the batter took the at-bat).
+   *
+   *   base  = xBA (Statcast expected BA) or season AVG, fallback 0.240
+   *   platoon: an opposite-handed batter gets a small edge
+   *
+   * Returns { prob, baseBa, platoonAdv } — prob is a string "NN.N".
+   */
+  function modelHitProbability(stats, bHand, pHand) {
+    const s = stats || {};
+    const baseBa = parseFloat(s.xBA) || parseFloat(s.avg) || 0.240;
+    const b = (bHand || 'R').toUpperCase();
+    const p = (pHand || 'R').toUpperCase();
+    const platoonAdv = (p !== b) ? 0.04 : -0.015;
+    let prob = (baseBa + platoonAdv) * 100;
+    prob = Math.max(0, Math.min(100, prob));
+    return {
+      prob: prob.toFixed(1),
+      baseBa: baseBa.toFixed(3),
+      platoonAdv: platoonAdv.toFixed(3),
+    };
+  }
+
   function render(container, gd) {
     if (!gd || !gd.liveData) return;
-    
+
     container.innerHTML = '<div class="props-loading">Loading matchup & statcast data...</div>';
 
     const live = gd.liveData;
     const offense = live.linescore?.offense || {};
     const defense = live.linescore?.defense || {};
-    
+
     const currentPitcher = defense.pitcher;
     const batter = offense.batter;
     const onDeck = offense.onDeck;
-    const inHole = offense.inHole;
-    
+    const inHole = offense.inTheHole;
+
     if (!currentPitcher || !batter) {
       container.innerHTML = '<div class="props-empty" style="padding:2rem;text-align:center;color:var(--c-text-muted);">No active matchup available.</div>';
       return;
@@ -107,7 +138,7 @@ window.Props = (() => {
       onDeck ? fetchPlayerStats(onDeck.id) : Promise.resolve(null),
       inHole ? fetchPlayerStats(inHole.id) : Promise.resolve(null)
     ]).then(([batterData, onDeckData, inHoleData]) => {
-      
+
       const bStats = parseStatcast(batterData);
       const odStats = parseStatcast(onDeckData);
       const ihStats = parseStatcast(inHoleData);
@@ -116,7 +147,7 @@ window.Props = (() => {
 
       const pSection = document.createElement('div');
       pSection.className = 'props-section pitcher-section';
-      
+
       const pTitle = document.createElement('h3');
       pTitle.className = 'props-heading';
       pTitle.textContent = `Current Pitcher: ${currentPitcher.fullName}`;
@@ -125,7 +156,7 @@ window.Props = (() => {
       if (arsenal.totalPitches > 0) {
         const pMix = document.createElement('div');
         pMix.className = 'arsenal-mix';
-        
+
         let mixHtml = `<div class="mix-meta">${arsenal.totalPitches} pitches thrown today</div>`;
         mixHtml += `<div class="mix-grid">`;
         arsenal.mix.forEach(m => {
@@ -148,7 +179,7 @@ window.Props = (() => {
 
       const bSection = document.createElement('div');
       bSection.className = 'props-section batters-section';
-      
+
       const bTitle = document.createElement('h3');
       bTitle.className = 'props-heading';
       bTitle.textContent = `Propabilities: Upcoming Batters vs ${currentPitcher.fullName}`;
@@ -156,18 +187,10 @@ window.Props = (() => {
 
       const renderBatterCard = (player, label, stats, pitcherHandCode) => {
         if (!player) return '';
-        
-        // Model formula: base hit probability derived from xBA or season AVG
-        let baseBa = parseFloat(stats.xBA) || parseFloat(stats.avg) || 0.240;
-        
-        // Estimate batter handedness from data or assume R
-        let bHand = player.batSide?.code || 'R';
-        let pHand = pitcherHandCode || 'R';
-        
-        // Platoon advantage: opposite handedness yields higher hit prob
-        let platoonAdv = (pHand !== bHand) ? 0.04 : -0.015;
-        let hitProb = ((baseBa + platoonAdv) * 100).toFixed(1);
-        
+
+        // Shared model: implied hit probability from xBA/AVG + platoon matchup.
+        const model = modelHitProbability(stats, player.batSide?.code, pitcherHandCode);
+
         return `
           <div class="batter-prop-card ${label === 'Current Batter' ? 'active-batter' : ''}">
             <div class="b-header">
@@ -185,9 +208,9 @@ window.Props = (() => {
             <div class="hit-prob">
               <span class="prob-label">Implied Hit Probability</span>
               <div class="prob-bar-container">
-                <div class="prob-bar" style="width: ${hitProb}%"></div>
+                <div class="prob-bar" style="width: ${model.prob}%"></div>
               </div>
-              <span class="prob-value">${hitProb}%</span>
+              <span class="prob-value">${model.prob}%</span>
             </div>
           </div>
         `;
@@ -208,5 +231,11 @@ window.Props = (() => {
     });
   }
 
-  return { render };
+  return {
+    render,
+    fetchPlayerStats,
+    getCachedPlayerStats,
+    parseStatcast,
+    modelHitProbability,
+  };
 })();

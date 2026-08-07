@@ -652,6 +652,44 @@ a:hover { text-decoration: underline; }
 }
 .chip-count { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
 
+/* pre-at-bat hit probability (finished at-bats) */
+.chip-hitprob {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-size: 11.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.chip-hitprob.loading { opacity: 0.6; }
+.chip-hitprob .hp-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.chip-hitprob .hp-val { font-weight: 800; }
+.chip-hitprob .hp-mark { font-size: 11px; line-height: 1; }
+.chip-hitprob.hit-yes {
+  color: #7dd3a0;
+  border-color: rgba(46, 160, 67, 0.45);
+  background: rgba(46, 160, 67, 0.12);
+}
+.chip-hitprob.hit-yes .hp-label { color: #7dd3a0; }
+.chip-hitprob.hit-no {
+  color: #ffa8a8;
+  border-color: rgba(224, 49, 49, 0.4);
+  background: rgba(224, 49, 49, 0.10);
+}
+.chip-hitprob.hit-no .hp-label { color: #ffa8a8; }
+
 .pitch-strip { display: inline-flex; gap: 3px; align-items: center; }
 .pitch-dot {
   width: 20px; height: 20px;
