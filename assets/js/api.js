@@ -29,14 +29,17 @@ const MLB = (() => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   /** Fetch JSON with a timeout + simple exponential retry. */
-  async function getJSON(url, { timeout = 15000, retries = 2 } = {}) {
+  async function getJSON(url, { timeout = 12000, retries = 2, signal, cache = 'no-store' } = {}) {
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       const ctrl = new AbortController();
+      const onAbort = () => ctrl.abort();
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
       const timer = setTimeout(() => ctrl.abort(), timeout);
       try {
         const res = await fetch(url, {
           signal: ctrl.signal,
+          cache,
           headers: { Accept: 'application/json' },
         });
         if (!res.ok) {
@@ -49,7 +52,10 @@ const MLB = (() => {
         lastErr = err;
       } finally {
         clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onAbort);
       }
+      // A caller cancellation is deliberate; don't retry or mask it.
+      if (signal && signal.aborted) throw lastErr;
       if (attempt < retries) await sleep(400 * (2 ** attempt));
     }
     throw lastErr;
@@ -64,10 +70,10 @@ const MLB = (() => {
    *   - linescore       : live inning / count / score for scoreboard cards
    *   - decisions       : W/L/S pitchers on finished games
    */
-  async function getSchedule(dateStr) {
+  async function getSchedule(dateStr, options = {}) {
     const url = `${V1}/schedule?sportId=${SPORT_ID}&date=${dateStr}` +
                 '&hydrate=probablePitcher,linescore,decisions';
-    const data = await getJSON(url);
+    const data = await getJSON(url, options);
     const dates = (data && data.dates) || [];
     return dates.length ? dates[0].games || [] : [];
   }
@@ -77,17 +83,17 @@ const MLB = (() => {
    * Tries v1.1 first (the version the schedule links to), falls back to v1,
    * then assembles a bundle from the older split endpoints.
    */
-  async function getLiveFeed(gamePk) {
+  async function getLiveFeed(gamePk, options = {}) {
     try {
-      return await getJSON(`${V11}/game/${gamePk}/feed/live`);
+      return await getJSON(`${V11}/game/${gamePk}/feed/live`, options);
     } catch (err1) {
       try {
-        return await getJSON(`${V1}/game/${gamePk}/feed/live`);
+        return await getJSON(`${V1}/game/${gamePk}/feed/live`, options);
       } catch (err2) {
         const [pbp, box, ls] = await Promise.all([
-          getJSON(`${V1}/game/${gamePk}/playByPlay`),
-          getJSON(`${V1}/game/${gamePk}/boxscore`),
-          getJSON(`${V1}/game/${gamePk}/linescore`),
+          getJSON(`${V1}/game/${gamePk}/playByPlay`, options),
+          getJSON(`${V1}/game/${gamePk}/boxscore`, options),
+          getJSON(`${V1}/game/${gamePk}/linescore`, options),
         ]);
         return {
           gamePk,

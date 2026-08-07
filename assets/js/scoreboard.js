@@ -4,12 +4,14 @@
 'use strict';
 
 (() => {
-  const POLL_MS = 30000; // quiet refresh of the scoreboard
+  const LIVE_POLL_MS = 10000;
+  const IDLE_POLL_MS = 60000;
 
   let dateStr = todayStr();
   let games = [];
   let filter = 'all';
   let pollTimer = null;
+  let requestInFlight = false;
 
   /* ------------------------------------------------------------------ state */
 
@@ -27,31 +29,61 @@
   /* ------------------------------------------------------------------ fetch */
 
   async function load() {
+    // Never let an older response overwrite a newly selected date.
+    if (requestInFlight) return;
+    const requestDate = dateStr;
+    requestInFlight = true;
     const listEl = $('#game-list');
     const banner = $('#banner');
     const statusLine = $('#status-line');
 
-    UI.clear(listEl).appendChild(spinner());
+    // Keep cards on screen during background refreshes; it is faster and avoids flicker.
+    if (!games.length) UI.clear(listEl).appendChild(spinner());
     UI.clear(banner);
-    statusLine.textContent = 'Loading…';
+    if (!games.length) statusLine.textContent = 'Loading…';
 
     try {
-      games = await MLB.getSchedule(dateStr);
+      const nextGames = await MLB.getSchedule(requestDate);
+      if (requestDate !== dateStr) return;
+      games = nextGames;
       render();
       statusLine.textContent =
         `${games.length} game${games.length === 1 ? '' : 's'} · ` +
         `${games.filter((g) => g.status.abstractGameState === 'Live').length} in progress · ` +
         `updated ${new Date().toLocaleTimeString()}`;
+      scheduleNext();
     } catch (err) {
+      if (requestDate !== dateStr) return;
       console.error(err);
-      UI.clear(listEl);
-      banner.appendChild(
-        UI.el('div', 'banner-error',
-          `Couldn't reach the MLB StatsAPI (${err.message || err}). ` +
-          'Check your connection and try again.'));
+      if (!games.length) UI.clear(listEl);
+      banner.appendChild(UI.el('div', 'banner-error',
+        `Couldn't reach the MLB StatsAPI (${err.message || err}). ` +
+        'Check your connection and try again.'));
       banner.appendChild(UI.el('button', 'btn', 'Retry', { onclick: 'Scoreboard.retry()' }));
-      statusLine.textContent = 'Load failed';
+      statusLine.textContent = 'Load failed — retrying soon';
+      scheduleNext(10000);
+    } finally {
+      requestInFlight = false;
+      // A date click during an in-flight request is served immediately afterward.
+      if (requestDate !== dateStr) load();
     }
+  }
+
+  function scheduleNext(overrideMs) {
+    clearTimeout(pollTimer);
+    const hasLiveGame = games.some((g) => g.status.abstractGameState === 'Live');
+    pollTimer = setTimeout(() => {
+      if (!document.hidden) load();
+      else scheduleNext();
+    }, overrideMs || (hasLiveGame ? LIVE_POLL_MS : IDLE_POLL_MS));
+  }
+
+  function updateDateLabel() {
+    const labelDate = new Date(`${dateStr}T12:00:00`);
+    $('#date-label').textContent = labelDate.toLocaleDateString([], {
+      weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
+    });
+    $('#date-picker').value = dateStr;
   }
 
   /* ---------------------------------------------------------------- render */
@@ -227,16 +259,18 @@
       filter = f;
       render();
     },
-    prevDay() { shiftDate(-1); syncUrl(); load(); },
-    nextDay() { shiftDate(1); syncUrl(); load(); },
+    prevDay() { shiftDate(-1); syncUrl(); updateDateLabel(); games = []; load(); },
+    nextDay() { shiftDate(1); syncUrl(); updateDateLabel(); games = []; load(); },
     today() {
       dateStr = todayStr();
       syncUrl();
+      updateDateLabel();
+      games = [];
       load();
     },
     pickDate() {
       const d = $('#date-picker').value;
-      if (d) { dateStr = d; syncUrl(); load(); }
+      if (d) { dateStr = d; syncUrl(); updateDateLabel(); games = []; load(); }
     },
   };
 
@@ -254,13 +288,10 @@
     if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) dateStr = d;
     $('#date-picker').value = dateStr;
 
-    const dateLabel = $('#date-label');
-    const labelDate = new Date(`${dateStr}T12:00:00`);
-    dateLabel.textContent = labelDate.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
-
-    load();
-    pollTimer = setInterval(() => {
+    updateDateLabel();
+    document.addEventListener('visibilitychange', () => {
       if (!document.hidden) load();
-    }, POLL_MS);
+    });
+    load();
   });
 })();
