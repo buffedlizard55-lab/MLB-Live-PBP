@@ -7,8 +7,10 @@
 'use strict';
 
 (() => {
-  const LIVE_POLL_MS = 10000;   // in-progress games
-  const OTHER_POLL_MS = 60000;  // preview / final
+  // Five seconds keeps the count and pitch events responsive without hammering the feed.
+  const LIVE_POLL_MS = 5000;
+  const PREVIEW_POLL_MS = 120000;
+  const FINAL_POLL_MS = 300000;
 
   let gamePk = null;
   let feed = null;
@@ -17,6 +19,7 @@
   let nextRefreshAt = 0;
   let lastToken = null;
   let activeTab = 'plays';
+  let requestInFlight = false;
 
   /* ------------------------------------------------------------------ boot */
 
@@ -45,17 +48,20 @@
   /* ----------------------------------------------------------------- fetch */
 
   async function load(showSpinner) {
-    if (!gamePk) return;
-    if (showSpinner) $('#loading').classList.add('visible');
+    if (!gamePk || requestInFlight) return;
+    requestInFlight = true;
+    if (showSpinner && !feed) $('#loading').classList.add('visible');
     try {
       const data = await MLB.getLiveFeed(gamePk);
       const token = feedToken(data);
       const changed = token !== lastToken || !feed;
       feed = data;
       lastToken = token;
-      renderAll();
-      if (!changed) {
-        // nothing new — just touch the "last updated" clock
+      // A live feed can be large. Keep the existing DOM when no baseball state changed.
+      if (changed) {
+        renderAll();
+      } else {
+        renderStatusLine();
       }
       $('#loading').classList.remove('visible');
       scheduleNext();
@@ -64,18 +70,31 @@
       $('#loading').classList.remove('visible');
       $('#status-line').textContent = `Update failed: ${err.message || err} — retrying…`;
       scheduleNext(5000);
+    } finally {
+      requestInFlight = false;
     }
   }
 
-  /** Change token: metaData.timeStamp when present, else last-play marker. */
+  /**
+   * State token deliberately ignores the feed timestamp: it changes even when no
+   * play changed. This prevents a costly full timeline/box-score redraw on idle polls.
+   */
   function feedToken(data) {
-    if (data.metaData && data.metaData.timeStamp) return data.metaData.timeStamp;
     const plays = data.liveData && data.liveData.plays;
-    const last = plays && plays.allPlays && plays.allPlays[plays.allPlays.length - 1];
+    const current = plays && plays.currentPlay;
+    const all = (plays && plays.allPlays) || [];
+    const last = all[all.length - 1] || {};
+    const event = current && current.playEvents && current.playEvents[current.playEvents.length - 1];
     const ls = data.liveData && data.liveData.linescore;
     return [
-      last && last.about && last.about.endTime,
-      last && last.about && last.about.atBatIndex,
+      all.length,
+      last.about && last.about.atBatIndex,
+      last.about && last.about.endTime,
+      current && current.about && current.about.atBatIndex,
+      event && (event.playId || event.index),
+      event && event.details && event.details.description,
+      current && current.count && `${current.count.balls}-${current.count.strikes}-${current.count.outs}`,
+      ls && ls.currentInning, ls && ls.inningState,
       ls && ls.teams && ls.teams.away && ls.teams.away.runs,
       ls && ls.teams && ls.teams.home && ls.teams.home.runs,
     ].join('|');
@@ -89,7 +108,8 @@
   }
 
   function scheduleNext(overrideMs) {
-    const interval = overrideMs || (isLive() ? LIVE_POLL_MS : OTHER_POLL_MS);
+    const interval = overrideMs || (isLive() ? LIVE_POLL_MS :
+      (gd().status && gd().status.abstractGameState === 'Final' ? FINAL_POLL_MS : PREVIEW_POLL_MS));
     nextRefreshAt = Date.now() + interval;
     clearTimeout(pollTimer);
     pollTimer = setTimeout(() => { load(false); }, interval);
@@ -165,8 +185,9 @@
     renderHeader();
     renderLivePanel();
     renderLinescore();
-    renderBoxscore();
-    renderPlays();
+    // The box score is the heaviest view; render it only when it can be seen.
+    if (activeTab === 'boxscore') renderBoxscore();
+    if (activeTab === 'plays') renderPlays();
     renderStatusLine();
   }
 
@@ -365,7 +386,10 @@
     const pitcher = matchup.pitcher || {};
     const pitchingSide = about.halfInning === 'bottom' ? 'away' : 'home';
     const pStats = pitcherStats(pitcher.id);
-    const pitchCount = countPitcherPitches(pitcher.id);
+    // Boxscore counters are supplied by the live feed and avoid rescanning every pitch.
+    const pitchCount = pStats && pStats.pitchesThrown != null
+      ? { total: pStats.pitchesThrown, strikes: pStats.strikes || 0 }
+      : countPitcherPitches(pitcher.id);
 
     const prow = UI.el('div', 'ab-row');
     const pshot = UI.headshot(pitcher.id, pitcher.fullName, 'ab-headshot');
@@ -796,6 +820,9 @@
     });
     $('#panel-plays').style.display = tab === 'plays' ? '' : 'none';
     $('#panel-boxscore').style.display = tab === 'boxscore' ? '' : 'none';
+    // Lazy rendering keeps live updates fast on the default play-by-play view.
+    if (feed && tab === 'boxscore') renderBoxscore();
+    if (feed && tab === 'plays') renderPlays();
   }
 
   /* ------------------------------------------------------------ status line */

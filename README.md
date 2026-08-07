@@ -10,11 +10,11 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
   who's pitching, the count, outs, runners on base**, on-deck / in-the-hole hitters,
   pitch counts, last play, inning-by-inning linescore, full box score, and the complete
   play-by-play timeline with pitch-by-pitch details.
-- Auto-refreshes every **10 seconds** during live games; works on desktop and mobile.
+- Auto-refreshes every **5 seconds** during live games; works on desktop and mobile.
 - No build step, no frameworks, no API keys — it runs on **GitHub Pages** (or any static
   host, or even `file://`).
 
-> **Live demo (once deployed):** `https://<your-username>.github.io/MLB-Live-PBP/`
+> **Live demo:** [buffedlizard55-lab.github.io/MLB-Live-PBP](https://buffedlizard55-lab.github.io/MLB-Live-PBP/)
 
 ---
 
@@ -48,9 +48,10 @@ liveData.decisions             → winning/losing/saving pitcher
 gameData.players / teams       → names, positions, records, venue, weather, status
 ```
 
-The app polls `feed/live` every 10s while a game is in progress (the API's own
-`metaData.wait` hints at that cadence) and re-renders only when the feed's timestamp
-changes. When the tab is hidden, polling pauses automatically.
+The app polls `feed/live` every 5s while a game is in progress and only rebuilds the
+DOM when the baseball state changes (count, pitch event, score, inning, or play). The
+heavy box-score table is lazy-rendered only when its tab is open. Preview and final
+games use slower cadences, and polling pauses automatically while the tab is hidden.
 
 ## Project structure
 
@@ -115,8 +116,8 @@ GitHub Actions**.
 
 - **Season / league:** `SPORT_ID` in `assets/js/api.js` (1 = MLB). Minor-league IDs
   (11–14) also work.
-- **Refresh rate:** `LIVE_POLL_MS` / `OTHER_POLL_MS` in `assets/js/game.js` and
-  `POLL_MS` in `assets/js/scoreboard.js`.
+- **Refresh rate:** `LIVE_POLL_MS`, `PREVIEW_POLL_MS`, and `FINAL_POLL_MS` in
+  `assets/js/game.js`; `LIVE_POLL_MS` / `IDLE_POLL_MS` in `assets/js/scoreboard.js`.
 - **Team colors:** `TEAM_COLORS` in `assets/js/ui.js`.
 
 ## Notes & etiquette
