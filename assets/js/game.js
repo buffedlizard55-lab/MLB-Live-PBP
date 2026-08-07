@@ -356,13 +356,13 @@
       countWrap.appendChild(UI.countDots(count.balls, count.strikes, count.outs));
       atBat.appendChild(countWrap);
 
-      /* runners */
-      const runners = (cp.runners || []).filter((r) => r.movement && !r.movement.isOut && r.movement.end);
-      if (runners.length) {
+      /* runners: linescore offense is the authoritative live base state. */
+      const baseState = basesOnField(ls, cp);
+      if (baseState.labels.length) {
         const runRow = UI.el('div', 'runners-row');
-        runRow.appendChild(UI.diamond(UI.basesFromRunners(cp.runners)));
+        runRow.appendChild(UI.diamond(baseState.bases));
         runRow.appendChild(UI.el('span', 'runners-text',
-          `Runners on ${runners.map((r) => shortBase(r.movement.end)).join(', ')}`));
+          `Runners on ${baseState.labels.join(', ')}`));
         atBat.appendChild(runRow);
       } else {
         atBat.appendChild(UI.el('div', 'runners-empty', 'Bases empty'));
@@ -384,7 +384,6 @@
     const pitch = UI.el('div', 'panel-card pitching-card');
     pitch.appendChild(UI.el('h3', 'panel-title', 'Pitching'));
     const pitcher = matchup.pitcher || {};
-    const pitchingSide = about.halfInning === 'bottom' ? 'away' : 'home';
     const pStats = pitcherStats(pitcher.id);
     // Boxscore counters are supplied by the live feed and avoid rescanning every pitch.
     const pitchCount = pStats && pStats.pitchesThrown != null
@@ -751,8 +750,32 @@
     if (!box || !box.teams || !box.teams[side]) return [];
     const order = box.teams[side].battingOrder || [];
     const idx = order.indexOf(batterId);
-    if (idx < 0) return [];
-    return order.slice(idx + 1, idx + 3).map(playerName);
+    if (idx < 0 || order.length < 2) return [];
+    // Batting orders wrap after the ninth hitter.
+    return [order[(idx + 1) % order.length], order[(idx + 2) % order.length]]
+      .filter((id) => id && id !== batterId).map(playerName);
+  }
+
+  /** Accurate occupied bases from linescore.offense, with PBP as a fallback. */
+  function basesOnField(ls, currentPlay) {
+    const offense = (ls && ls.offense) || {};
+    const bases = {
+      first: !!offense.first,
+      second: !!offense.second,
+      third: !!offense.third,
+    };
+    const labels = [];
+    [['first', '1st'], ['second', '2nd'], ['third', '3rd']].forEach(([key, label]) => {
+      if (bases[key]) labels.push(label);
+    });
+    if (ls && ls.offense) return { bases, labels };
+
+    const runners = (currentPlay && currentPlay.runners || [])
+      .filter((r) => r.movement && !r.movement.isOut && r.movement.end);
+    return {
+      bases: UI.basesFromRunners(runners),
+      labels: runners.map((r) => shortBase(r.movement.end)),
+    };
   }
 
   /** Total pitches / strikes thrown by a pitcher so far, from play events. */
