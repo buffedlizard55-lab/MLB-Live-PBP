@@ -1,0 +1,17 @@
+name: API smoke test
+
+on:
+  workflow_dispatch:
+  schedule:
+    # nightly sanity check that the upstream data still matches our parsers
+    - cron: '17 4 * * *'
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run smoke test against live MLB StatsAPI
+        run: node tools/smoke-test.mjs

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MLB Live Scoreboard</title>
+  <meta name="description" content="Live MLB scoreboard and game play-by-play powered by the public MLB StatsAPI — the same data behind mlb.com Gameday.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='46' fill='%23fff' stroke='%23e03131' stroke-width='6'/%3E%3Cpath d='M50 4 A46 46 0 0 1 96 50 M50 96 A46 46 0 0 1 4 50 M4 50 A46 46 0 0 1 50 4 M96 50 A46 46 0 0 1 50 96' stroke='%23e03131' stroke-width='2.5' fill='none'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body class="page-scoreboard">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-ball">⚾</span>
+      <span>MLB Live PBP</span>
+      <span class="brand-sub">scoreboard · play-by-play</span>
+    </div>
+    <div class="date-nav">
+      <button class="btn btn-ghost" onclick="Scoreboard.prevDay()" title="Previous day">←</button>
+      <input type="date" id="date-picker" onchange="Scoreboard.pickDate()" aria-label="Game date">
+      <button class="btn btn-ghost" onclick="Scoreboard.nextDay()" title="Next day">→</button>
+      <button class="btn" onclick="Scoreboard.today()">Today</button>
+    </div>
+    <div id="date-label" class="date-label"></div>
+  </header>
+
+  <div id="banner" class="banner"></div>
+  <nav id="tabs" class="tabs" aria-label="Filter games"></nav>
+
+  <main id="game-list" class="game-list"></main>
+
+  <div id="status-line" class="status-line"></div>
+
+  <footer class="site-footer">
+    <p>
+      Unofficial fan project. Data via the public MLB StatsAPI
+      (<a href="https://statsapi.mlb.com" target="_blank" rel="noopener">statsapi.mlb.com</a>) —
+      the same feeds that power <a href="https://www.mlb.com" target="_blank" rel="noopener">MLB.com</a> Gameday.
+      Not affiliated with MLB or MLB Advanced Media.
+    </p>
+  </footer>
+
+  <script src="assets/js/api.js"></script>
+  <script src="assets/js/ui.js"></script>
+  <script src="assets/js/scoreboard.js"></script>
+</body>
+</html>
