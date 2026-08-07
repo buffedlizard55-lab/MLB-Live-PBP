@@ -71,6 +71,22 @@ assert.equal(noData.prob, '24.5', 'baseline fallback should remain stable and tr
 const legacy = Props.modelHitProbability(highContactBatter, 'L', 'R');
 assert.equal(legacy.coverage, 'batter-only', 'legacy call should gracefully become a one-side fallback');
 
+// Game context / remaining at-bats / game flow state adjustments test cases.
+const contextInning1 = { inning: 1, halfInning: 'top', battingOrderPos: 1, isHomeBatting: false, gameState: 'Live' };
+const contextInning9 = { inning: 9, halfInning: 'top', battingOrderPos: 9, isHomeBatting: false, gameState: 'Live' };
+const contextFinal = { inning: 9, halfInning: 'bottom', battingOrderPos: 5, isHomeBatting: true, gameState: 'Final' };
+
+const probInning1 = Props.modelHitProbability(highContactBatter, hitFriendlyPitcher, 'L', 'R', contextInning1);
+const probInning9 = Props.modelHitProbability(highContactBatter, hitFriendlyPitcher, 'L', 'R', contextInning9);
+const probFinal = Props.modelHitProbability(highContactBatter, hitFriendlyPitcher, 'L', 'R', contextFinal);
+
+assert.ok(probInning1.probability > probInning9.probability,
+  'first several innings should have higher hit probability due to more expected at-bats');
+assert.ok(probInning9.probability < 0.50,
+  'as game progresses (9th inning), hit probability should go down towards a single plate appearance rate');
+assert.equal(probFinal.probability, 0.0,
+  'hit probability should be 0.0 once the game is over / final');
+
 const batterFeedFixture = {
   stats: [
     { type: { displayName: 'Expected Statistics' }, splits: [{ stat: { avg: '.287' } }] },

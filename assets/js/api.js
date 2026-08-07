@@ -29,7 +29,7 @@ const MLB = (() => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   /** Fetch JSON with a timeout + simple exponential retry. */
-  async function getJSON(url, { timeout = 12000, retries = 2, signal, cache = 'no-store' } = {}) {
+  async function getJSON(url, { timeout = 8000, retries = 1, signal, cache = 'no-store' } = {}) {
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       const ctrl = new AbortController();
@@ -83,13 +83,21 @@ const MLB = (() => {
    * Tries v1.1 first (the version the schedule links to), falls back to v1,
    * then assembles a bundle from the older split endpoints.
    */
+  function isLegacyFeedMiss(err) {
+    // Only try the older endpoints when this feed version is actually unavailable.
+    // Retrying a network/timeout failure against four endpoints is slower and adds load.
+    return err && [400, 404, 410].includes(err.status);
+  }
+
   async function getLiveFeed(gamePk, options = {}) {
     try {
       return await getJSON(`${V11}/game/${gamePk}/feed/live`, options);
     } catch (err1) {
+      if (!isLegacyFeedMiss(err1)) throw err1;
       try {
         return await getJSON(`${V1}/game/${gamePk}/feed/live`, options);
       } catch (err2) {
+        if (!isLegacyFeedMiss(err2)) throw err2;
         const [pbp, box, ls] = await Promise.all([
           getJSON(`${V1}/game/${gamePk}/playByPlay`, options),
           getJSON(`${V1}/game/${gamePk}/boxscore`, options),
