@@ -87,7 +87,7 @@ window.Props = (() => {
     return entry && entry.resolved ? entry.data : null;
   }
 
-  async function getHitPrediction(batterId, pitcherId, batterHand, pitcherHand, season = null) {
+  async function getHitPrediction(batterId, pitcherId, batterHand, pitcherHand, season = null, gameContext = null) {
     const [batterData, pitcherData] = await Promise.all([
       fetchPlayerStats(batterId, 'hitting', season),
       fetchPlayerStats(pitcherId, 'pitching', season),
@@ -97,6 +97,7 @@ window.Props = (() => {
       parsePitcherStats(pitcherData),
       batterHand,
       pitcherHand,
+      gameContext,
     );
   }
 
@@ -337,7 +338,65 @@ window.Props = (() => {
   }
 
   /**
-   * Predict the chance that a batter records a hit in the full plate appearance.
+   * Estimate expected remaining plate appearances based on inning, score, batting order, outs, and game status.
+   */
+  function getExpectedRemainingPAs(gameContext) {
+    if (!gameContext) return 1.0;
+
+    const inning = Math.max(1, parseInt(gameContext.inning) || 1);
+    const isHomeBatting = !!gameContext.isHomeBatting;
+    const scoreAway = parseInt(gameContext.scoreAway) || 0;
+    const scoreHome = parseInt(gameContext.scoreHome) || 0;
+    const outs = Math.min(2, Math.max(0, parseInt(gameContext.outs) || 0));
+    const battingOrderPos = Math.min(9, Math.max(1, parseInt(gameContext.battingOrderPos) || 5));
+    const gameState = String(gameContext.gameState || '').toLowerCase();
+
+    if (gameState === 'final' || gameState === 'completed' || gameState === 'game over') {
+      return 0.0;
+    }
+
+    // Expected remaining team plate appearances in current inning:
+    // 0 outs: ~4.0 more PAs
+    // 1 out: ~2.7 more PAs
+    // 2 outs: ~1.3 more PAs
+    let currentInningRemainingTeamPAs = 4.0 - (outs * 1.35);
+    if (currentInningRemainingTeamPAs < 1.0) currentInningRemainingTeamPAs = 1.0;
+
+    // Remaining innings of play (standard is 9)
+    const isHomeLeading = scoreHome > scoreAway;
+    const scoreDiff = Math.abs(scoreHome - scoreAway);
+
+    let expectedFutureTeamPAs = 0;
+    for (let i = inning + 1; i <= 9; i++) {
+      let inningWeight = 1.0;
+      if (i === 9) {
+        if (isHomeBatting) {
+          // If Home is already leading in late innings, they might not need to bat in bottom of 9th
+          if (isHomeLeading && scoreDiff >= 3) {
+            inningWeight = 0.1;
+          } else if (isHomeLeading && scoreDiff >= 1) {
+            inningWeight = 0.3;
+          } else if (scoreDiff === 0) {
+            inningWeight = 0.5;
+          } else {
+            inningWeight = 0.9;
+          }
+        }
+      }
+      expectedFutureTeamPAs += 4.2 * inningWeight;
+    }
+
+    const totalExpectedTeamPAs = 1.0 + (currentInningRemainingTeamPAs - 1.0) + expectedFutureTeamPAs;
+    const expectedAdditionalPAs = (totalExpectedTeamPAs - 1.0) / 9.0;
+    const orderAdjustment = (5.0 - battingOrderPos) * 0.04;
+    const rawRemainingPAs = 1.0 + expectedAdditionalPAs + orderAdjustment;
+
+    return Math.max(1.0, rawRemainingPAs);
+  }
+
+  /**
+   * Predict the chance that a batter records a hit in the full plate appearance,
+   * adjusted by remaining plate appearances and game flow state.
    *
    * Two signals enter independently: the batter's hit-production signal and
    * the pitcher's hit-allowed signal. When both are available their regressed
@@ -345,7 +404,7 @@ window.Props = (() => {
    * an explicit fallback label. This also accepts the previous three-argument
    * signature modelHitProbability(batterStats, batterHand, pitcherHand).
    */
-  function modelHitProbability(batterStats, pitcherStats, batterHand, pitcherHand) {
+  function modelHitProbability(batterStats, pitcherStats, batterHand, pitcherHand, gameContext = null) {
     // Backward compatibility with the one-sided model API.
     if (typeof pitcherStats === 'string') {
       pitcherHand = batterHand;
@@ -364,29 +423,55 @@ window.Props = (() => {
     }
 
     const platoon = platoonAdjustment(batterHand, pitcherHand);
-    const probability = clamp(
+    const rawProbability = clamp(
       logistic(baseLogit) + platoon.value,
       MIN_HIT_PROBABILITY,
       MAX_HIT_PROBABILITY,
     );
+
+    // Take into account remaining at bats and game flow state
+    const remainingPAs = getExpectedRemainingPAs(gameContext);
+    
+    // If remainingPAs is 0 (e.g. game is over), the probability of a hit from this point is 0
+    let probability = rawProbability;
+    if (remainingPAs === 0) {
+      probability = 0.0;
+    } else if (remainingPAs > 1.0) {
+      // Calculate the probability of getting at least one hit in the remaining plate appearances:
+      // P(at least 1 hit) = 1 - (1 - rawProbability)^remainingPAs
+      probability = 1.0 - Math.pow(1.0 - rawProbability, remainingPAs);
+    }
+    
+    // Ensure final probability is clamped within reasonable limits (unless it's 0 because game is over)
+    if (remainingPAs > 0) {
+      probability = clamp(probability, MIN_HIT_PROBABILITY, 0.95);
+    }
 
     let coverage = 'baseline';
     if (batter.available && pitcher.available) coverage = 'two-sided';
     else if (batter.available) coverage = 'batter-only';
     else if (pitcher.available) coverage = 'pitcher-only';
 
-    const coverageLabel = {
+    let coverageLabel = {
       'two-sided': 'Batter + pitcher season inputs',
       'batter-only': 'Batter input; pitcher baseline fallback',
       'pitcher-only': 'Pitcher input; batter baseline fallback',
       baseline: 'League baseline fallback',
     }[coverage];
 
+    if (gameContext && remainingPAs > 0) {
+      const paDesc = remainingPAs.toFixed(1);
+      coverageLabel += ` · Game flow adjust (est. ${paDesc} PAs remaining)`;
+    }
+
     return {
       probability,
       prob: (probability * 100).toFixed(1),
       noHitProbability: 1 - probability,
       noHitProb: ((1 - probability) * 100).toFixed(1),
+      rawProbability,
+      rawProb: (rawProbability * 100).toFixed(1),
+      remainingPAs,
       batter,
       pitcher,
       platoon,
@@ -593,8 +678,8 @@ window.Props = (() => {
     return section;
   }
 
-  function batterCard(player, label, batterStats, pitcherStats, batterHand, pitcherHand) {
-    const model = modelHitProbability(batterStats, pitcherStats, batterHand, pitcherHand);
+  function batterCard(player, label, batterStats, pitcherStats, batterHand, pitcherHand, gameContext = null) {
+    const model = modelHitProbability(batterStats, pitcherStats, batterHand, pitcherHand, gameContext);
     const card = node('article', `batter-prop-card ${label === 'Current Batter' ? 'active-batter' : ''}`);
 
     const header = node('div', 'b-header');
@@ -662,7 +747,35 @@ window.Props = (() => {
       const pitcherStats = parsePitcherStats(data[0]);
       const batterData = data.slice(1);
       const currentStats = parseBatterStats(batterData[0]);
-      const currentModel = modelHitProbability(currentStats, pitcherStats, batterHand, pitcherHand);
+
+      const ls = live.linescore || {};
+      const box = live.boxscore || {};
+      const halfInning = ls.inningHalf ? ls.inningHalf.toLowerCase() : 'top';
+      const isHomeBatting = halfInning === 'bottom';
+      const battingSide = isHomeBatting ? 'home' : 'away';
+      const scoreAway = ls.teams && ls.teams.away && ls.teams.away.runs;
+      const scoreHome = ls.teams && ls.teams.home && ls.teams.home.runs;
+
+      function getBattingOrderPosition(boxscore, side, playerId) {
+        if (!boxscore || !boxscore.teams || !boxscore.teams[side]) return null;
+        const order = boxscore.teams[side].battingOrder || [];
+        const idx = order.indexOf(playerId);
+        return idx >= 0 ? idx + 1 : null;
+      }
+
+      const currentOrderPos = getBattingOrderPosition(box, battingSide, batter.id);
+      const gameContext = {
+        inning: ls.currentInning,
+        halfInning,
+        battingOrderPos: currentOrderPos,
+        isHomeBatting,
+        scoreAway,
+        scoreHome,
+        outs: ls.outs,
+        gameState: gameData.status && gameData.status.abstractGameState,
+      };
+
+      const currentModel = modelHitProbability(currentStats, pitcherStats, batterHand, pitcherHand, gameContext);
       const arsenal = getPitcherArsenal(live.plays && live.plays.allPlays, pitcher.id);
 
       container.replaceChildren();
@@ -673,6 +786,8 @@ window.Props = (() => {
       batterSection.appendChild(node('h3', 'props-heading', `Upcoming Batters vs ${playerName(pitcher)}`));
       const grid = node('div', 'batters-grid');
       batters.forEach((entry, index) => {
+        const orderPos = getBattingOrderPosition(box, battingSide, entry.player.id);
+        const batterContext = Object.assign({}, gameContext, { battingOrderPos: orderPos });
         grid.appendChild(batterCard(
           entry.player,
           entry.label,
@@ -680,6 +795,7 @@ window.Props = (() => {
           pitcherStats,
           entry.hand,
           pitcherHand,
+          batterContext,
         ));
       });
       batterSection.appendChild(grid);
