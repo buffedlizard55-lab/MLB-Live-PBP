@@ -16,6 +16,10 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
   who's pitching, the count, outs, runners on base**, on-deck / in-the-hole hitters,
   pitch counts, last play, inning-by-inning linescore, full box score, and the complete
   play-by-play timeline with pitch-by-pitch details.
+- **Two-sided hit forecast** — a transparent pre-plate-appearance estimate that blends
+  the batter's season hit-production signal with the pitcher's hit-allowed signal,
+  shows the hit/no-hit split, and explains the handedness adjustment. It appears in
+  the live at-bat card, the Props & Matchup tab, and completed PBP rows.
 - Auto-refreshes every **5 seconds** during live games; works on desktop and mobile.
 - No build step, no frameworks, no API keys — it runs on **GitHub Pages** (or any static
   host, or even `file://`).
@@ -41,6 +45,7 @@ This project does the same thing with its own front end. The API calls we make:
 | Fallback bundle (if the feed 404s) | `GET /api/v1/game/{gamePk}/playByPlay` + `/boxscore` + `/linescore` |
 | Team logos | `https://www.mlbstatic.com/team-logos/team-cap-on-dark/{teamId}.svg` |
 | Player headshots | `https://img.mlbstatic.com/mlb-photos/image/upload/.../v1/people/{playerId}/headshot/67/current` |
+| Batter / pitcher season inputs for the forecast | `GET /api/v1/people/{playerId}/stats?stats=statcast,expectedStatistics,season&group=hitting&season=YYYY`; pitchers request `expectedStatistics,season` with `group=pitching` |
 
 The live feed is the heart of it — one response contains everything Gameday shows:
 
@@ -59,6 +64,27 @@ DOM when the baseball state changes (count, pitch event, score, inning, or play)
 heavy box-score table is lazy-rendered only when its tab is open. Preview and final
 games use slower cadences, and polling pauses automatically while the tab is hidden.
 
+## Two-sided hit forecast
+
+The hit percentage is a **transparent, pre-plate-appearance estimate** — not an MLB
+projection or a betting line. It deliberately gives both participants a visible role:
+
+1. **Batter side:** current-season xBA (when available) and AVG form a hit-production
+   signal. xBA receives the larger weight because it is less dependent on where batted
+   balls landed.
+2. **Pitcher side:** current-season xBA allowed (when available) and opponent AVG form
+   a hit-allowed signal. A lower pitcher signal suppresses the final hit forecast.
+3. **Small samples:** each side is regressed toward a `.245` league hit-rate baseline
+   using its available at-bats before the two signals are blended in log-odds space.
+4. **Matchup:** a small, explicit platoon adjustment is added for opposite-handed or
+   switch-hitter matchups. The UI also exposes the complementary **No hit** chance.
+
+If one player has no usable season data, the forecast remains available but labels the
+fallback (for example, “Batter input; pitcher baseline fallback”). If neither side has
+data, it shows the league baseline instead of pretending the estimate is personalized.
+The same cached model powers the live at-bat card, Props & Matchup tab, and PBP chips;
+for archived games the request is scoped to the feed's game season.
+
 ## Project structure
 
 ```
@@ -72,6 +98,7 @@ games use slower cadences, and polling pauses automatically while the tab is hid
 │       ├── api.js             # MLB StatsAPI client (fetch, retry, fallbacks, formatters)
 │       ├── ui.js              # Shared UI: team logos, colors, count dots, runners diamond
 │       ├── scoreboard.js      # Scoreboard page logic
+│       ├── props.js           # Two-sided hit model, stat cache, Props & Matchup tab
 │       └── game.js            # Game page logic (live "at bat" module, linescore, box, PBP)
 └── docs/workflows/            # Optional GitHub Actions files (see deployment section)
 ```
@@ -90,6 +117,12 @@ npx serve .
 
 Then open <http://localhost:8000>. You can also open `index.html` directly in a browser
 (`file://` works — the app uses plain scripts, no modules).
+
+To run the deterministic, network-free model checks:
+
+```bash
+node tools/hit-model-test.mjs
+```
 
 ## Deploy to GitHub Pages
 
@@ -111,8 +144,9 @@ Actions (and/or run the nightly API smoke test), ready-to-use workflow files are
 
 - `pages.yml` — deploys to Pages on every push to `main` (requires the repo setting
   **Pages → Source → "GitHub Actions"** instead of branch deployment).
-- `smoke.yml` — nightly check that the upstream MLB StatsAPI still matches our
-  parsers; run it anytime from **Actions** with "Run workflow".
+- `smoke.yml` — runs the deterministic two-sided model checks and a nightly
+  check that the upstream MLB StatsAPI still matches our parsers; run it anytime
+  from **Actions** with "Run workflow".
 
 To use them, copy the file contents into `.github/workflows/` in the repo (the GitHub
 web UI's *Add file* is the easiest way), then go to **Settings → Pages → Source →
