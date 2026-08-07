@@ -188,6 +188,7 @@
     // The box score is the heaviest view; render it only when it can be seen.
     if (activeTab === 'boxscore') renderBoxscore();
     if (activeTab === 'plays') renderPlays();
+    if (activeTab === 'props' && window.Props) window.Props.render($('#props-wrap'), gd());
     renderStatusLine();
   }
 
@@ -820,9 +821,11 @@
     });
     $('#panel-plays').style.display = tab === 'plays' ? '' : 'none';
     $('#panel-boxscore').style.display = tab === 'boxscore' ? '' : 'none';
+    $('#panel-props').style.display = tab === 'props' ? '' : 'none';
     // Lazy rendering keeps live updates fast on the default play-by-play view.
     if (feed && tab === 'boxscore') renderBoxscore();
     if (feed && tab === 'plays') renderPlays();
+    if (feed && tab === 'props' && window.Props) window.Props.render($('#props-wrap'), gd());
   }
 
   /* ------------------------------------------------------------ status line */
