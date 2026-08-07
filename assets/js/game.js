@@ -503,6 +503,11 @@
     const orderPos = battingOrderPosition(battingSide, batter.id);
     const scoreAway = ls.teams && ls.teams.away && ls.teams.away.runs;
     const scoreHome = ls.teams && ls.teams.home && ls.teams.home.runs;
+    const plays = playsData() || {};
+    const liveCount = (plays.currentPlay && plays.currentPlay.count) || null;
+    const facedToday = window.Props.timesFacedToday
+      ? window.Props.timesFacedToday(plays.allPlays, batter.id, pitcher.id)
+      : 0;
     const gameContext = {
       inning: ls.currentInning,
       halfInning,
@@ -512,6 +517,9 @@
       scoreHome,
       outs: ls.outs,
       gameState: gd().status && gd().status.abstractGameState,
+      gameDate: gd().datetime && gd().datetime.dateTime,
+      count: liveCount,
+      timesFacedToday: facedToday,
     };
 
     window.Props.getHitPrediction(batter.id, pitcher.id, bHand, pHand, gameSeason(), gameContext)
@@ -522,8 +530,15 @@
         forecast.classList.add(`model-${model.coverage}`);
 
         const heading = UI.el('div', 'live-hit-heading');
-        heading.appendChild(UI.el('span', 'live-hit-label', 'Two-sided hit forecast'));
-        heading.appendChild(UI.el('strong', 'live-hit-value', `${model.prob}%`));
+        heading.appendChild(UI.el('span', 'live-hit-label', 'Hit forecast — this PA'));
+        const valueWrap = UI.el('span', 'live-hit-value-wrap');
+        valueWrap.appendChild(UI.el('strong', 'live-hit-value', `${model.prob}%`));
+        if (model.tier) {
+          const pill = UI.el('span', `tier-pill tier-${model.tier.key} tier-sm`, model.tier.label);
+          pill.title = 'Matchup tier from the per-plate-appearance hit probability';
+          valueWrap.appendChild(pill);
+        }
+        heading.appendChild(valueWrap);
         forecast.appendChild(heading);
 
         const details = UI.el('div', 'live-hit-details');
@@ -532,9 +547,15 @@
         details.appendChild(UI.el('span', '', `Batter ${batterSignal}`));
         details.appendChild(UI.el('span', '', `Pitcher ${pitcherSignal}`));
         details.appendChild(UI.el('span', '', `No hit ${model.noHitProb}%`));
+        if (model.countFactor && model.countFactor.applied) {
+          details.appendChild(UI.el('span', '', `Count ${model.countFactor.label} live`));
+        }
+        if (model.gameFlowProb) {
+          details.appendChild(UI.el('span', '', `≥1 hit rest of game ${model.gameFlowProb}%`));
+        }
         forecast.appendChild(details);
         forecast.appendChild(UI.el('div', 'live-hit-coverage', model.coverageLabel));
-        forecast.title = `Pre-plate-appearance forecast: ${window.Props.describeHitModel
+        forecast.title = `Live at-bat hit forecast: ${window.Props.describeHitModel
           ? window.Props.describeHitModel(model)
           : model.coverageLabel}`;
       })
@@ -815,6 +836,10 @@
       ]);
     } catch (_) { /* individual fetch failures fall back to the league baseline */ }
 
+    // Chronological pair counts give each chip the times-through-the-order
+    // context of its own moment (items are collected in allPlays order).
+    const pairSeen = new Map();
+    const feedGameDate = gd().datetime && gd().datetime.dateTime;
     items.forEach(({ play, chip, bHand, pHand }) => {
       // A new poll may have rebuilt the play list while requests were pending.
       if (!chip.isConnected) return;
@@ -841,7 +866,10 @@
       const playIsHomeBatting = playHalfInning === 'bottom';
       const playBattingSide = playIsHomeBatting ? 'home' : 'away';
       const playOrderPos = battingOrderPosition(playBattingSide, batterId);
-      
+      const pairKey = `${batterId}:${pitcherId}`;
+      const faced = pairSeen.get(pairKey) || 0;
+      pairSeen.set(pairKey, faced + 1);
+
       const gameContext = {
         inning: playAbout.inning,
         halfInning: playHalfInning,
@@ -851,6 +879,8 @@
         scoreHome: playResult.homeScore,
         outs: playCount.outs,
         gameState: 'Live',
+        gameDate: feedGameDate,
+        timesFacedToday: faced,
       };
 
       const model = window.Props.modelHitProbability(batterStats, pitcherStats, bHand, pHand, gameContext);

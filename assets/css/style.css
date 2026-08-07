@@ -938,3 +938,50 @@ a:hover { text-decoration: underline; }
   .forecast-result-value { font-size: 25px; }
   .batters-grid { grid-template-columns: 1fr; }
 }
+
+/* ----------------------------------------------------- model v2: tiers + drivers */
+
+.tier-pill {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.tier-sm { padding: 1px 7px; font-size: 9.5px; }
+.tier-elite { background: rgba(46, 160, 67, 0.28); color: #8ff0ac; border: 1px solid rgba(46, 160, 67, 0.6); }
+.tier-favorable { background: rgba(46, 160, 67, 0.16); color: #7dd3a0; border: 1px solid rgba(46, 160, 67, 0.4); }
+.tier-neutral { background: rgba(139, 160, 186, 0.14); color: #aebfcf; border: 1px solid rgba(139, 160, 186, 0.35); }
+.tier-tough { background: rgba(210, 153, 34, 0.16); color: #f0c568; border: 1px solid rgba(210, 153, 34, 0.45); }
+.tier-dominated { background: rgba(224, 49, 49, 0.16); color: #ffa8a8; border: 1px solid rgba(224, 49, 49, 0.45); }
+
+.tier-fill-elite { background: linear-gradient(90deg, #2ea043, #57d977) !important; }
+.tier-fill-favorable { background: linear-gradient(90deg, #238636, #7dd3a0) !important; }
+.tier-fill-neutral { background: linear-gradient(90deg, #46607e, #8ba0ba) !important; }
+.tier-fill-tough { background: linear-gradient(90deg, #9e6a03, #d29922) !important; }
+.tier-fill-dominated { background: linear-gradient(90deg, #a12828, #e03131) !important; }
+
+.prob-value-wrap,
+.live-hit-value-wrap,
+.forecast-value-row { display: inline-flex; align-items: center; gap: 8px; }
+
+.forecast-scale-note {
+  margin: 2px 0 4px;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.adj-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.adj-chip {
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  border: 1px solid transparent;
+}
+.adj-pos { color: #8ff0ac; background: rgba(46, 160, 67, 0.13); border-color: rgba(46, 160, 67, 0.35); }
+.adj-neg { color: #ffa8a8; background: rgba(224, 49, 49, 0.12); border-color: rgba(224, 49, 49, 0.3); }

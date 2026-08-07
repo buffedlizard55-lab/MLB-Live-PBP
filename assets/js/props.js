@@ -1,23 +1,89 @@
 /* ============================================================================
- * props.js — matchup data, a transparent two-sided hit forecast, and the
+ * props.js — matchup data, a discriminative two-sided hit forecast, and the
  * Props & Matchup tab.
  *
- * The forecast is deliberately lightweight rather than a black-box betting
- * model. It combines a batter's season hit-quality / batting-average signal
- * with the pitcher's season hit-allowed signal, regresses both toward a league
- * baseline for small samples, and then applies a small handedness adjustment.
+ * MODEL v2 — why it exists:
+ * The original model blended season-level batter/pitcher rates with a flat
+ * handedness bump and surfaced a game-flow-inflated number, so every matchup
+ * landed in a narrow band and the forecast couldn't distinguish a great spot
+ * from a terrible one. v2 attacks discrimination on three axes:
+ *
+ *   1. RICHER, WIDER INPUTS. Platoon splits (batter vs pitcher-hand, pitcher
+ *      vs batter-hand) and recent form (gameLog) have far more spread than
+ *      season aggregates, so they carry real separating power.
+ *   2. MULTIPLICATIVE COMBINATION. Evidence compounds in log-odds space
+ *      (generalized log5, Bill James's odds-ratio matchup method) instead of
+ *      averaging logits, so extreme signals push the output toward the
+ *      extremes instead of canceling toward the mean.
+ *   3. IN-GAME STATE. The live count (anchored to published hit-rate-by-count
+ *      research), the times-through-the-order effect (~+8 wOBA pts/pass; MLB's
+ *      glossary shows .243/.255/.265 AVG by pass), and capped head-to-head
+ *      history adjust the baseline per-plate-appearance rate.
+ *
+ * The headline output is the per-plate-appearance hit probability; the old
+ * "at least one hit in remaining PAs" game-flow number is still computed and
+ * shown as a secondary projection.
  * ==========================================================================*/
 'use strict';
 
 window.Props = (() => {
   const STATS_CACHE = new Map();
 
-  // A neutral MLB hit rate used only as a regression target / missing-data fallback.
+  /* -------------------------------------------------------------- constants */
+
+  // A neutral MLB hit rate used as the prior / missing-data fallback.
   const LEAGUE_HIT_RATE = 0.245;
+  // Regression priors (in at-bats): a signal's reliability is sample/(sample+prior).
   const BATTER_REGRESSION_AB = 180;
   const PITCHER_REGRESSION_AB = 320;
-  const MIN_HIT_PROBABILITY = 0.08;
-  const MAX_HIT_PROBABILITY = 0.45;
+  const SPLIT_BATTER_PRIOR_AB = 120;
+  const SPLIT_PITCHER_PRIOR_BF = 160;
+  const FORM_PRIOR_AB = 55;
+  const FORM_WEIGHT_CAP = 0.45;   // hot/cold streaks are weakly predictive — keep modest
+  const FORM_WINDOW_GAMES = 8;
+  const H2H_PRIOR_AB = 20;
+  const H2H_WEIGHT_CAP = 0.25;    // fun, tiny nudge only
+  // Total evidence swing is capped so stacked edges can't produce absurd outputs.
+  const MAX_TOTAL_DELTA_LOGIT = 0.9;
+  // Times-through-the-order: ~+8 wOBA pts per pass ≈ +0.75 pts of AVG per pass,
+  // credited from the 2nd PA vs the same pitcher today, capped at 2 passes.
+  const TTO_BUMP_PER_PASS = 0.0075;
+  const TTO_MAX_PASSES = 2;
+
+  const MIN_PA_PROBABILITY = 0.10;   // per-plate-appearance clamps (pre-count)
+  const MAX_PA_PROBABILITY = 0.42;
+  const MIN_LIVE_PROBABILITY = 0.08; // post-count clamps
+  const MAX_LIVE_PROBABILITY = 0.48;
+
+  /* Live in-at-bat count factors (odds multipliers vs a fresh 0-0 count).
+   * Anchored to published research — see tools/count-model-derivation.mjs:
+   * ahead .313 / even .285 / behind .218 (SABR), ~.16 AVG after 0-2, and the
+   * FanGraphs wOBA-by-count shape with the walk value at 3-ball counts removed
+   * (walks end a PA without a hit, and 3-0 pitches are auto-taken). */
+  const COUNT_FACTORS = {
+    '0-0': 1.00,
+    '0-1': 0.93,
+    '0-2': 0.74,
+    '1-0': 1.07,
+    '1-1': 1.00,
+    '1-2': 0.77,
+    '2-0': 1.15,
+    '2-1': 1.08,
+    '2-2': 0.80,
+    '3-0': 1.12,
+    '3-1': 1.16,
+    '3-2': 0.92,
+  };
+
+  // Display tiers for the final per-PA probability — fans read "which kind of
+  // matchup is this" faster than they read raw percentages.
+  const TIERS = [
+    { min: 0.315, key: 'elite', label: 'Elite matchup' },
+    { min: 0.275, key: 'favorable', label: 'Favorable' },
+    { min: 0.215, key: 'neutral', label: 'Neutral' },
+    { min: 0.170, key: 'tough', label: 'Tough' },
+    { min: -Infinity, key: 'dominated', label: "Pitcher's edge" },
+  ];
 
   let renderVersion = 0;
 
@@ -36,10 +102,24 @@ window.Props = (() => {
     return `${normalizedGroup(group)}:${playerId}:${normalizedSeason(season) || 'current'}`;
   }
 
+  function h2hCacheKey(batterId, pitcherId, season) {
+    return `h2h:${batterId}:${pitcherId}:${normalizedSeason(season) || 'career'}`;
+  }
+
+  function fetchJSON(url) {
+    return fetch(url, { headers: { Accept: 'application/json' } })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      });
+  }
+
   /**
-   * Fetch one player's current (or supplied game-season) hitting or pitching
-   * data. Entries cache the in-flight Promise as well as its resolved value so
-   * a timeline with repeated batters does not make duplicate requests.
+   * Fetch one player's season hitting or pitching bundle. One request returns
+   * season aggregates, expected stats, Statcast quality, platoon splits
+   * (statSplits, sitCodes vl/vr), and the full game log (recent form). Entries
+   * cache the in-flight Promise as well as its resolved value so a timeline
+   * with repeated batters does not make duplicate requests.
    */
   function fetchPlayerStats(playerId, group = 'hitting', season = null) {
     if (!playerId) return Promise.resolve(null);
@@ -53,22 +133,55 @@ window.Props = (() => {
     const params = new URLSearchParams({
       // Pitcher forecasts only need expected / season rates. Avoid requesting
       // a hitter-specific Statcast group on pitching-only player records.
-      stats: statGroup === 'pitching' ? 'expectedStatistics,season' : 'statcast,expectedStatistics,season',
+      stats: statGroup === 'pitching'
+        ? 'expectedStatistics,season,statSplits,gameLog'
+        : 'statcast,expectedStatistics,season,statSplits,gameLog',
       group: statGroup,
+      // Platoon splits. For hitters: vs LHP / vs RHP. For pitchers: vs LHB / vs RHB.
+      sitCodes: 'vl,vr',
     });
     if (seasonValue) params.set('season', seasonValue);
 
     const entry = { data: null, resolved: false, promise: null };
-    entry.promise = fetch(`https://statsapi.mlb.com/api/v1/people/${playerId}/stats?${params.toString()}`, {
-      headers: { Accept: 'application/json' },
-    })
-      .then((res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.json();
-      })
+    entry.promise = fetchJSON(`https://statsapi.mlb.com/api/v1/people/${playerId}/stats?${params.toString()}`)
       .catch((err) => {
         // A forecast can still use the opposite side or its league baseline.
         console.warn(`Props: failed to fetch ${statGroup} stats for ${playerId}`, err);
+        return null;
+      })
+      .then((data) => {
+        entry.data = data;
+        entry.resolved = true;
+        return data;
+      });
+
+    STATS_CACHE.set(key, entry);
+    return entry.promise;
+  }
+
+  /**
+   * Career head-to-head line for one batter/pitcher pair. Kept out of the
+   * main bundle because it needs both ids; used only for the live forecast,
+   * never for the bulk timeline chips (one extra request per unique matchup).
+   */
+  function fetchHeadToHead(batterId, pitcherId, season = null) {
+    if (!batterId || !pitcherId) return Promise.resolve(null);
+    const key = h2hCacheKey(batterId, pitcherId, season);
+    const cached = STATS_CACHE.get(key);
+    if (cached) return cached.promise;
+
+    const params = new URLSearchParams({
+      stats: 'vsPlayer',
+      group: 'hitting',
+      opposingPlayerId: String(pitcherId),
+    });
+    const seasonValue = normalizedSeason(season);
+    if (seasonValue) params.set('season', seasonValue);
+
+    const entry = { data: null, resolved: false, promise: null };
+    entry.promise = fetchJSON(`https://statsapi.mlb.com/api/v1/people/${batterId}/stats?${params.toString()}`)
+      .catch((err) => {
+        console.warn(`Props: failed to fetch head-to-head ${batterId} vs ${pitcherId}`, err);
         return null;
       })
       .then((data) => {
@@ -88,12 +201,15 @@ window.Props = (() => {
   }
 
   async function getHitPrediction(batterId, pitcherId, batterHand, pitcherHand, season = null, gameContext = null) {
-    const [batterData, pitcherData] = await Promise.all([
+    const [batterData, pitcherData, h2hData] = await Promise.all([
       fetchPlayerStats(batterId, 'hitting', season),
       fetchPlayerStats(pitcherId, 'pitching', season),
+      fetchHeadToHead(batterId, pitcherId),   // career — one cached request per pair
     ]);
+    const batterProfile = parseBatterStats(batterData);
+    batterProfile.h2h = parseHeadToHead(h2hData);
     return modelHitProbability(
-      parseBatterStats(batterData),
+      batterProfile,
       parsePitcherStats(pitcherData),
       batterHand,
       pitcherHand,
@@ -146,12 +262,34 @@ window.Props = (() => {
     return split ? split.stat : null;
   }
 
+  function groupForType(data, wantedType) {
+    if (!data || !Array.isArray(data.stats)) return null;
+    const wanted = compactType(wantedType);
+    const found = data.stats.find((item) => {
+      const type = item && item.type || {};
+      return [type.displayName, type.name, type.code]
+        .some((candidate) => compactType(candidate) === wanted);
+    });
+    return found && Array.isArray(found.splits) ? found.splits : null;
+  }
+
   function displayRate(value) {
     return value == null ? '—' : value.toFixed(3).replace(/^0(?=\.)/, '');
   }
 
   function displayMetric(value, decimals = 1) {
     return value == null ? '—' : Number(value).toFixed(decimals);
+  }
+
+  /** YYYY-MM-DD from an ISO datetime (or a date already in that shape). */
+  function dayOf(value) {
+    const text = String(value || '');
+    const match = text.match(/^(\d{4}-\d{2}-\d{2})/);
+    return match ? match[1] : '';
+  }
+
+  function emptySplit() {
+    return { avg: null, atBats: 0 };
   }
 
   function baseProfile(role) {
@@ -165,7 +303,72 @@ window.Props = (() => {
       exitVelo: '—',
       launchAngle: '—',
       ops: '—',
+      // v2 additions:
+      splits: { vl: emptySplit(), vr: emptySplit() },
+      recentLog: [],     // [{ date: 'YYYY-MM-DD', hits, atBats }] chronological
+      h2h: null,         // career head-to-head { avg, atBats } when fetched
     };
+  }
+
+  function normalizeSplits(input) {
+    const splits = { vl: emptySplit(), vr: emptySplit() };
+    if (!input) return splits;
+    // API shape: array of entries with split.code — handled by parseSplitsFromApi.
+    // Plain-object fixture shape: { vl: {avg, atBats}, vr: {...} } or
+    // { vsLeft: {...}, vsRight: {...} }.
+    const vl = input.vl || input.vsLeft;
+    const vr = input.vr || input.vsRight;
+    if (vl) splits.vl = { avg: rate(vl.avg != null ? vl.avg : vl.avgRate), atBats: finiteNumber(vl.atBats != null ? vl.atBats : vl.battersFaced) || 0 };
+    if (vr) splits.vr = { avg: rate(vr.avg != null ? vr.avg : vr.avgRate), atBats: finiteNumber(vr.atBats != null ? vr.atBats : vr.battersFaced) || 0 };
+    return splits;
+  }
+
+  function parseSplitsFromApi(data) {
+    const splits = { vl: emptySplit(), vr: emptySplit() };
+    const entries = groupForType(data, 'statSplits') || [];
+    entries.forEach((entry) => {
+      const code = entry && entry.split && String(entry.split.code || '').toLowerCase();
+      if (code !== 'vl' && code !== 'vr' || !entry.stat) return;
+      const hits = finiteNumber(entry.stat.hits);
+      const atBats = finiteNumber(entry.stat.atBats);
+      let avg = rate(entry.stat.avg);
+      if (avg == null && hits != null && atBats > 0) avg = hits / atBats;
+      splits[code] = { avg, atBats: atBats || 0 };
+    });
+    return splits;
+  }
+
+  function parseGameLog(data) {
+    const entries = groupForType(data, 'gameLog') || [];
+    return entries
+      .map((entry) => ({
+        date: dayOf(entry && entry.date),
+        hits: finiteNumber(entry && entry.stat && entry.stat.hits),
+        atBats: finiteNumber(entry && entry.stat && entry.stat.atBats),
+      }))
+      .filter((entry) => entry.date && entry.atBats != null)
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  }
+
+  /** Career head-to-head (vsPlayerTotal preferred; fall back to summing seasons). */
+  function parseHeadToHead(data) {
+    if (!data || !Array.isArray(data.stats)) return null;
+    const total = statForType(data, 'vsPlayerTotal');
+    if (total) {
+      const avg = rate(total.avg);
+      const atBats = finiteNumber(total.atBats) || 0;
+      if (avg != null && atBats > 0) return { avg, atBats };
+    }
+    const seasons = groupForType(data, 'vsPlayer') || [];
+    let hits = 0;
+    let atBats = 0;
+    seasons.forEach((entry) => {
+      const h = finiteNumber(entry && entry.stat && entry.stat.hits);
+      const ab = finiteNumber(entry && entry.stat && entry.stat.atBats);
+      if (h != null) hits += h;
+      if (ab != null) atBats += ab;
+    });
+    return atBats > 0 ? { avg: hits / atBats, atBats } : null;
   }
 
   function profileFromPlainObject(input, role) {
@@ -187,6 +390,18 @@ window.Props = (() => {
     profile.exitVelo = input.exitVelo == null ? '—' : String(input.exitVelo);
     profile.launchAngle = input.launchAngle == null ? '—' : String(input.launchAngle);
     profile.ops = input.ops == null ? '—' : String(input.ops);
+    profile.splits = normalizeSplits(input.splits);
+    if (Array.isArray(input.recentLog)) profile.recentLog = input.recentLog;
+    if (input.h2h) profile.h2h = { avg: rate(input.h2h.avg), atBats: finiteNumber(input.h2h.atBats) || 0 };
+    // Fixture shortcut: a precomputed recent-form line. The epoch date keeps
+    // the entry eligible under any game-date cutoff.
+    if (input.recent) {
+      profile.recentLog = [{
+        date: '0000-01-01',
+        hits: Math.round((rate(input.recent.avg) || 0) * (finiteNumber(input.recent.atBats) || 0) * 1000) / 1000,
+        atBats: finiteNumber(input.recent.atBats) || 0,
+      }];
+    }
     return profile;
   }
 
@@ -217,6 +432,8 @@ window.Props = (() => {
     profile.exitVelo = displayMetric(exitVelo);
     profile.launchAngle = displayMetric(launchAngle);
     profile.ops = season && season.ops != null ? String(season.ops) : '—';
+    profile.splits = parseSplitsFromApi(statsData);
+    profile.recentLog = parseGameLog(statsData);
     return profile;
   }
 
@@ -246,6 +463,8 @@ window.Props = (() => {
     profile.avg = displayRate(avg);
     profile.sample = Math.max(0, sample || 0);
     profile.ops = season && season.ops != null ? String(season.ops) : '—';
+    profile.splits = parseSplitsFromApi(statsData);
+    profile.recentLog = parseGameLog(statsData);
     return profile;
   }
 
@@ -269,6 +488,24 @@ window.Props = (() => {
     return 1 / (1 + Math.exp(-value));
   }
 
+  function odds(value) {
+    const safe = clamp(value, 0.001, 0.999);
+    return safe / (1 - safe);
+  }
+
+  function tierFor(probability) {
+    return TIERS.find((tier) => probability >= tier.min) || TIERS[TIERS.length - 1];
+  }
+
+  function shrink(observedRate, priorRate, sample, priorAB) {
+    const reliability = clamp(sample / (sample + priorAB), 0, 1);
+    return { rate: priorRate + reliability * (observedRate - priorRate), reliability };
+  }
+
+  /**
+   * Season-level signal: blend xBA (less outcome-noise) with actual AVG, then
+   * shrink toward the league rate by sample size.
+   */
   function buildSignal(profileInput, role) {
     const profile = role === 'pitcher'
       ? parsePitcherStats(profileInput)
@@ -308,33 +545,137 @@ window.Props = (() => {
     const fallbackSample = role === 'pitcher' ? 80 : 40;
     const effectiveSample = observedSample || fallbackSample;
     const prior = role === 'pitcher' ? PITCHER_REGRESSION_AB : BATTER_REGRESSION_AB;
-    const reliability = effectiveSample / (effectiveSample + prior);
-    const shrunkRate = LEAGUE_HIT_RATE + reliability * (rawRate - LEAGUE_HIT_RATE);
+    const { rate: shrunkRate, reliability } = shrink(rawRate, LEAGUE_HIT_RATE, effectiveSample, prior);
 
     return {
       profile,
       available: true,
       rawRate,
-      rate: clamp(shrunkRate, MIN_HIT_PROBABILITY, MAX_HIT_PROBABILITY),
+      rate: clamp(shrunkRate, MIN_PA_PROBABILITY, MAX_PA_PROBABILITY),
       source,
       sample: observedSample,
       reliability,
     };
   }
 
-  function platoonAdjustment(batterHand, pitcherHand) {
+  /**
+   * Which platoon split applies to this matchup, for each side. For hitters,
+   * vl/vr is keyed by the PITCHER's hand; for pitchers, by the BATTER's side
+   * (switch hitters bat opposite the pitcher's hand).
+   */
+  function platoonCode(batterHand, pitcherHand, role) {
+    const bh = String(batterHand || '').toUpperCase();
+    const ph = String(pitcherHand || '').toUpperCase();
+    if (role === 'pitcher') {
+      const side = bh === 'S' ? (ph === 'L' ? 'R' : 'L') : bh;
+      return side === 'L' ? 'vl' : side === 'R' ? 'vr' : null;
+    }
+    return ph === 'L' ? 'vl' : ph === 'R' ? 'vr' : null;
+  }
+
+  /**
+   * Data-driven platoon signal: the split AVG (shrunk by split sample) minus
+   * the player's own shrunk season rate, so only the *differential* enters —
+   * the season rate is already fully counted in the level evidence.
+   * Falls back to a small flat adjustment when no split data exists.
+   */
+  function platoonSignal(profile, seasonSignal, batterHand, pitcherHand, role) {
+    const code = platoonCode(batterHand, pitcherHand, role);
+    const split = code && profile && profile.splits ? profile.splits[code] : null;
+    const priorAB = role === 'pitcher' ? SPLIT_PITCHER_PRIOR_BF : SPLIT_BATTER_PRIOR_AB;
+
+    if (split && split.avg != null && split.atBats > 0) {
+      const { rate: shrunkSplit, reliability } = shrink(split.avg, LEAGUE_HIT_RATE, split.atBats, priorAB);
+      const handLabel = role === 'pitcher'
+        ? (code === 'vl' ? 'vs LHB' : 'vs RHB')
+        : (code === 'vl' ? 'vs LHP' : 'vs RHP');
+      return {
+        available: true,
+        rate: shrunkSplit,
+        rawAvg: split.avg,
+        atBats: split.atBats,
+        reliability,
+        label: handLabel,
+      };
+    }
+
+    // Legacy flat fallback so behavior without splits stays principled.
     const batter = String(batterHand || '').toUpperCase();
     const pitcher = String(pitcherHand || '').toUpperCase();
+    let value = 0;
+    let label = 'No handedness adjustment';
     if (!batter || !pitcher || !['L', 'R', 'S'].includes(batter) || !['L', 'R'].includes(pitcher)) {
-      return { value: 0, label: 'No handedness adjustment' };
+      return { available: false, flat: { value, label } };
     }
-    if (batter === 'S') {
-      return { value: 0.009, label: 'Switch-hitter platoon edge' };
+    if (role === 'batter') {
+      if (batter === 'S') { value = 0.009; label = 'Switch-hitter platoon edge'; }
+      else if (batter !== pitcher) { value = 0.009; label = 'Opposite-handed platoon edge'; }
+      else { value = -0.006; label = 'Same-handed matchup'; }
     }
-    if (batter !== pitcher) {
-      return { value: 0.009, label: 'Opposite-handed platoon edge' };
+    return { available: false, flat: { value, label } };
+  }
+
+  /**
+   * Recent form: combined AVG over the player's last FORM_WINDOW_GAMES games
+   * with at-bats (game-log dates must not exceed the game being modeled, so
+   * forecasts for completed games stay historically correct).
+   */
+  function formSignal(profile, gameDate) {
+    const log = Array.isArray(profile && profile.recentLog) ? profile.recentLog : [];
+    if (!log.length) return { available: false };
+
+    const cutoff = dayOf(gameDate);
+    const eligible = cutoff ? log.filter((entry) => entry.date <= cutoff) : log.slice();
+    let taken = 0;
+    let hits = 0;
+    let atBats = 0;
+    for (let i = eligible.length - 1; i >= 0 && taken < FORM_WINDOW_GAMES; i -= 1) {
+      const entry = eligible[i];
+      if (!(entry.atBats > 0)) continue;
+      hits += entry.hits || 0;
+      atBats += entry.atBats;
+      taken += 1;
     }
-    return { value: -0.006, label: 'Same-handed matchup' };
+    if (!taken || atBats < 8) return { available: false };
+
+    const raw = hits / atBats;
+    const { rate: shrunkRate, reliability } = shrink(raw, LEAGUE_HIT_RATE, atBats, FORM_PRIOR_AB);
+    return {
+      available: true,
+      rate: shrunkRate,
+      rawAvg: raw,
+      atBats,
+      games: taken,
+      reliability: reliability * FORM_WEIGHT_CAP,
+      label: `Last ${taken} G`,
+    };
+  }
+
+  /** Capped career head-to-head signal (batter vs this pitcher). */
+  function historySignal(profile) {
+    const h2h = profile && profile.h2h;
+    if (!h2h || h2h.avg == null || !(h2h.atBats > 0)) return { available: false };
+    const { rate: shrunkRate } = shrink(h2h.avg, LEAGUE_HIT_RATE, h2h.atBats, H2H_PRIOR_AB);
+    const reliability = Math.min(h2h.atBats, 20) / 20 * H2H_WEIGHT_CAP;
+    return {
+      available: true,
+      rate: shrunkRate,
+      rawAvg: h2h.avg,
+      atBats: h2h.atBats,
+      reliability,
+      label: `Career ${Math.round(h2h.rawAvg * h2h.atBats)}-for-${h2h.atBats}`,
+    };
+  }
+
+  /** Live in-at-bat count adjustment (odds multiplier). */
+  function countAdjustment(count) {
+    if (!count) return { applied: false, factor: 1, label: null };
+    const balls = clamp(parseInt(count.balls, 10) || 0, 0, 3);
+    const strikes = clamp(parseInt(count.strikes, 10) || 0, 0, 2);
+    if (balls === 0 && strikes === 0) return { applied: false, factor: 1, label: '0-0' };
+    const key = `${balls}-${strikes}`;
+    const factor = COUNT_FACTORS[key] != null ? COUNT_FACTORS[key] : 1;
+    return { applied: factor !== 1, factor, label: key };
   }
 
   /**
@@ -367,7 +708,7 @@ window.Props = (() => {
     const scoreDiff = Math.abs(scoreHome - scoreAway);
 
     let expectedFutureTeamPAs = 0;
-    for (let i = inning + 1; i <= 9; i++) {
+    for (let i = inning + 1; i <= 9; i += 1) {
       let inningWeight = 1.0;
       if (i === 9) {
         if (isHomeBatting) {
@@ -395,14 +736,20 @@ window.Props = (() => {
   }
 
   /**
-   * Predict the chance that a batter records a hit in the full plate appearance,
-   * adjusted by remaining plate appearances and game flow state.
+   * Predict the chance that a batter records a hit in THIS plate appearance.
    *
-   * Two signals enter independently: the batter's hit-production signal and
-   * the pitcher's hit-allowed signal. When both are available their regressed
-   * logits are blended evenly; if only one is available, that side is used with
-   * an explicit fallback label. This also accepts the previous three-argument
-   * signature modelHitProbability(batterStats, batterHand, pitcherHand).
+   * Structure (all in log-odds space; generalized log5):
+   *   level    = league prior, shifted by the batter's and pitcher's season
+   *              rates, each weighed by its sample-based reliability;
+   *   + platoon deltas from REAL splits (fallback: small flat adjustments);
+   *   + recent-form delta (game-log window, capped weight);
+   *   + capped head-to-head history delta;
+   *   = per-PA matchup rate (clamped), then
+   *   + times-through-the-order bump (probability space);
+   *   × live count factor (odds space) for the in-at-bat headline number.
+   *
+   * This also accepts the previous three-argument signature
+   * modelHitProbability(batterStats, batterHand, pitcherHand).
    */
   function modelHitProbability(batterStats, pitcherStats, batterHand, pitcherHand, gameContext = null) {
     // Backward compatibility with the one-sided model API.
@@ -412,39 +759,135 @@ window.Props = (() => {
       pitcherStats = null;
     }
 
+    const adjustments = [];
+    const leagueLogit = logit(LEAGUE_HIT_RATE);
+
+    /* --- 1. level: season evidence from both sides ------------------------ */
     const batter = buildSignal(batterStats, 'batter');
     const pitcher = buildSignal(pitcherStats, 'pitcher');
-    const activeSignals = [batter, pitcher].filter((signal) => signal.available);
 
-    let baseLogit = logit(LEAGUE_HIT_RATE);
-    if (activeSignals.length) {
-      baseLogit = activeSignals.reduce((sum, signal) => sum + logit(signal.rate), 0) /
-        activeSignals.length;
+    let totalDelta = 0;
+    if (batter.available) totalDelta += batter.reliability * (logit(batter.rate) - leagueLogit);
+    if (pitcher.available) totalDelta += pitcher.reliability * (logit(pitcher.rate) - leagueLogit);
+    totalDelta = clamp(totalDelta, -MAX_TOTAL_DELTA_LOGIT, MAX_TOTAL_DELTA_LOGIT);
+
+    let levelProbability = logistic(leagueLogit + totalDelta);
+    adjustments.push({
+      id: 'level',
+      label: 'Season matchup',
+      points: levelProbability - LEAGUE_HIT_RATE,
+    });
+
+    /* --- 2. platoon: real splits when available, flat fallback otherwise -- */
+    const batterSplit = platoonSignal(batter.profile, batter, batterHand, pitcherHand, 'batter');
+    const pitcherSplit = platoonSignal(pitcher.profile, pitcher, batterHand, pitcherHand, 'pitcher');
+
+    let platoonDeltaLogit = 0;
+    const platoonLabels = [];
+    if (batterSplit.available) {
+      platoonDeltaLogit += batterSplit.reliability * 0.85 *
+        (logit(batterSplit.rate) - logit(batter.available ? batter.rate : LEAGUE_HIT_RATE));
+      platoonLabels.push(`Batter ${batterSplit.label} ${displayRate(batterSplit.rawAvg)} (${batterSplit.atBats} AB)`);
+    }
+    if (pitcherSplit.available) {
+      platoonDeltaLogit += pitcherSplit.reliability * 0.85 *
+        (logit(pitcherSplit.rate) - logit(pitcher.available ? pitcher.rate : LEAGUE_HIT_RATE));
+      platoonLabels.push(`Pitcher ${pitcherSplit.label} ${displayRate(pitcherSplit.rawAvg)} (${pitcherSplit.atBats} BF AB)`);
     }
 
-    const platoon = platoonAdjustment(batterHand, pitcherHand);
-    const rawProbability = clamp(
-      logistic(baseLogit) + platoon.value,
-      MIN_HIT_PROBABILITY,
-      MAX_HIT_PROBABILITY,
-    );
+    const flatPlatoon = batterSplit.flat || { value: 0, label: '' };
+    let postPlatoonProbability;
+    let platoon;
+    if (batterSplit.available || pitcherSplit.available) {
+      postPlatoonProbability = logistic(logit(levelProbability) + platoonDeltaLogit);
+      platoon = {
+        value: postPlatoonProbability - levelProbability,
+        label: platoonLabels.join(' · ') || 'Platoon splits',
+        dataDriven: true,
+      };
+    } else {
+      postPlatoonProbability = levelProbability + (flatPlatoon.value || 0);
+      platoon = { value: flatPlatoon.value || 0, label: flatPlatoon.label, dataDriven: false };
+    }
+    adjustments.push({ id: 'platoon', label: platoon.label, points: platoon.value });
 
-    // Take into account remaining at bats and game flow state
+    /* --- 3. recent form (batter + pitcher, capped) ------------------------ */
+    const gameDate = gameContext && gameContext.gameDate;
+    const batterForm = formSignal(batter.profile, gameDate);
+    const pitcherForm = formSignal(pitcher.profile, gameDate);
+
+    let formDeltaLogit = 0;
+    const formLabels = [];
+    if (batterForm.available) {
+      formDeltaLogit += batterForm.reliability *
+        (logit(batterForm.rate) - logit(batter.available ? batter.rate : LEAGUE_HIT_RATE));
+      formLabels.push(`Batter ${batterForm.label} ${displayRate(batterForm.rawAvg)}`);
+    }
+    if (pitcherForm.available) {
+      formDeltaLogit += pitcherForm.reliability *
+        (logit(pitcherForm.rate) - logit(pitcher.available ? pitcher.rate : LEAGUE_HIT_RATE));
+      formLabels.push(`Pitcher ${pitcherForm.label} ${displayRate(pitcherForm.rawAvg)}`);
+    }
+    const postFormProbability = logistic(logit(postPlatoonProbability) + formDeltaLogit);
+    adjustments.push({
+      id: 'form',
+      label: formLabels.join(' · ') || 'Recent form',
+      points: postFormProbability - postPlatoonProbability,
+    });
+
+    /* --- 4. head-to-head history (career, capped tiny) -------------------- */
+    const h2h = historySignal(batter.profile);
+    let postHistoryProbability = postFormProbability;
+    if (h2h.available) {
+      const h2hDeltaLogit = h2h.reliability * (logit(h2h.rate) - leagueLogit);
+      postHistoryProbability = logistic(logit(postHistoryProbability) + h2hDeltaLogit);
+      adjustments.push({
+        id: 'history',
+        label: h2h.label,
+        points: postHistoryProbability - postFormProbability,
+      });
+    }
+
+    /* --- 5. times through the order (same-game familiarity) --------------- */
+    const timesFaced = Math.max(0, parseInt(gameContext && gameContext.timesFacedToday, 10) || 0);
+    const ttoPasses = Math.min(timesFaced, TTO_MAX_PASSES);
+    const ttoPoints = ttoPasses * TTO_BUMP_PER_PASS;
+    const postTtoProbability = postHistoryProbability + ttoPoints;
+    if (ttoPasses > 0) {
+      adjustments.push({
+        id: 'familiarity',
+        label: `${timesFaced + 1}${timesFaced === 0 ? 'st' : timesFaced === 1 ? 'nd' : 'rd'} look today`,
+        points: ttoPoints,
+      });
+    }
+
+    /* --- per-PA matchup rate (count-free) --------------------------------- */
+    const paProbability = clamp(postTtoProbability, MIN_PA_PROBABILITY, MAX_PA_PROBABILITY);
+
+    /* --- 6. live count (in-at-bat headline adjustment) -------------------- */
+    const countInfo = countAdjustment(gameContext && gameContext.count);
+    let liveProbability = paProbability;
+    if (countInfo.applied) {
+      const adjustedOdds = odds(paProbability) * countInfo.factor;
+      liveProbability = adjustedOdds / (1 + adjustedOdds);
+      adjustments.push({
+        id: 'count',
+        label: `Count ${countInfo.label}`,
+        points: liveProbability - paProbability,
+      });
+    }
+    const probability = clamp(liveProbability, MIN_LIVE_PROBABILITY, MAX_LIVE_PROBABILITY);
+
+    /* --- secondary projection: at least one hit across remaining PAs ------ */
     const remainingPAs = getExpectedRemainingPAs(gameContext);
-    
-    // If remainingPAs is 0 (e.g. game is over), the probability of a hit from this point is 0
-    let probability = rawProbability;
+    let gameFlowProbability = paProbability;
     if (remainingPAs === 0) {
-      probability = 0.0;
+      gameFlowProbability = 0.0;
     } else if (remainingPAs > 1.0) {
-      // Calculate the probability of getting at least one hit in the remaining plate appearances:
-      // P(at least 1 hit) = 1 - (1 - rawProbability)^remainingPAs
-      probability = 1.0 - Math.pow(1.0 - rawProbability, remainingPAs);
+      gameFlowProbability = 1.0 - Math.pow(1.0 - paProbability, remainingPAs);
     }
-    
-    // Ensure final probability is clamped within reasonable limits (unless it's 0 because game is over)
     if (remainingPAs > 0) {
-      probability = clamp(probability, MIN_HIT_PROBABILITY, 0.95);
+      gameFlowProbability = clamp(gameFlowProbability, MIN_PA_PROBABILITY, 0.95);
     }
 
     let coverage = 'baseline';
@@ -452,32 +895,56 @@ window.Props = (() => {
     else if (batter.available) coverage = 'batter-only';
     else if (pitcher.available) coverage = 'pitcher-only';
 
+    const usedSignals = [];
+    if (batter.available) usedSignals.push('batter season');
+    if (pitcher.available) usedSignals.push('pitcher season');
+    if (batterSplit.available || pitcherSplit.available) usedSignals.push('platoon splits');
+    if (batterForm.available || pitcherForm.available) usedSignals.push('recent form');
+    if (h2h.available) usedSignals.push('head-to-head');
+
     let coverageLabel = {
       'two-sided': 'Batter + pitcher season inputs',
       'batter-only': 'Batter input; pitcher baseline fallback',
       'pitcher-only': 'Pitcher input; batter baseline fallback',
       baseline: 'League baseline fallback',
     }[coverage];
-
+    if (usedSignals.length > (coverage === 'two-sided' ? 2 : 1)) {
+      coverageLabel = `Inputs: ${usedSignals.join(', ')}`;
+    }
     if (gameContext && remainingPAs > 0) {
-      const paDesc = remainingPAs.toFixed(1);
-      coverageLabel += ` · Game flow adjust (est. ${paDesc} PAs remaining)`;
+      coverageLabel += ` · est. ${remainingPAs.toFixed(1)} PAs left`;
     }
 
+    const tier = tierFor(probability);
+
     return {
+      // Headline: THIS plate appearance, count-adjusted when live.
       probability,
       prob: (probability * 100).toFixed(1),
       noHitProbability: 1 - probability,
       noHitProb: ((1 - probability) * 100).toFixed(1),
-      rawProbability,
-      rawProb: (rawProbability * 100).toFixed(1),
+      tier,
+      // Count-free per-PA matchup rate (used for upcoming batters + projections).
+      paProbability,
+      paProb: (paProbability * 100).toFixed(1),
+      // Projection over the rest of the game (the old headline number).
+      gameFlowProbability,
+      gameFlowProb: (gameFlowProbability * 100).toFixed(1),
       remainingPAs,
       batter,
       pitcher,
       platoon,
+      splits: { batter: batterSplit, pitcher: pitcherSplit },
+      form: { batter: batterForm, pitcher: pitcherForm },
+      h2h,
+      countFactor: countInfo,
+      timesFacedToday: timesFaced,
+      adjustments: adjustments.filter((adj) => adj.points !== 0 || adj.id === 'level'),
       coverage,
       coverageLabel,
       // Compatibility fields used by the previous PBP chip implementation.
+      rawProbability: paProbability,
+      rawProb: (paProbability * 100).toFixed(1),
       baseBa: batter.rate.toFixed(3),
       platoonAdv: platoon.value.toFixed(3),
     };
@@ -492,14 +959,19 @@ window.Props = (() => {
     return `${roleLabel} ${displayRate(signal.rate)} (${signal.source}${sample})`;
   }
 
+  function signedPoints(points) {
+    const pts = points * 100;
+    const sign = pts > 0.049 ? '+' : pts < -0.049 ? '−' : '';
+    return `${sign}${Math.abs(pts).toFixed(1)}`;
+  }
+
   function describeHitModel(model) {
-    const platoonPoints = Math.abs(model.platoon.value * 100).toFixed(1);
-    const direction = model.platoon.value > 0 ? '+' : model.platoon.value < 0 ? '−' : '';
-    const platoon = model.platoon.value
-      ? ` ${model.platoon.label} ${direction}${platoonPoints} pts.`
-      : '';
+    const parts = model.adjustments
+      .filter((adj) => Math.abs(adj.points) >= 0.001)
+      .map((adj) => `${adj.label} ${signedPoints(adj.points)} pts`);
+    const driverText = parts.length ? ` Drivers — ${parts.join(' · ')}.` : '';
     return `${model.coverageLabel}. ${signalDescription(model.batter, 'batter')}; ` +
-      `${signalDescription(model.pitcher, 'pitcher')}.${platoon}`;
+      `${signalDescription(model.pitcher, 'pitcher')}.${driverText}`;
   }
 
   /* --------------------------------------------------------- pitcher arsenal */
@@ -543,6 +1015,22 @@ window.Props = (() => {
     return { totalPitches: total, mix };
   }
 
+  /** Completed PAs this game between a batter/pitcher pair (times faced so far). */
+  function timesFacedToday(allPlays, batterId, pitcherId) {
+    if (!batterId || !pitcherId) return 0;
+    let count = 0;
+    (allPlays || []).forEach((play) => {
+      const matchup = play.matchup || {};
+      const about = play.about || {};
+      if (about.isComplete === false) return;
+      if (matchup.batter && matchup.pitcher &&
+          matchup.batter.id === batterId && matchup.pitcher.id === pitcherId) {
+        count += 1;
+      }
+    });
+    return count;
+  }
+
   /* --------------------------------------------------------------- rendering */
 
   function node(tag, className, text) {
@@ -555,6 +1043,11 @@ window.Props = (() => {
   function seasonFor(gameData) {
     const season = gameData && gameData.game && gameData.game.season;
     return normalizedSeason(season) || null;
+  }
+
+  function gameDateFor(gameData) {
+    const dt = gameData && gameData.datetime;
+    return dt && dt.dateTime ? dt.dateTime : null;
   }
 
   function playerWithGameData(player, gameData) {
@@ -581,31 +1074,69 @@ window.Props = (() => {
     parent.appendChild(image);
   }
 
+  function tierPill(model, compact = false) {
+    const pill = node('span', `tier-pill tier-${model.tier.key}`,
+      compact ? model.tier.label.replace(' matchup', '') : model.tier.label);
+    pill.title = 'Matchup tier from the per-plate-appearance hit probability';
+    return pill;
+  }
+
   function appendForecastBar(parent, model, compact = false) {
     const forecast = node('div', `hit-forecast ${compact ? 'hit-forecast-compact' : ''}`);
     const label = node('div', 'forecast-label-row');
-    label.appendChild(node('span', 'prob-label', compact ? 'Two-sided hit forecast' : 'Projected hit probability'));
-    label.appendChild(node('strong', 'prob-value', `${model.prob}%`));
+    label.appendChild(node('span', 'prob-label', compact ? 'Hit chance this PA' : 'Projected hit probability'));
+    const valueWrap = node('span', 'prob-value-wrap');
+    valueWrap.appendChild(node('strong', 'prob-value', `${model.prob}%`));
+    valueWrap.appendChild(tierPill(model, true));
+    label.appendChild(valueWrap);
     forecast.appendChild(label);
 
-    const track = node('div', 'prob-bar-container');
-    const bar = node('div', 'prob-bar');
-    bar.style.width = `${model.prob}%`;
+    const track = node('div', 'prob-bar-container scaled');
+    // Normalize the bar across the realistic per-PA band so differences read clearly.
+    const scaled = clamp((model.probability - MIN_PA_PROBABILITY) /
+      (MAX_LIVE_PROBABILITY - MIN_PA_PROBABILITY), 0, 1);
+    const bar = node('div', `prob-bar tier-fill-${model.tier.key}`);
+    bar.style.width = `${(scaled * 100).toFixed(1)}%`;
     track.appendChild(bar);
     forecast.appendChild(track);
 
-    const subline = node('div', 'forecast-subline', `${model.coverageLabel} · No hit ${model.noHitProb}%`);
+    const subline = node('div', 'forecast-subline',
+      `${model.coverageLabel} · No hit ${model.noHitProb}%`);
     forecast.appendChild(subline);
     forecast.title = describeHitModel(model);
     parent.appendChild(forecast);
   }
 
-  function appendSignal(parent, className, heading, signal, role) {
+  function appendSignal(parent, className, heading, signal, role, extra) {
     const side = node('div', `forecast-side ${className}`);
     side.appendChild(node('span', 'forecast-side-label', heading));
     side.appendChild(node('strong', 'forecast-side-value', signal.available ? displayRate(signal.rate) : '—'));
-    side.appendChild(node('span', 'forecast-side-meta', signalDescription(signal, role)));
+    const meta = [signalDescription(signal, role)];
+    if (extra) meta.push(extra);
+    side.appendChild(node('span', 'forecast-side-meta', meta.join(' · ')));
     parent.appendChild(side);
+  }
+
+  function adjustmentsRow(model) {
+    const chips = node('div', 'adj-chips');
+    const labels = {
+      level: 'Season',
+      platoon: 'Platoon',
+      form: 'Form',
+      history: 'History',
+      familiarity: 'Familiarity',
+      count: 'Count',
+    };
+    model.adjustments.forEach((adj) => {
+      const pts = adj.points * 100;
+      if (Math.abs(pts) < 0.05) return;
+      const cls = pts > 0 ? 'adj-pos' : 'adj-neg';
+      const chip = node('span', `adj-chip ${cls}`,
+        `${labels[adj.id] || adj.id} ${signedPoints(adj.points)}`);
+      chip.title = adj.label;
+      chips.appendChild(chip);
+    });
+    return chips;
   }
 
   function forecastSection(batter, pitcher, model) {
@@ -615,8 +1146,11 @@ window.Props = (() => {
 
     const scoreLine = node('div', 'forecast-scoreline');
     const hitBlock = node('div', 'forecast-result');
-    hitBlock.appendChild(node('span', 'forecast-result-label', 'Hit'));
-    hitBlock.appendChild(node('strong', 'forecast-result-value', `${model.prob}%`));
+    hitBlock.appendChild(node('span', 'forecast-result-label', 'Hit this PA'));
+    const hitValueRow = node('div', 'forecast-value-row');
+    hitValueRow.appendChild(node('strong', 'forecast-result-value', `${model.prob}%`));
+    hitValueRow.appendChild(tierPill(model));
+    hitBlock.appendChild(hitValueRow);
     scoreLine.appendChild(hitBlock);
     const noHitBlock = node('div', 'forecast-result forecast-no-hit');
     noHitBlock.appendChild(node('span', 'forecast-result-label', 'No hit'));
@@ -624,39 +1158,57 @@ window.Props = (() => {
     scoreLine.appendChild(noHitBlock);
     section.appendChild(scoreLine);
 
-    const track = node('div', 'forecast-main-track');
-    const bar = node('div', 'forecast-main-bar');
-    bar.style.width = `${model.prob}%`;
+    const track = node('div', 'forecast-main-track scaled');
+    const scaled = clamp((model.probability - MIN_PA_PROBABILITY) /
+      (MAX_LIVE_PROBABILITY - MIN_PA_PROBABILITY), 0, 1);
+    const bar = node('div', `forecast-main-bar tier-fill-${model.tier.key}`);
+    bar.style.width = `${(scaled * 100).toFixed(1)}%`;
     track.appendChild(bar);
     section.appendChild(track);
+    section.appendChild(node('div', 'forecast-scale-note',
+      `Per-PA scale ${Math.round(MIN_PA_PROBABILITY * 100)}–${Math.round(MAX_LIVE_PROBABILITY * 100)}% · ` +
+      `Chance of ≥1 more hit this game: ${model.gameFlowProb}% (est. ${model.remainingPAs.toFixed(1)} PAs)`));
 
     const sides = node('div', 'forecast-sides');
-    appendSignal(sides, 'forecast-batter', 'Batter signal', model.batter, 'batter');
-    appendSignal(sides, 'forecast-pitcher', 'Pitcher signal', model.pitcher, 'pitcher');
+    const batterSplit = model.splits.batter;
+    const pitcherSplit = model.splits.pitcher;
+    appendSignal(sides, 'forecast-batter', 'Batter signal', model.batter, 'batter',
+      batterSplit.available
+        ? `Split ${batterSplit.label}: ${displayRate(batterSplit.rawAvg)} (${batterSplit.atBats} AB)`
+        : null);
+    appendSignal(sides, 'forecast-pitcher', 'Pitcher signal', model.pitcher, 'pitcher',
+      pitcherSplit.available
+        ? `Split ${pitcherSplit.label}: ${displayRate(pitcherSplit.rawAvg)} (${pitcherSplit.atBats} BF AB)`
+        : null);
     section.appendChild(sides);
 
-    const adjustments = node('div', 'forecast-adjustments');
-    const platoonPoints = model.platoon.value === 0
-      ? '0.0'
-      : `${model.platoon.value > 0 ? '+' : '−'}${Math.abs(model.platoon.value * 100).toFixed(1)}`;
-    adjustments.appendChild(node('span', 'forecast-adjustment-label', 'Handedness'));
-    adjustments.appendChild(node('span', 'forecast-adjustment-value',
-      `${model.platoon.label} · ${platoonPoints} percentage points`));
-    section.appendChild(adjustments);
+    const chips = adjustmentsRow(model);
+    if (model.adjustments.some((adj) => Math.abs(adj.points) * 100 >= 0.05)) {
+      const adjustments = node('div', 'forecast-adjustments');
+      adjustments.appendChild(node('span', 'forecast-adjustment-label', 'Drivers'));
+      adjustments.appendChild(chips);
+      section.appendChild(adjustments);
+    }
 
     section.appendChild(node('p', 'forecast-method-note',
-      'Season rates are regressed toward the league hit rate before the batter and pitcher signals are blended. This is a pre-plate-appearance estimate, not a betting line.'));
+      'Season rates are regressed toward the league hit rate, combined multiplicatively (log5), then adjusted by platoon splits, recent form, head-to-head history, same-game familiarity, and the live count. This is a per-plate-appearance estimate, not a betting line.'));
     section.title = describeHitModel(model);
     return section;
   }
 
-  function pitcherSection(pitcher, pitcherStats, arsenal) {
+  function pitcherSection(pitcher, pitcherStats, arsenal, model) {
     const section = node('section', 'props-section pitcher-section');
     section.appendChild(node('h3', 'props-heading', `Current Pitcher: ${playerName(pitcher)}`));
     const rateText = pitcherStats.xBA !== '—' || pitcherStats.avg !== '—'
       ? `Hit-allowed inputs: xBA ${pitcherStats.xBA} · Opp. AVG ${pitcherStats.avg}`
       : 'Pitcher season hit-allowed data is unavailable.';
     section.appendChild(node('p', 'mix-meta pitcher-input-line', rateText));
+
+    const form = model && model.form && model.form.pitcher;
+    if (form && form.available) {
+      section.appendChild(node('p', 'mix-meta pitcher-input-line',
+        `Recent form: ${displayRate(form.rawAvg)} allowed over last ${form.games} G (${form.atBats} AB)`));
+    }
 
     if (!arsenal.totalPitches) {
       section.appendChild(node('p', 'mix-meta', 'No pitches thrown yet today.'));
@@ -699,7 +1251,8 @@ window.Props = (() => {
     };
     stat('xBA', batterStats.xBA);
     stat('AVG', batterStats.avg);
-    stat('Pitcher signal', pitcherStats.xBA !== '—' ? pitcherStats.xBA : pitcherStats.avg);
+    const split = model.splits.batter;
+    stat('Split', split.available ? displayRate(split.rawAvg) : '—');
     card.appendChild(stats);
 
     appendForecastBar(card, model, true);
@@ -730,6 +1283,7 @@ window.Props = (() => {
     container.replaceChildren(node('div', 'props-loading', 'Loading two-sided matchup data…'));
 
     const season = seasonFor(gameData);
+    const gameDate = gameDateFor(gameData);
     const batterHand = playerHand(batter, matchup.batSide);
     const pitcherHand = (matchup.pitchHand && matchup.pitchHand.code) || (pitcher.pitchHand && pitcher.pitchHand.code) || '';
     const batters = [
@@ -738,15 +1292,20 @@ window.Props = (() => {
       { player: inHole, label: 'In the Hole', hand: playerHand(inHole) },
     ].filter((entry) => entry.player && entry.player.id);
 
+    const allPlays = live.plays && live.plays.allPlays || [];
+
     Promise.all([
       fetchPlayerStats(pitcher.id, 'pitching', season),
+      fetchHeadToHead(batter.id, pitcher.id),
       ...batters.map((entry) => fetchPlayerStats(entry.player.id, 'hitting', season)),
     ]).then((data) => {
       if (version !== renderVersion || !container.isConnected) return;
 
       const pitcherStats = parsePitcherStats(data[0]);
-      const batterData = data.slice(1);
+      const h2h = parseHeadToHead(data[1]);
+      const batterData = data.slice(2);
       const currentStats = parseBatterStats(batterData[0]);
+      currentStats.h2h = h2h;
 
       const ls = live.linescore || {};
       const box = live.boxscore || {};
@@ -773,21 +1332,29 @@ window.Props = (() => {
         scoreHome,
         outs: ls.outs,
         gameState: gameData.status && gameData.status.abstractGameState,
+        gameDate,
+        count: currentPlay.count || null,
+        timesFacedToday: timesFacedToday(allPlays, batter.id, pitcher.id),
       };
 
       const currentModel = modelHitProbability(currentStats, pitcherStats, batterHand, pitcherHand, gameContext);
-      const arsenal = getPitcherArsenal(live.plays && live.plays.allPlays, pitcher.id);
+      const arsenal = getPitcherArsenal(allPlays, pitcher.id);
 
       container.replaceChildren();
       container.appendChild(forecastSection(batter, pitcher, currentModel));
-      container.appendChild(pitcherSection(pitcher, pitcherStats, arsenal));
+      container.appendChild(pitcherSection(pitcher, pitcherStats, arsenal, currentModel));
 
       const batterSection = node('section', 'props-section batters-section');
       batterSection.appendChild(node('h3', 'props-heading', `Upcoming Batters vs ${playerName(pitcher)}`));
       const grid = node('div', 'batters-grid');
       batters.forEach((entry, index) => {
         const orderPos = getBattingOrderPosition(box, battingSide, entry.player.id);
-        const batterContext = Object.assign({}, gameContext, { battingOrderPos: orderPos });
+        const batterContext = Object.assign({}, gameContext, {
+          battingOrderPos: orderPos,
+          // Only the live at-bat carries a count; on-deck/in-hole start fresh.
+          count: index === 0 ? gameContext.count : null,
+          timesFacedToday: timesFacedToday(allPlays, entry.player.id, pitcher.id),
+        });
         grid.appendChild(batterCard(
           entry.player,
           entry.label,
@@ -813,12 +1380,15 @@ window.Props = (() => {
   return {
     render,
     fetchPlayerStats,
+    fetchHeadToHead,
     getCachedPlayerStats,
     getHitPrediction,
     getPitcherArsenal,
+    timesFacedToday,
     parseStatcast,
     parseBatterStats,
     parsePitcherStats,
+    parseHeadToHead,
     modelHitProbability,
     describeHitModel,
   };
