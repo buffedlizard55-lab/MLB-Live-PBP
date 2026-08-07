@@ -1,0 +1,8 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local tooling (not used by this project, but harmless to ignore)
+node_modules/
+.vscode/
+.idea/

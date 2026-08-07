@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MLB Live PBP — Game</title>
+  <meta name="description" content="Live MLB game view: who's at bat, who's pitching, runners, count, linescore, box score and full play-by-play.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='46' fill='%23fff' stroke='%23e03131' stroke-width='6'/%3E%3Cpath d='M50 4 A46 46 0 0 1 96 50 M50 96 A46 46 0 0 1 4 50 M4 50 A46 46 0 0 1 50 4 M96 50 A46 46 0 0 1 50 96' stroke='%23e03131' stroke-width='2.5' fill='none'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body class="page-game">
+  <header class="topbar topbar-game">
+    <a class="btn btn-ghost" href="index.html">← Scoreboard</a>
+    <div class="game-controls">
+      <button id="refresh-btn" class="btn">Refresh</button>
+      <span class="countdown" id="countdown"></span>
+    </div>
+  </header>
+
+  <div id="loading" class="loading-overlay"><div class="spinner"></div></div>
+
+  <main id="main" class="game-main">
+
+    <!-- game header: teams / score / status -->
+    <section class="game-header">
+      <div id="header-away" class="header-side"></div>
+      <div id="header-center" class="header-center"></div>
+      <div id="header-home" class="header-side"></div>
+    </section>
+    <div id="header-meta" class="header-meta"></div>
+    <div id="header-decisions" class="header-decisions"></div>
+
+    <!-- live module: at bat / pitching -->
+    <section id="live-panel" class="live-panel"></section>
+
+    <!-- linescore -->
+    <section id="linescore-wrap" class="panel"></section>
+
+    <!-- tabs: play-by-play / box score -->
+    <nav class="tabs tabs-game" aria-label="Game views">
+      <button class="tab-btn tab-on" data-tab="plays">Play-by-Play</button>
+      <button class="tab-btn" data-tab="boxscore">Box Score</button>
+    </nav>
+
+    <section id="panel-plays" class="panel">
+      <div id="plays-wrap" class="plays-wrap"></div>
+    </section>
+
+    <section id="panel-boxscore" class="panel" style="display:none">
+      <div id="boxscore-wrap" class="boxscore-wrap"></div>
+    </section>
+
+    <div id="status-line" class="status-line"></div>
+  </main>
+
+  <footer class="site-footer">
+    <p>
+      Unofficial fan project. Live data via the public MLB StatsAPI
+      (<a href="https://statsapi.mlb.com" target="_blank" rel="noopener">statsapi.mlb.com</a>).
+      Not affiliated with MLB or MLB Advanced Media.
+    </p>
+  </footer>
+
+  <script src="assets/js/api.js"></script>
+  <script src="assets/js/ui.js"></script>
+  <script src="assets/js/game.js"></script>
+</body>
+</html>
