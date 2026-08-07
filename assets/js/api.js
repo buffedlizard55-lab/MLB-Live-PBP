@@ -160,23 +160,26 @@ const MLB = (() => {
       return n > 9 ? `Final/${n}` : 'Final';
     }
     const st = (linescore.inningState || '').toLowerCase();
-    const ord = linescore.currentInningOrdinal ||
-                (linescore.currentInning ? ordinal(linescore.currentInning) : '');
-    if (st === 'top') return `Top ${ord}`;
-    if (st === 'bottom') return `Bot ${ord}`;
-    if (st === 'middle') return `Mid ${ord}`;
-    if (st === 'end') return `End ${ord}`;
-    return ord ? `${st} ${ord}` : '';
+    const num = linescore.currentInning != null
+      ? String(linescore.currentInning)
+      : linescore.currentInningOrdinal || '';
+    if (st === 'top') return `Top ${num}`;
+    if (st === 'bottom') return `Bot ${num}`;
+    if (st === 'middle') return `Mid ${num}`;
+    if (st === 'end') return `End ${num}`;
+    return num ? `${st} ${num}` : '';
   }
 
   /** "▲ 5" / "▼ 5" / "◆ 5" glyph + label for scoreboard cards. */
   function inningGlyph(linescore) {
     if (!linescore) return '';
     const st = (linescore.inningState || '').toLowerCase();
-    const ord = linescore.currentInningOrdinal || '';
-    if (st === 'top') return `▲ ${ord}`;
-    if (st === 'bottom') return `▼ ${ord}`;
-    if (st === 'middle') return `◆ ${ord}`;
+    const num = linescore.currentInning != null
+      ? String(linescore.currentInning)
+      : linescore.currentInningOrdinal || '';
+    if (st === 'top') return `▲ ${num}`;
+    if (st === 'bottom') return `▼ ${num}`;
+    if (st === 'middle') return `◆ ${num}`;
     return '';
   }
 

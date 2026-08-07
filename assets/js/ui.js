@@ -50,6 +50,13 @@ const UI = (() => {
 
   /** Logo <img> that falls back to a colored circle with the abbreviation. */
   function teamLogo(teamId, teamName, abbrev, cls) {
+    const holder = (id, name) => {
+      const h = el('span', `team-logo-fallback ${cls || ''}`);
+      h.style.background = teamColor(id);
+      h.textContent = abbrev || (name || '?').slice(0, 3).toUpperCase();
+      return h;
+    };
+    if (!teamId) return holder(teamId, teamName);
     const img = el('img', `team-logo ${cls || ''}`);
     img.alt = teamName || 'team';
     img.loading = 'lazy';
@@ -59,18 +66,18 @@ const UI = (() => {
       const fb = new Image();
       fb.src = MLB.teamLogoFallbackUrl(teamId);
       fb.onload = () => { img.src = fb.src; };
-      fb.onerror = () => {
-        const holder = el('span', 'team-logo-fallback');
-        holder.style.background = teamColor(teamId);
-        holder.textContent = abbrev || (teamName || '?').slice(0, 3).toUpperCase();
-        img.replaceWith(holder);
-      };
+      fb.onerror = () => { img.replaceWith(holder(teamId, teamName)); };
     };
     return img;
   }
 
   /** Player headshot <img> with graceful hide on error. */
   function headshot(personId, name, cls) {
+    if (!personId) {
+      const placeholder = el('span', `headshot headshot-na ${cls || ''}`);
+      placeholder.title = name || 'player';
+      return placeholder;
+    }
     const img = el('img', `headshot ${cls || ''}`);
     img.alt = name || 'player';
     img.loading = 'lazy';

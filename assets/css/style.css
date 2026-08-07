@@ -442,6 +442,13 @@ a:hover { text-decoration: underline; }
   background: var(--panel-2);
   object-fit: cover;
 }
+.headshot-na {
+  width: 52px; height: 52px;
+  border-radius: 50%;
+  background: var(--panel-2);
+  border: 1px dashed var(--line);
+  display: inline-block;
+}
 .ab-name { font-size: 18px; font-weight: 800; }
 .ab-meta { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
 
