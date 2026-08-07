@@ -665,6 +665,8 @@
     const atBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 80;
     const list = UI.el('div', 'plays-list');
 
+    // Collect finished at-bats that need a pre-at-bat hit-probability chip.
+    const probItems = [];
     let curKey = null;
     plays.allPlays.forEach((play) => {
       const result = play.result;
@@ -675,10 +677,75 @@
         curKey = key;
         list.appendChild(playSectionHeader(about));
       }
-      list.appendChild(playRow(play));
+      list.appendChild(playRow(play, probItems));
     });
     wrap.appendChild(list);
     if (atBottom) wrap.scrollTop = wrap.scrollHeight;
+
+    // Fill in the hit-probability chips (needs the batters' statcast stats).
+    enrichPlayHitProb(probItems);
+  }
+
+  /**
+   * Whether a play is a *completed* plate appearance (an at-bat that finished).
+   * Live/in-progress at-bats have about.isComplete === false and are excluded,
+   * since the request was specifically the probability "before taking the at bat".
+   */
+  function isFinishedAtBat(play) {
+    const about = play.about;
+    if (!about) return true;             // final games: treat as finished
+    return about.isComplete !== false;   // false => still in progress
+  }
+
+  /** Did this at-bat result in a hit? Prefer the feed flag, else infer from the event. */
+  function atBatWasHit(play) {
+    const r = play.result || {};
+    if (typeof r.isHit === 'boolean') return r.isHit;
+    const ev = r.event || '';
+    return /\b(Single|Double|Triple|Home Run|Ground Rule Double|Inside[\s-]the[\s-]park Home Run)\b/i.test(ev);
+  }
+
+  /**
+   * Compute and paint the pre-at-bat hit probability for each finished at-bat.
+   * Batters' statcast/season stats are fetched once and cached in Props, so
+   * re-renders (polling) resolve instantly from cache.
+   */
+  async function enrichPlayHitProb(items) {
+    if (!items.length || !window.Props || !window.Props.fetchPlayerStats) return;
+
+    const ids = [...new Set(
+      items.map((it) => it.play.matchup && it.play.matchup.batter && it.play.matchup.batter.id)
+            .filter(Boolean)
+    )];
+
+    // Warm the cache (no-op for already-cached batters).
+    try {
+      await Promise.all(ids.map((id) => window.Props.fetchPlayerStats(id)));
+    } catch (_) { /* ignore — individual failures are handled below */ }
+
+    items.forEach(({ play, chip, bHand, pHand }) => {
+      const id = play.matchup && play.matchup.batter && play.matchup.batter.id;
+      const data = id ? window.Props.getCachedPlayerStats(id) : null;
+      if (!data) {
+        chip.textContent = 'Hit —';
+        chip.classList.remove('loading');
+        chip.title = 'Hit probability unavailable (no stat data)';
+        return;
+      }
+      const stats = window.Props.parseStatcast(data);
+      const model = window.Props.modelHitProbability(stats, bHand, pHand);
+      const gotHit = atBatWasHit(play);
+
+      chip.textContent = '';
+      chip.classList.remove('loading');
+      chip.classList.add(gotHit ? 'hit-yes' : 'hit-no');
+      chip.appendChild(UI.el('span', 'hp-label', 'Hit'));
+      chip.appendChild(UI.el('span', 'hp-val', `${model.prob}%`));
+      chip.appendChild(UI.el('span', 'hp-mark', gotHit ? '✓' : '✗'));
+      chip.title = `Implied hit probability before this at-bat: ${model.prob}% ` +
+        `(model: base ${model.baseBa} ${pHand && bHand ? `· ${bHand} vs ${pHand}` : ''} ` +
+        `± platoon ${model.platoonAdv}) · ${gotHit ? 'got the hit' : 'no hit'}`;
+    });
   }
 
   function playSectionHeader(about) {
@@ -690,7 +757,7 @@
     return head;
   }
 
-  function playRow(play) {
+  function playRow(play, probItems) {
     const result = play.result;
     const about = play.about || {};
     const count = play.count || {};
@@ -729,6 +796,18 @@
         strip.appendChild(dot);
       });
       chips.appendChild(strip);
+    }
+
+    /* pre-at-bat hit probability (finished at-bats that are real plate appearances) */
+    if (window.Props && window.Props.modelHitProbability && probItems &&
+        isFinishedAtBat(play) && pitches.length &&
+        play.matchup && play.matchup.batter && play.matchup.batSide) {
+      const bHand = play.matchup.batSide.code || 'R';
+      const pHand = play.matchup.pitchHand ? play.matchup.pitchHand.code : 'R';
+      const chip = UI.el('span', 'chip-hitprob loading', 'Hit …');
+      chip.title = 'Pre-at-bat implied hit probability (model)';
+      chips.appendChild(chip);
+      probItems.push({ play, chip, bHand, pHand });
     }
 
     row.appendChild(chips);
