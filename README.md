@@ -1,5 +1,11 @@
 # ⚾ MLB Live PBP — Live MLB Scoreboard & Play-by-Play
 
+> ### 🛑 **CHECKPOINT NOTICE: `v1.0.0-stable-checkpoint`** 🛑
+> **This tag marks a safe, working baseline of the code. If any experimental changes break the app, you can instantly revert back to this stable state by running:**
+> ```bash
+> git reset --hard v1.0.0-stable-checkpoint
+> ```
+
 A zero-dependency, static web app that pulls **live MLB game data** straight from the
 public MLB StatsAPI and renders it in a **Gameday-style scoreboard** — exactly the data
 mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
