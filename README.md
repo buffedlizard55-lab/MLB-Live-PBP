@@ -16,10 +16,12 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
   who's pitching, the count, outs, runners on base**, on-deck / in-the-hole hitters,
   pitch counts, last play, inning-by-inning linescore, full box score, and the complete
   play-by-play timeline with pitch-by-pitch details.
-- **Two-sided hit forecast** — a transparent pre-plate-appearance estimate that blends
-  the batter's season hit-production signal with the pitcher's hit-allowed signal,
-  shows the hit/no-hit split, and explains the handedness adjustment. It appears in
-  the live at-bat card, the Props & Matchup tab, and completed PBP rows.
+- **Two-sided hit forecast** — a transparent per-plate-appearance hit probability that
+  compounds the batter's and pitcher's season rates (log5), real platoon splits,
+  recent form, head-to-head history, same-game familiarity, and the live count into a
+  single number with a matchup tier (Elite → Pitcher's edge) and per-driver point
+  adjustments. It appears in the live at-bat card, the Props & Matchup tab, and
+  completed PBP rows.
 - Auto-refreshes every **5 seconds** during live games; works on desktop and mobile.
 - No build step, no frameworks, no API keys — it runs on **GitHub Pages** (or any static
   host, or even `file://`).
@@ -45,7 +47,8 @@ This project does the same thing with its own front end. The API calls we make:
 | Fallback bundle (if the feed 404s) | `GET /api/v1/game/{gamePk}/playByPlay` + `/boxscore` + `/linescore` |
 | Team logos | `https://www.mlbstatic.com/team-logos/team-cap-on-dark/{teamId}.svg` |
 | Player headshots | `https://img.mlbstatic.com/mlb-photos/image/upload/.../v1/people/{playerId}/headshot/67/current` |
-| Batter / pitcher season inputs for the forecast | `GET /api/v1/people/{playerId}/stats?stats=statcast,expectedStatistics,season&group=hitting&season=YYYY`; pitchers request `expectedStatistics,season` with `group=pitching` |
+| Batter / pitcher season inputs for the forecast | `GET /api/v1/people/{playerId}/stats?stats=statcast,expectedStatistics,season,statSplits,gameLog&group=hitting&sitCodes=vl,vr&season=YYYY`; pitchers request `expectedStatistics,season,statSplits,gameLog` with `group=pitching` |
+| Career head-to-head for the live forecast | `GET /api/v1/people/{batterId}/stats?stats=vsPlayer&group=hitting&opposingPlayerId={pitcherId}` |
 
 The live feed is the heart of it — one response contains everything Gameday shows:
 
@@ -66,18 +69,33 @@ games use slower cadences, and polling pauses automatically while the tab is hid
 
 ## Two-sided hit forecast
 
-The hit percentage is a **transparent, pre-plate-appearance estimate** — not an MLB
-projection or a betting line. It deliberately gives both participants a visible role:
+The hit percentage is a **transparent, per-plate-appearance estimate** — not an MLB
+projection or a betting line. It is built to *discriminate*: great spots and terrible
+spots land far apart instead of clustering around the league average. The model:
 
-1. **Batter side:** current-season xBA (when available) and AVG form a hit-production
-   signal. xBA receives the larger weight because it is less dependent on where batted
-   balls landed.
-2. **Pitcher side:** current-season xBA allowed (when available) and opponent AVG form
-   a hit-allowed signal. A lower pitcher signal suppresses the final hit forecast.
-3. **Small samples:** each side is regressed toward a `.245` league hit-rate baseline
-   using its available at-bats before the two signals are blended in log-odds space.
-4. **Matchup:** a small, explicit platoon adjustment is added for opposite-handed or
-   switch-hitter matchups. The UI also exposes the complementary **No hit** chance.
+1. **Season level (both sides):** the batter's xBA/AVG hit-production signal and the
+   pitcher's xBA-allowed/opponent-AVG signal are each regressed toward a `.245` league
+   baseline (sample-based reliability), then compounded in log-odds space — a
+   generalized **log5** (Bill James's odds-ratio method), so extreme signals push the
+   estimate toward the extremes rather than canceling toward the mean.
+2. **Platoon splits:** each player's real `vs LHP` / `vs RHP` (pitchers: `vs LHB` /
+   `vs RHB`) split enters as a shrunken *differential* against their own season rate.
+   Without split data, a small flat handedness adjustment is used instead.
+3. **Recent form:** the player's game-log window (last ~8 games, never using games
+   after the modeled game's date) nudges the estimate with a capped weight.
+4. **Head-to-head:** the career batter/pitcher line is a strictly capped, small nudge.
+5. **Same-game familiarity:** each repeat plate appearance against the same pitcher
+   adds a small times-through-the-order bump (~+0.75 pts/pass, capped at the third look).
+6. **Live count:** mid-at-bat, the fresh-count estimate is multiplied in odds space by
+   an empirically anchored count factor (3-1 » 0-0 » 0-2); walks are *not* hits, so
+   3-ball factors deliberately exclude the walk's value (see
+   `tools/count-model-derivation.mjs` for the derivation and anchors).
+
+The headline number is the **hit probability for this plate appearance**; the chance
+of at least one more hit across the remaining expected plate appearances is shown as a
+secondary projection. A **matchup tier** (Elite matchup / Favorable / Neutral / Tough /
+Pitcher's edge) and per-driver **adjustment chips** (season, platoon, form, history,
+familiarity, count — in percentage points) make every forecast explainable.
 
 If one player has no usable season data, the forecast remains available but labels the
 fallback (for example, “Batter input; pitcher baseline fallback”). If neither side has

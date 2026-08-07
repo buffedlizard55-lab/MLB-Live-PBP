@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 /* ============================================================================
- * hit-model-test.mjs — deterministic checks for the two-sided hit forecast.
+ * hit-model-test.mjs — deterministic checks for the discriminative two-sided
+ * hit forecast (model v2).
  *
  * Run: node tools/hit-model-test.mjs
  *
- * This evaluates the browser script in a tiny VM; no network requests or DOM
- * are required. The cases intentionally cover model direction, the complement
- * invariant, graceful data fallbacks, parser aliases, and legacy API support.
+ * Evaluates the browser script in a tiny VM; no network or DOM required.
+ * Beyond direction/invariant checks, this suite encodes the SPREAD
+ * requirements that motivated v2: stacked edges must separate clearly,
+ * and live context (count, times-through-order, form) must move the number.
  * ==========================================================================*/
 
 import assert from 'node:assert/strict';
@@ -33,6 +35,8 @@ vm.runInContext(source, context, { filename: 'assets/js/props.js' });
 const { Props } = context.window;
 assert.ok(Props, 'Props module should load');
 
+/* ------------------------------------------------- season-only basics (v1 API) */
+
 const highContactBatter = { xBA: '.320', avg: '.310', atBats: 560 };
 const lowContactBatter = { xBA: '.195', avg: '.205', atBats: 560 };
 const hitFriendlyPitcher = { xBA: '.305', avg: '.300', atBats: 680 };
@@ -43,8 +47,8 @@ const favorable = Props.modelHitProbability(
 const unfavorable = Props.modelHitProbability(
   lowContactBatter, hitSuppressingPitcher, 'R', 'R');
 assert.equal(favorable.coverage, 'two-sided', 'both supplied player sides should be used');
-assert.ok(favorable.probability > unfavorable.probability + 0.08,
-  'a stronger batter against a weaker pitcher should raise the forecast materially');
+assert.ok(favorable.probability > unfavorable.probability + 0.10,
+  `extreme matchups must separate by >10 pts even without splits (got ${favorable.prob} vs ${unfavorable.prob})`);
 
 const againstWeakPitcher = Props.modelHitProbability(
   highContactBatter, hitFriendlyPitcher, 'R', 'R');
@@ -61,17 +65,19 @@ const switchHitter = Props.modelHitProbability(
 const sameHanded = Props.modelHitProbability(
   highContactBatter, hitFriendlyPitcher, 'R', 'R');
 assert.ok(switchHitter.probability > sameHanded.probability,
-  'switch hitters should receive the documented platoon edge');
+  'without split data, switch hitters should keep the documented flat platoon edge');
 
 const noData = Props.modelHitProbability({}, {}, '', '');
 assert.equal(noData.coverage, 'baseline', 'missing data should be an explicit baseline fallback');
 assert.equal(noData.prob, '24.5', 'baseline fallback should remain stable and transparent');
+assert.equal(noData.tier.key, 'neutral', 'league-average rates should be the neutral tier');
 
 // Original modelHitProbability(stats, batterHand, pitcherHand) callers still work.
 const legacy = Props.modelHitProbability(highContactBatter, 'L', 'R');
 assert.equal(legacy.coverage, 'batter-only', 'legacy call should gracefully become a one-side fallback');
 
-// Game context / remaining at-bats / game flow state adjustments test cases.
+/* --------------------------------------- the headline is the per-PA rate now */
+
 const contextInning1 = { inning: 1, halfInning: 'top', battingOrderPos: 1, isHomeBatting: false, gameState: 'Live' };
 const contextInning9 = { inning: 9, halfInning: 'top', battingOrderPos: 9, isHomeBatting: false, gameState: 'Live' };
 const contextFinal = { inning: 9, halfInning: 'bottom', battingOrderPos: 5, isHomeBatting: true, gameState: 'Final' };
@@ -80,24 +86,169 @@ const probInning1 = Props.modelHitProbability(highContactBatter, hitFriendlyPitc
 const probInning9 = Props.modelHitProbability(highContactBatter, hitFriendlyPitcher, 'L', 'R', contextInning9);
 const probFinal = Props.modelHitProbability(highContactBatter, hitFriendlyPitcher, 'L', 'R', contextFinal);
 
-assert.ok(probInning1.probability > probInning9.probability,
-  'first several innings should have higher hit probability due to more expected at-bats');
-assert.ok(probInning9.probability < 0.50,
-  'as game progresses (9th inning), hit probability should go down towards a single plate appearance rate');
-assert.equal(probFinal.probability, 0.0,
-  'hit probability should be 0.0 once the game is over / final');
+assert.ok(Math.abs(probInning1.probability - probInning9.probability) < 1e-9,
+  'the per-PA headline rate must not drift with inning/score (that was the v1 clustering bug)');
+assert.ok(probInning1.gameFlowProbability > probInning9.gameFlowProbability,
+  'the remaining-PAs projection should still reward many remaining at-bats');
+assert.equal(probFinal.gameFlowProbability, 0.0,
+  'the remaining-PAs projection goes to 0 for finished games');
+assert.ok(probFinal.probability > 0.01,
+  'the per-PA headline stays meaningful for chips on finished games');
+assert.ok(probInning1.probability < 0.42 && probInning9.probability > 0.10,
+  'per-PA probabilities stay inside the realistic band');
+
+/* ------------------------------------------------- DISCRIMINATION (v2 core) */
+
+// Stacked edges: platoon splits + recent form widen the gap far beyond v1.
+const eliteBatter = {
+  xBA: '.320', avg: '.310', atBats: 560,
+  splits: { vr: { avg: '.360', atBats: 400 } },
+  recent: { avg: '.380', atBats: 30 },
+};
+const generousPitcher = {
+  xBA: '.305', avg: '.300', atBats: 680,
+  splits: { vr: { avg: '.340', atBats: 300 } },
+};
+const overwhelmedBatter = {
+  xBA: '.195', avg: '.205', atBats: 560,
+  splits: { vr: { avg: '.170', atBats: 400 } },
+  recent: { avg: '.150', atBats: 30 },
+};
+const dominantPitcher = {
+  xBA: '.190', avg: '.200', atBats: 680,
+  splits: { vr: { avg: '.175', atBats: 300 } },
+};
+
+const stackedGood = Props.modelHitProbability(eliteBatter, generousPitcher, 'R', 'R');
+const stackedBad = Props.modelHitProbability(overwhelmedBatter, dominantPitcher, 'R', 'R');
+assert.ok(stackedGood.probability - stackedBad.probability >= 0.14,
+  `fully differentiated matchups should separate by ≥14 pts (got ${stackedGood.prob} vs ${stackedBad.prob})`);
+assert.ok(stackedGood.probability >= 0.30, 'elite stack should project a genuinely high hit chance');
+assert.ok(stackedBad.probability <= 0.22, 'overwhelmed stack should project a genuinely low hit chance');
+assert.notEqual(stackedGood.tier.key, stackedBad.tier.key, 'extremes must earn different tiers');
+assert.ok(['elite', 'favorable'].includes(stackedGood.tier.key), 'elite stack earns a positive tier');
+assert.ok(['tough', 'dominated'].includes(stackedBad.tier.key), 'overwhelmed stack earns a negative tier');
+
+// Splits must widen the gap relative to season-only inputs.
+const seasonGap = favorable.probability - unfavorable.probability;
+assert.ok((stackedGood.probability - stackedBad.probability) > seasonGap + 0.03,
+  'real platoon splits + form must add separation beyond season aggregates');
+
+// Driver chips explain each material adjustment.
+const driverIds = stackedGood.adjustments.map((adj) => adj.id);
+assert.ok(driverIds.includes('level') && driverIds.includes('platoon') && driverIds.includes('form'),
+  'adjustments should name the season level, platoon, and form drivers');
+assert.ok(stackedGood.adjustments.find((adj) => adj.id === 'platoon').points > 0.005,
+  'platoon splits should create a visible positive driver for the elite stack');
+
+/* ------------------------------------------------------------ platoon splits */
+
+const splitBatter = { xBA: '.260', avg: '.255', atBats: 500, splits: { vr: { avg: '.340', atBats: 400 } } };
+const plainBatter = { xBA: '.260', avg: '.255', atBats: 500 };
+const avgPitcher = { xBA: '.245', avg: '.248', atBats: 600 };
+const withEdge = Props.modelHitProbability(splitBatter, avgPitcher, 'R', 'R');
+const withoutEdge = Props.modelHitProbability(plainBatter, avgPitcher, 'R', 'R');
+assert.ok(withEdge.probability > withoutEdge.probability + 0.008,
+  'a real platoon-split edge must raise the forecast over the flat adjustment');
+
+// Pitcher-side split works independently and in the right direction.
+const pitcherSplitEdge = { xBA: '.245', avg: '.248', atBats: 600, splits: { vl: { avg: '.330', atBats: 350 } } };
+const leftyFriendly = Props.modelHitProbability(plainBatter, pitcherSplitEdge, 'L', 'R');
+const rightyNeutral = Props.modelHitProbability(plainBatter, pitcherSplitEdge, 'R', 'R');
+assert.ok(leftyFriendly.probability > rightyNeutral.probability + 0.004,
+  'a pitcher who struggles vs LHB must raise lefty forecasts (vl = vs left-handed batters)');
+
+// Switch hitters bat opposite: vs LHP they bat right → pitcher vr split applies.
+const pitcherVrEdge = { xBA: '.245', avg: '.248', atBats: 600, splits: { vr: { avg: '.330', atBats: 350 } } };
+const switchVsLhp = Props.modelHitProbability(plainBatter, pitcherVrEdge, 'S', 'L');
+assert.ok(switchVsLhp.probability > rightyNeutral.probability + 0.004,
+  'switch hitters must map to the pitcher split for the side they bat from');
+
+/* ------------------------------------------------------------- recent form */
+
+const hotBatter = { xBA: '.250', avg: '.250', atBats: 500, recent: { avg: '.420', atBats: 32 } };
+const coldBatter = { xBA: '.250', avg: '.250', atBats: 500, recent: { avg: '.120', atBats: 32 } };
+const hot = Props.modelHitProbability(hotBatter, avgPitcher, 'R', 'R');
+const cold = Props.modelHitProbability(coldBatter, avgPitcher, 'R', 'R');
+assert.ok(hot.probability > cold.probability + 0.008,
+  'hot/cold recent form must spread the forecast');
+assert.ok(hot.probability < 0.35 && cold.probability > 0.15,
+  'form is capped so streaks cannot dominate the season signal');
+
+/* --------------------------------------------------------- live count state */
+
+const liveContext = (balls, strikes) => ({ count: { balls, strikes }, gameState: 'Live' });
+const at00 = Props.modelHitProbability(plainBatter, avgPitcher, 'R', 'R', liveContext(0, 0));
+const at02 = Props.modelHitProbability(plainBatter, avgPitcher, 'R', 'R', liveContext(0, 2));
+const at31 = Props.modelHitProbability(plainBatter, avgPitcher, 'R', 'R', liveContext(3, 1));
+assert.ok(at31.probability > at00.probability + 0.015,
+  `3-1 must clearly beat 0-0 (got ${at31.prob} vs ${at00.prob})`);
+assert.ok(at00.probability > at02.probability + 0.03,
+  `0-0 must clearly beat 0-2 (got ${at00.prob} vs ${at02.prob})`);
+assert.ok(at02.probability >= 0.08, 'count adjustment respects the live floor');
+assert.equal(at00.probability, Props.modelHitProbability(plainBatter, avgPitcher, 'R', 'R').probability,
+  'a fresh 0-0 count must equal the count-free per-PA rate');
+const countDriver = at02.adjustments.find((adj) => adj.id === 'count');
+assert.ok(countDriver && countDriver.points < -0.02, 'the count driver chip should explain the 0-2 penalty');
+
+/* -------------------------------------------------- times through the order */
+
+const firstLook = Props.modelHitProbability(plainBatter, avgPitcher, 'R', 'R', { timesFacedToday: 0 });
+const thirdLook = Props.modelHitProbability(plainBatter, avgPitcher, 'R', 'R', { timesFacedToday: 2 });
+const tenthLook = Props.modelHitProbability(plainBatter, avgPitcher, 'R', 'R', { timesFacedToday: 9 });
+assert.ok(Math.abs((thirdLook.probability - firstLook.probability) - 0.015) < 1e-9,
+  'the third look should add ~+1.5 pts of same-game familiarity');
+assert.equal(tenthLook.probability, thirdLook.probability,
+  'familiarity is capped after the third time through the order');
+
+/* ------------------------------------------------------- head-to-head (cap) */
+
+const ownedHim = {
+  xBA: '.250', avg: '.250', atBats: 500,
+  h2h: { avg: '.850', atBats: 12 },
+};
+const noHistory = { xBA: '.250', avg: '.250', atBats: 500 };
+const withHistory = Props.modelHitProbability(ownedHim, avgPitcher, 'R', 'R');
+const withoutHistory = Props.modelHitProbability(noHistory, avgPitcher, 'R', 'R');
+const h2hLift = withHistory.probability - withoutHistory.probability;
+assert.ok(h2hLift > 0.005, 'a strong head-to-head line should lift the forecast');
+assert.ok(h2hLift <= 0.035, `head-to-head is capped as a small nudge (got +${(h2hLift * 100).toFixed(1)} pts)`);
+
+/* ------------------------------------------------------------- stat parsing */
 
 const batterFeedFixture = {
   stats: [
     { type: { displayName: 'Expected Statistics' }, splits: [{ stat: { avg: '.287' } }] },
     { type: { displayName: 'season' }, splits: [{ stat: { avg: '.278', atBats: 300, ops: '.811' } }] },
     { type: { displayName: 'Statcast' }, splits: [{ stat: { launchSpeed: '91.4', launchAngle: '14.2' } }] },
+    {
+      type: { displayName: 'statSplits' },
+      splits: [
+        { split: { code: 'vl' }, stat: { avg: '.341', atBats: 123 } },
+        { split: { code: 'vr' }, stat: { avg: '.328', atBats: 418 } },
+      ],
+    },
+    {
+      type: { displayName: 'gameLog' },
+      splits: [
+        { date: '2026-08-06', stat: { hits: 2, atBats: 4 } },
+        { date: '2026-07-30', stat: { hits: 1, atBats: 4 } },
+        { date: '2026-08-02', stat: { hits: 0, atBats: 3 } },
+      ],
+    },
   ],
 };
 const pitcherFeedFixture = {
   stats: [
     { type: { displayName: 'expectedStatistics' }, splits: [{ stat: { estimatedBaAgainst: '.226' } }] },
     { type: { displayName: 'season' }, splits: [{ stat: { hits: 89, atBats: 382 } }] },
+    {
+      type: { displayName: 'statSplits' },
+      splits: [
+        { split: { code: 'vl' }, stat: { avg: '.210', atBats: 362 } },
+        { split: { code: 'vr' }, stat: { avg: '.186', atBats: 322 } },
+      ],
+    },
   ],
 };
 const batterStats = Props.parseBatterStats(batterFeedFixture);
@@ -106,6 +257,54 @@ assert.equal(batterStats.xBA, '.287', 'parser should accept expected-stat avg al
 assert.equal(batterStats.avg, '.278', 'parser should retain season AVG');
 assert.equal(pitcherStats.xBA, '.226', 'pitcher parser should read xBA-against');
 assert.equal(pitcherStats.avg, '.233', 'pitcher parser should derive opponent AVG from hits / AB');
+assert.equal(batterStats.splits.vl.avg, 0.341, 'statSplits vl should populate the batter split pool');
+assert.equal(batterStats.splits.vr.atBats, 418, 'split sample sizes should be retained');
+assert.equal(pitcherStats.splits.vl.avg, 0.210, 'pitcher statSplits should populate vs-hand pools');
+assert.equal(batterStats.recentLog.length, 3, 'gameLog entries should be captured for recent form');
+assert.equal(batterStats.recentLog[0].date, '2026-07-30', 'recent form should be sorted chronologically');
+
+// Recent form respects the game being modeled (no "future" games leak in).
+const logProfile = {
+  xBA: '.250', avg: '.250', atBats: 500,
+  recentLog: [
+    { date: '2026-07-01', hits: 0, atBats: 4 },
+    { date: '2026-07-02', hits: 0, atBats: 4 },
+    { date: '2026-07-03', hits: 1, atBats: 4 },
+    { date: '2026-07-29', hits: 5, atBats: 5 }, // hot game AFTER the cutoff below
+  ],
+};
+const formBeforeHotGame = Props.modelHitProbability(
+  logProfile, avgPitcher, 'R', 'R', { gameDate: '2026-07-15T23:00:00Z' });
+const formAfterHotGame = Props.modelHitProbability(
+  logProfile, avgPitcher, 'R', 'R', { gameDate: '2026-07-30T23:00:00Z' });
+assert.ok(formBeforeHotGame.probability < formAfterHotGame.probability,
+  'form only counts games played up to the modeled game date');
+assert.ok(formBeforeHotGame.form.batter.available &&
+  formBeforeHotGame.form.batter.rawAvg < 0.15,
+  'the cutoff forecast should only see the cold stretch');
+
+/* ------------------------------------------------------ head-to-head parser */
+
+const h2hFixture = {
+  stats: [
+    { type: { displayName: 'vsPlayerTotal' }, splits: [{ stat: { avg: '.429', atBats: 21 } }] },
+    { type: { displayName: 'vsPlayer' }, splits: [{ season: '2025', stat: { hits: 9, atBats: 21 } }] },
+  ],
+};
+const h2hParsed = Props.parseHeadToHead(h2hFixture);
+assert.equal(h2hParsed.atBats, 21, 'career head-to-head should prefer the total line');
+assert.equal(h2hParsed.avg, 0.429, 'career head-to-head rate should parse');
+assert.equal(Props.parseHeadToHead({ stats: [] }), null, 'no history should be explicit');
+const h2hSeasonsOnly = Props.parseHeadToHead({
+  stats: [{ type: { displayName: 'vsPlayer' }, splits: [
+    { stat: { hits: 5, atBats: 10 } },
+    { stat: { hits: 3, atBats: 10 } },
+  ] }],
+});
+assert.equal(h2hSeasonsOnly.atBats, 20, 'season lines should sum without a total');
+assert.equal(h2hSeasonsOnly.avg, 0.4, 'summed head-to-head rate should be hits / AB');
+
+/* ----------------------------------------------------------------- arsenal */
 
 const arsenal = Props.getPitcherArsenal([
   {
@@ -123,8 +322,19 @@ const arsenal = Props.getPitcherArsenal([
 assert.equal(arsenal.totalPitches, 2, 'arsenal should only count the selected pitcher');
 assert.equal(arsenal.mix[0].code, 'FF', 'arsenal should retain pitch types');
 
-// Role + season are part of the cache key, which prevents a hitter response
-// from ever being reused as a pitcher's opponent-AVG input.
+/* ------------------------------------------------------- same-game familiarity */
+
+const familiarityPlays = [
+  { about: { isComplete: true }, matchup: { batter: { id: 7 }, pitcher: { id: 8 } } },
+  { about: { isComplete: true }, matchup: { batter: { id: 7 }, pitcher: { id: 8 } } },
+  { about: { isComplete: false }, matchup: { batter: { id: 7 }, pitcher: { id: 8 } } }, // live PA — not yet
+  { about: { isComplete: true }, matchup: { batter: { id: 7 }, pitcher: { id: 9 } } },
+];
+assert.equal(Props.timesFacedToday(familiarityPlays, 7, 8), 2,
+  'timesFacedToday counts only completed PAs between the pair');
+
+/* ------------------------------------------------------------- fetch caching */
+
 const requests = [];
 context.fetch = async (url) => {
   requests.push(String(url));
@@ -140,9 +350,21 @@ assert.equal(requests.length, 2, 'same player/group/season should share one in-f
 assert.match(requests[0], /group=hitting/, 'hitting cache entry should request hitter data');
 assert.match(requests[1], /group=pitching/, 'pitching cache entry should request pitcher data');
 assert.match(requests[1], /season=2026/, 'forecast requests should preserve the game season');
+assert.match(requests[0], /stats=statcast%2CexpectedStatistics%2Cseason%2CstatSplits%2CgameLog/,
+  'hitter bundle should include splits and game logs');
+assert.match(requests[0], /sitCodes=vl%2Cvr/, 'bundle should request platoon sitCodes');
+assert.ok(!requests[1].includes('statcast%2C'), 'pitcher bundle should skip hitter-only Statcast groups');
 
-// Render against a tiny DOM shim to verify the tab consumes a full feed
-// (liveData + gameData), rather than silently expecting the wrong object shape.
+await Props.fetchHeadToHead(7, 8);
+await Props.fetchHeadToHead(7, 8);
+await Props.fetchHeadToHead(7, 9);
+const h2hRequests = requests.slice(2);
+assert.equal(h2hRequests.length, 2, 'head-to-head fetches should dedupe per batter/pitcher pair');
+assert.match(h2hRequests[0], /stats=vsPlayer/, 'head-to-head should use the vsPlayer feed');
+assert.match(h2hRequests[0], /opposingPlayerId=8/, 'head-to-head targets the opposing pitcher');
+
+/* ------------------------------------------------------------ render (DOM shim) */
+
 class FakeElement {
   constructor(tagName) {
     this.tagName = tagName;
@@ -178,11 +400,12 @@ context.fetch = async (url) => ({
 });
 const container = new FakeElement('div');
 Props.render(container, {
-  gameData: { game: { season: '2026' }, players: {} },
+  gameData: { game: { season: '2026' }, players: {}, datetime: { dateTime: '2026-08-06T23:00:00Z' } },
   liveData: {
     plays: {
       allPlays: [],
       currentPlay: {
+        count: { balls: 2, strikes: 1 },
         matchup: {
           batter: { id: 7, fullName: 'Test Batter' },
           pitcher: { id: 8, fullName: 'Test Pitcher' },
@@ -202,4 +425,4 @@ assert.equal(container.children.length, 3, 'forecast tab should render forecast,
 assert.match(container.children[0].className, /matchup-forecast-section/,
   'first rendered section should be the two-sided forecast');
 
-console.log('two-sided hit-model tests passed');
+console.log('discriminative hit-model (v2) tests passed');
