@@ -1021,6 +1021,11 @@ a:hover { text-decoration: underline; }
   background: linear-gradient(90deg, #2f81f7, #a78bfa);
   transition: width 0.3s ease;
 }
+.forecast-projection-note {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 10.5px;
+}
 
 .adj-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
 .adj-chip {

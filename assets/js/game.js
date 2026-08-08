@@ -550,10 +550,29 @@
         if (model.countFactor && model.countFactor.applied) {
           details.appendChild(UI.el('span', '', `Count ${model.countFactor.label} live`));
         }
-        if (model.gameFlowProb) {
-          details.appendChild(UI.el('span', '', `≥1 hit rest of game ${model.gameFlowProb}%`));
-        }
         forecast.appendChild(details);
+
+        // The WIDE number: chance of ≥1 hit across the remaining PAs. This is
+        // what fans read on a broadcast graphic and it is where the promised
+        // 16-95% spread actually lives (50-95% during live games). It is only
+        // meaningful mid-game; on a Final game there are no PAs left.
+        if (model.remainingPAs > 0.05 && model.gameFlowProbability > 0) {
+          const proj = UI.el('div', 'forecast-projection');
+          const projHead = UI.el('div', 'forecast-projection-header');
+          projHead.appendChild(UI.el('span', 'forecast-projection-label',
+            `≥1 hit in next ${model.remainingPAs.toFixed(1)} PAs`));
+          projHead.appendChild(UI.el('strong', 'forecast-projection-value',
+            `${model.gameFlowProb}%`));
+          proj.appendChild(projHead);
+          const projTrack = UI.el('div', 'forecast-projection-track');
+          const projBar = UI.el('div', 'forecast-projection-bar tier-fill-projection');
+          projBar.style.width = `${Math.max(0, Math.min(1, model.gameFlowProbability)) * 100}%`;
+          projTrack.appendChild(projBar);
+          proj.appendChild(projTrack);
+          proj.title = '1 − (1 − per-PA hit chance) ^ remaining PAs — fan-style projection, not a betting line';
+          forecast.appendChild(proj);
+        }
+
         forecast.appendChild(UI.el('div', 'live-hit-coverage', model.coverageLabel));
         forecast.title = `Live at-bat hit forecast: ${window.Props.describeHitModel
           ? window.Props.describeHitModel(model)

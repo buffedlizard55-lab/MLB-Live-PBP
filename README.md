@@ -71,12 +71,25 @@ games use slower cadences, and polling pauses automatically while the tab is hid
 
 The hit percentage is a **transparent, per-plate-appearance estimate** — not an MLB
 projection or a betting line. It is built to *discriminate*: great spots and terrible
-spots land far apart instead of clustering around the league average. The model
-produces a per-PA headline that can span roughly **13%–50%** (closer to the user's
-16-80% target on a stacked edge, see `tools/model-calibration-report.mjs`), and a
-secondary "chance of at least one more hit across the remaining PAs" projection that
-spans the same family in a different shape (50% on a single PA left, 90%+ on many
-PAs left). The model:
+spots land far apart instead of clustering around the league average. Two numbers are
+shown, and they intentionally live in different bands:
+
+- **Per-PA headline ("Hit this PA")** — the chance the batter gets a hit in *this*
+  plate appearance. For **real MLB matchups this typically reads 22–30%** (league hit
+  rates cluster around `.245`, and real batters/pitchers do too); the model's full
+  clamp band is 13–62% per-PA (10–78% with live count), reached only by stacked
+  synthetic edges like an overmatched call-up vs an ace (~13%) or an elite hitter on
+  a hitter's count vs a weak arm (~50%). A single-PA hit rate can't honestly reach
+  80%: even a perfect .400 hitter vs a .150-allowed pitcher resolves to ~55% before
+  clamps. See `tools/model-calibration-report.mjs` for the archetype grid.
+- **"≥1 hit in next N PAs" projection** — the *wide* number, and where the promised
+  16–95% spread actually lives. It is `1 − (1 − per-PA)^remaining PAs`, so during a
+  live game it naturally reads **50–95%** (the broadcast-style graphic number most
+  fans expect). It is shown on the live at-bat card and in the Props & Matchup tab;
+  on a **Final game there are no PAs left, so it reads "—"/0%** and the per-PA rate is
+  the relevant number. Both are per-batter and per-pitcher.
+
+The model:
 
 1. **Season level (both sides):** the batter's xBA/AVG hit-production signal and the
    pitcher's xBA-allowed/opponent-AVG signal are each regressed toward a `.245` league
@@ -88,9 +101,10 @@ PAs left). The model:
 2. **Platoon splits:** each player's real `vs LHP` / `vs RHP` (pitchers: `vs LHB` /
    `vs RHB`) split enters as a shrunken *differential* against their own season rate.
    Without split data, a small flat handedness adjustment is used instead.
-3. **Recent form:** the player's game-log window (last ~8 games, never using games
-   after the modeled game's date) nudges the estimate with a meaningful weight
-   (capped so a single hot/cold week cannot dominate the season signal).
+3. **Recent form:** the player's game-log window (last ~8 games, strictly before the
+   modeled game's date, so a forecast never leaks the game's own result) nudges the
+   estimate with a meaningful weight (capped so a single hot/cold week cannot dominate
+   the season signal).
 4. **Head-to-head:** the career batter/pitcher line is a bounded but real nudge
    (~up to 5.5 pts of weighted signal).
 5. **Same-game familiarity:** each repeat plate appearance against the same pitcher
