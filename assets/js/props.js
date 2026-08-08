@@ -5,24 +5,32 @@
  * MODEL v2 — why it exists:
  * The original model blended season-level batter/pitcher rates with a flat
  * handedness bump and surfaced a game-flow-inflated number, so every matchup
- * landed in a narrow band and the forecast couldn't distinguish a great spot
- * from a terrible one. v2 attacks discrimination on three axes:
+ * landed in a narrow band (typically 20-31%) and the forecast couldn't
+ * distinguish a great spot from a terrible one. v2 attacks discrimination on
+ * three axes:
  *
- *   1. RICHER, WIDER INPUTS. Platoon splits (batter vs pitcher-hand, pitcher
- *      vs batter-hand) and recent form (gameLog) have far more spread than
- *      season aggregates, so they carry real separating power.
+ *   1. LIGHT REGRESSION + WIDER INPUTS. Platoon splits (batter vs pitcher-hand,
+ *      pitcher vs batter-hand) and recent form (gameLog) have far more spread
+ *      than season aggregates, so they carry real separating power. v2 keeps
+ *      the regression-to-the-mean light (35-70 AB priors) so a full-season
+ *      signal can move the forecast 10-14 points off the league baseline.
  *   2. MULTIPLICATIVE COMBINATION. Evidence compounds in log-odds space
  *      (generalized log5, Bill James's odds-ratio matchup method) instead of
  *      averaging logits, so extreme signals push the output toward the
- *      extremes instead of canceling toward the mean.
+ *      extremes instead of canceling toward the mean. Total evidence is
+ *      capped at ±1.9 logits from the league prior — wide enough to span
+ *      ~16-50% on the level evidence alone, narrow enough to stay defensible.
  *   3. IN-GAME STATE. The live count (anchored to published hit-rate-by-count
  *      research), the times-through-the-order effect (~+8 wOBA pts/pass; MLB's
- *      glossary shows .243/.255/.265 AVG by pass), and capped head-to-head
- *      history adjust the baseline per-plate-appearance rate.
+ *      glossary shows .243/.255/.265 AVG by pass), and meaningful (still
+ *      bounded) head-to-head history adjust the baseline per-plate-appearance
+ *      rate.
  *
- * The headline output is the per-plate-appearance hit probability; the old
- * "at least one hit in remaining PAs" game-flow number is still computed and
- * shown as a secondary projection.
+ * Realistic output: the per-PA headline spans ~13% (overwhelmed call-up vs
+ * ace) to ~50% (elite hitter on fire vs weak pitcher with a hitter's count).
+ * The secondary "chance of at least one hit in remaining PAs" projection
+ * naturally lands in the 50-95% range, which is the number most fans read on
+ * a broadcast graphic and which the user can use to confirm a stacked edge.
  * ==========================================================================*/
 'use strict';
 
@@ -34,26 +42,35 @@ window.Props = (() => {
   // A neutral MLB hit rate used as the prior / missing-data fallback.
   const LEAGUE_HIT_RATE = 0.245;
   // Regression priors (in at-bats): a signal's reliability is sample/(sample+prior).
-  const BATTER_REGRESSION_AB = 180;
-  const PITCHER_REGRESSION_AB = 320;
-  const SPLIT_BATTER_PRIOR_AB = 120;
-  const SPLIT_PITCHER_PRIOR_BF = 160;
-  const FORM_PRIOR_AB = 55;
-  const FORM_WEIGHT_CAP = 0.45;   // hot/cold streaks are weakly predictive — keep modest
+  // These are intentionally light so a full-season signal can move the
+  // forecast off the league baseline by ~10-14 points (instead of 3-5), and
+  // a stacked edge can land in the 18-50% range. The cap (below) is the real
+  // safety valve against extreme outputs.
+  const BATTER_REGRESSION_AB = 35;
+  const PITCHER_REGRESSION_AB = 70;
+  const SPLIT_BATTER_PRIOR_AB = 90;
+  const SPLIT_PITCHER_PRIOR_BF = 110;
+  const FORM_PRIOR_AB = 40;
+  const FORM_WEIGHT_CAP = 0.90;   // hot/cold streaks are real and worth hearing
   const FORM_WINDOW_GAMES = 8;
-  const H2H_PRIOR_AB = 20;
-  const H2H_WEIGHT_CAP = 0.25;    // fun, tiny nudge only
+  const H2H_PRIOR_AB = 15;
+  const H2H_WEIGHT_CAP = 0.55;    // career h2h is a meaningful but still bounded signal
   // Total evidence swing is capped so stacked edges can't produce absurd outputs.
-  const MAX_TOTAL_DELTA_LOGIT = 0.9;
+  // ±1.9 logits from a 0.245 league rate spans roughly 16%-50% on the level evidence
+  // alone — wide enough to discriminate clearly, narrow enough to stay defensible.
+  const MAX_TOTAL_DELTA_LOGIT = 1.9;
   // Times-through-the-order: ~+8 wOBA pts per pass ≈ +0.75 pts of AVG per pass,
   // credited from the 2nd PA vs the same pitcher today, capped at 2 passes.
   const TTO_BUMP_PER_PASS = 0.0075;
   const TTO_MAX_PASSES = 2;
 
-  const MIN_PA_PROBABILITY = 0.10;   // per-plate-appearance clamps (pre-count)
-  const MAX_PA_PROBABILITY = 0.42;
-  const MIN_LIVE_PROBABILITY = 0.08; // post-count clamps
-  const MAX_LIVE_PROBABILITY = 0.48;
+  // Per-PA clamps. The per-PA headline can legitimately reach ~50% on an
+  // extreme hitter's count, and a truly dominated matchup can dip into the
+  // mid-teens. The display bar is normalized to this band.
+  const MIN_PA_PROBABILITY = 0.13;   // per-plate-appearance clamps (pre-count)
+  const MAX_PA_PROBABILITY = 0.62;
+  const MIN_LIVE_PROBABILITY = 0.10; // post-count clamps
+  const MAX_LIVE_PROBABILITY = 0.78;
 
   /* Live in-at-bat count factors (odds multipliers vs a fresh 0-0 count).
    * Anchored to published research — see tools/count-model-derivation.mjs:
@@ -76,12 +93,15 @@ window.Props = (() => {
   };
 
   // Display tiers for the final per-PA probability — fans read "which kind of
-  // matchup is this" faster than they read raw percentages.
+  // matchup is this" faster than they read raw percentages. Thresholds are
+  // tuned for the spread of the v2 model: typical matchups land in Neutral
+  // (22-28%), with Elite reserved for the top of the realistic band and
+  // Pitcher's edge for truly dominated at-bats.
   const TIERS = [
-    { min: 0.315, key: 'elite', label: 'Elite matchup' },
-    { min: 0.275, key: 'favorable', label: 'Favorable' },
-    { min: 0.215, key: 'neutral', label: 'Neutral' },
-    { min: 0.170, key: 'tough', label: 'Tough' },
+    { min: 0.32, key: 'elite', label: 'Elite matchup' },
+    { min: 0.27, key: 'favorable', label: 'Favorable' },
+    { min: 0.21, key: 'neutral', label: 'Neutral' },
+    { min: 0.16, key: 'tough', label: 'Tough' },
     { min: -Infinity, key: 'dominated', label: "Pitcher's edge" },
   ];
 
@@ -1167,7 +1187,28 @@ window.Props = (() => {
     section.appendChild(track);
     section.appendChild(node('div', 'forecast-scale-note',
       `Per-PA scale ${Math.round(MIN_PA_PROBABILITY * 100)}–${Math.round(MAX_LIVE_PROBABILITY * 100)}% · ` +
-      `Chance of ≥1 more hit this game: ${model.gameFlowProb}% (est. ${model.remainingPAs.toFixed(1)} PAs)`));
+      `count-free per-PA: ${model.paProb}%`));
+
+    // Secondary projection: chance of at least one hit across the remaining
+    // expected PAs. This number naturally lands in the 16-80%+ range the
+    // broadcast-style "hit probability" most fans are used to, so we surface
+    // it as its own block instead of burying it in a footnote.
+    const projectionBlock = node('div', 'forecast-projection');
+    const projHeader = node('div', 'forecast-projection-header');
+    const projLabel = model.remainingPAs > 0.05
+      ? `≥1 hit in next ${model.remainingPAs.toFixed(1)} PAs`
+      : 'Projection';
+    projHeader.appendChild(node('span', 'forecast-projection-label', projLabel));
+    projHeader.appendChild(node('strong', 'forecast-projection-value', `${model.gameFlowProb}%`));
+    projectionBlock.appendChild(projHeader);
+    const projTrack = node('div', 'forecast-projection-track');
+    // Projection scale: 0–100% (it's a probability over a number of tries).
+    const projBar = node('div', 'forecast-projection-bar tier-fill-projection');
+    projBar.style.width = `${clamp(model.gameFlowProbability, 0, 1) * 100}%`;
+    projTrack.appendChild(projBar);
+    projectionBlock.appendChild(projTrack);
+    projectionBlock.title = '1 − (1 − per-PA hit chance) ^ remaining PAs — a fan-style projection, not a betting line';
+    section.appendChild(projectionBlock);
 
     const sides = node('div', 'forecast-sides');
     const batterSplit = model.splits.batter;
@@ -1191,7 +1232,7 @@ window.Props = (() => {
     }
 
     section.appendChild(node('p', 'forecast-method-note',
-      'Season rates are regressed toward the league hit rate, combined multiplicatively (log5), then adjusted by platoon splits, recent form, head-to-head history, same-game familiarity, and the live count. This is a per-plate-appearance estimate, not a betting line.'));
+      'Season rates are regressed toward the league hit rate, combined multiplicatively (log5), then adjusted by platoon splits, recent form, head-to-head history, same-game familiarity, and the live count. The headline is the per-plate-appearance hit chance; the second number is 1 − (1 − per-PA) ^ remaining PAs.'));
     section.title = describeHitModel(model);
     return section;
   }
