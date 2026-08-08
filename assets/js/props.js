@@ -26,11 +26,14 @@
  *      bounded) head-to-head history adjust the baseline per-plate-appearance
  *      rate.
  *
- * Realistic output: the per-PA headline spans ~13% (overwhelmed call-up vs
- * ace) to ~50% (elite hitter on fire vs weak pitcher with a hitter's count).
- * The secondary "chance of at least one hit in remaining PAs" projection
- * naturally lands in the 50-95% range, which is the number most fans read on
- * a broadcast graphic and which the user can use to confirm a stacked edge.
+ * Realistic output: for REAL MLB matchups the per-PA headline typically lands
+ * in a narrow 22-30% band (league hit rates are ~.245, and real batters/pitchers
+ * cluster there), reaching the theoretical extremes (~13% overwhelmed call-up
+ * vs ace, ~50% elite hitter on fire vs weak pitcher with a hitter's count) only
+ * for stacked synthetic edges. The secondary "chance of at least one hit in the
+ * remaining PAs" projection is the wide number — it naturally lands in the
+ * 50-95% range during live games (and the per-PA band is still used for the
+ * timeline chips). That is the number most fans read on a broadcast graphic.
  * ==========================================================================*/
 'use strict';
 
@@ -66,11 +69,19 @@ window.Props = (() => {
 
   // Per-PA clamps. The per-PA headline can legitimately reach ~50% on an
   // extreme hitter's count, and a truly dominated matchup can dip into the
-  // mid-teens. The display bar is normalized to this band.
+  // mid-teens.
   const MIN_PA_PROBABILITY = 0.13;   // per-plate-appearance clamps (pre-count)
   const MAX_PA_PROBABILITY = 0.62;
   const MIN_LIVE_PROBABILITY = 0.10; // post-count clamps
   const MAX_LIVE_PROBABILITY = 0.78;
+
+  // Display band for per-PA bars. The full clamp band is 10-78%, but REAL
+  // MLB matchups land in roughly 15-50% — normalizing bars across 10-78%
+  // makes a 23% vs 29% matchup look identical. Normalizing across this
+  // realistic band keeps real differences visibly readable (while a stacked
+  // extreme still pins the bar near the edges).
+  const DISPLAY_MIN_PROBABILITY = 0.14;
+  const DISPLAY_MAX_PROBABILITY = 0.50;
 
   /* Live in-at-bat count factors (odds multipliers vs a fresh 0-0 count).
    * Anchored to published research — see tools/count-model-derivation.mjs:
@@ -637,15 +648,17 @@ window.Props = (() => {
 
   /**
    * Recent form: combined AVG over the player's last FORM_WINDOW_GAMES games
-   * with at-bats (game-log dates must not exceed the game being modeled, so
-   * forecasts for completed games stay historically correct).
+   * with at-bats. Game-log dates must be strictly BEFORE the game being
+   * modeled (`< cutoff`, never `<=`): the gameLog feed includes the modeled
+   * game's own result on its date, and using it would leak the outcome into
+   * the "pre-at-bat" forecast.
    */
   function formSignal(profile, gameDate) {
     const log = Array.isArray(profile && profile.recentLog) ? profile.recentLog : [];
     if (!log.length) return { available: false };
 
     const cutoff = dayOf(gameDate);
-    const eligible = cutoff ? log.filter((entry) => entry.date <= cutoff) : log.slice();
+    const eligible = cutoff ? log.filter((entry) => entry.date < cutoff) : log.slice();
     let taken = 0;
     let hits = 0;
     let atBats = 0;
@@ -1112,9 +1125,10 @@ window.Props = (() => {
     forecast.appendChild(label);
 
     const track = node('div', 'prob-bar-container scaled');
-    // Normalize the bar across the realistic per-PA band so differences read clearly.
-    const scaled = clamp((model.probability - MIN_PA_PROBABILITY) /
-      (MAX_LIVE_PROBABILITY - MIN_PA_PROBABILITY), 0, 1);
+    // Normalize the bar across the realistic per-PA band (not the full clamp
+    // band) so real 22-30% matchups render as visibly different bars.
+    const scaled = clamp((model.probability - DISPLAY_MIN_PROBABILITY) /
+      (DISPLAY_MAX_PROBABILITY - DISPLAY_MIN_PROBABILITY), 0, 1);
     const bar = node('div', `prob-bar tier-fill-${model.tier.key}`);
     bar.style.width = `${(scaled * 100).toFixed(1)}%`;
     track.appendChild(bar);
@@ -1179,27 +1193,30 @@ window.Props = (() => {
     section.appendChild(scoreLine);
 
     const track = node('div', 'forecast-main-track scaled');
-    const scaled = clamp((model.probability - MIN_PA_PROBABILITY) /
-      (MAX_LIVE_PROBABILITY - MIN_PA_PROBABILITY), 0, 1);
+    const scaled = clamp((model.probability - DISPLAY_MIN_PROBABILITY) /
+      (DISPLAY_MAX_PROBABILITY - DISPLAY_MIN_PROBABILITY), 0, 1);
     const bar = node('div', `forecast-main-bar tier-fill-${model.tier.key}`);
     bar.style.width = `${(scaled * 100).toFixed(1)}%`;
     track.appendChild(bar);
     section.appendChild(track);
     section.appendChild(node('div', 'forecast-scale-note',
-      `Per-PA scale ${Math.round(MIN_PA_PROBABILITY * 100)}–${Math.round(MAX_LIVE_PROBABILITY * 100)}% · ` +
-      `count-free per-PA: ${model.paProb}%`));
+      `Per-PA scale ${Math.round(DISPLAY_MIN_PROBABILITY * 100)}–${Math.round(DISPLAY_MAX_PROBABILITY * 100)}% (realistic band) · ` +
+      `count-free per-PA: ${model.paProb}% · full clamp band ${Math.round(MIN_LIVE_PROBABILITY * 100)}–${Math.round(MAX_LIVE_PROBABILITY * 100)}%`));
 
     // Secondary projection: chance of at least one hit across the remaining
-    // expected PAs. This number naturally lands in the 16-80%+ range the
-    // broadcast-style "hit probability" most fans are used to, so we surface
-    // it as its own block instead of burying it in a footnote.
+    // expected PAs. This is the WIDE number — during live games it naturally
+    // lands in the 50-95% range (the broadcast-style "hit probability" most
+    // fans are used to). On a Final game there are no PAs left, so it reads
+    // 0% and the per-PA rate above is the meaningful number.
     const projectionBlock = node('div', 'forecast-projection');
     const projHeader = node('div', 'forecast-projection-header');
-    const projLabel = model.remainingPAs > 0.05
-      ? `≥1 hit in next ${model.remainingPAs.toFixed(1)} PAs`
-      : 'Projection';
+    const gameOver = model.remainingPAs <= 0.05;
+    const projLabel = gameOver
+      ? 'Game over'
+      : `≥1 hit in next ${model.remainingPAs.toFixed(1)} PAs`;
     projHeader.appendChild(node('span', 'forecast-projection-label', projLabel));
-    projHeader.appendChild(node('strong', 'forecast-projection-value', `${model.gameFlowProb}%`));
+    projHeader.appendChild(node('strong', 'forecast-projection-value',
+      gameOver ? '—' : `${model.gameFlowProb}%`));
     projectionBlock.appendChild(projHeader);
     const projTrack = node('div', 'forecast-projection-track');
     // Projection scale: 0–100% (it's a probability over a number of tries).
@@ -1207,6 +1224,11 @@ window.Props = (() => {
     projBar.style.width = `${clamp(model.gameFlowProbability, 0, 1) * 100}%`;
     projTrack.appendChild(projBar);
     projectionBlock.appendChild(projTrack);
+    if (gameOver) {
+      projTrack.style.opacity = '0.35';
+      projectionBlock.appendChild(node('div', 'forecast-projection-note',
+        'No plate appearances remain — the per-PA hit chance above is the relevant number.'));
+    }
     projectionBlock.title = '1 − (1 − per-PA hit chance) ^ remaining PAs — a fan-style projection, not a betting line';
     section.appendChild(projectionBlock);
 
