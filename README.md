@@ -71,19 +71,28 @@ games use slower cadences, and polling pauses automatically while the tab is hid
 
 The hit percentage is a **transparent, per-plate-appearance estimate** — not an MLB
 projection or a betting line. It is built to *discriminate*: great spots and terrible
-spots land far apart instead of clustering around the league average. The model:
+spots land far apart instead of clustering around the league average. The model
+produces a per-PA headline that can span roughly **13%–50%** (closer to the user's
+16-80% target on a stacked edge, see `tools/model-calibration-report.mjs`), and a
+secondary "chance of at least one more hit across the remaining PAs" projection that
+spans the same family in a different shape (50% on a single PA left, 90%+ on many
+PAs left). The model:
 
 1. **Season level (both sides):** the batter's xBA/AVG hit-production signal and the
    pitcher's xBA-allowed/opponent-AVG signal are each regressed toward a `.245` league
-   baseline (sample-based reliability), then compounded in log-odds space — a
-   generalized **log5** (Bill James's odds-ratio method), so extreme signals push the
-   estimate toward the extremes rather than canceling toward the mean.
+   baseline (light regression so a full-season signal can move the forecast by
+   ~10-14 points), then compounded in log-odds space — a generalized **log5** (Bill
+   James's odds-ratio method), so extreme signals push the estimate toward the
+   extremes rather than canceling toward the mean. Total evidence is capped at
+   ±1.9 logits from the league prior.
 2. **Platoon splits:** each player's real `vs LHP` / `vs RHP` (pitchers: `vs LHB` /
    `vs RHB`) split enters as a shrunken *differential* against their own season rate.
    Without split data, a small flat handedness adjustment is used instead.
 3. **Recent form:** the player's game-log window (last ~8 games, never using games
-   after the modeled game's date) nudges the estimate with a capped weight.
-4. **Head-to-head:** the career batter/pitcher line is a strictly capped, small nudge.
+   after the modeled game's date) nudges the estimate with a meaningful weight
+   (capped so a single hot/cold week cannot dominate the season signal).
+4. **Head-to-head:** the career batter/pitcher line is a bounded but real nudge
+   (~up to 5.5 pts of weighted signal).
 5. **Same-game familiarity:** each repeat plate appearance against the same pitcher
    adds a small times-through-the-order bump (~+0.75 pts/pass, capped at the third look).
 6. **Live count:** mid-at-bat, the fresh-count estimate is multiplied in odds space by

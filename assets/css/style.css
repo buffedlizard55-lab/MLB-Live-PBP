@@ -974,6 +974,54 @@ a:hover { text-decoration: underline; }
   font-size: 10.5px;
 }
 
+/* Secondary "chance of ≥1 hit in the next N PAs" projection. This number
+   naturally lands in the 16-95% range (the broadcast-style number fans
+   actually read on a graphic), and we surface it as its own block so the
+   per-PA headline and the projection both have room to land in different
+   parts of the band. */
+.forecast-projection {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(47, 129, 247, 0.35);
+  border-radius: 8px;
+  background: linear-gradient(100deg, rgba(47, 129, 247, 0.10), rgba(167, 139, 250, 0.08));
+}
+.forecast-projection-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+.forecast-projection-label {
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.65px;
+  text-transform: uppercase;
+}
+.forecast-projection-value {
+  color: #74c0fc;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 17px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+.forecast-projection-track {
+  height: 7px;
+  overflow: hidden;
+  background: #1a2740;
+  border: 1px solid #2c3e63;
+  border-radius: 999px;
+}
+.forecast-projection-bar {
+  height: 100%;
+  min-width: 2px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2f81f7, #a78bfa);
+  transition: width 0.3s ease;
+}
+
 .adj-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
 .adj-chip {
   padding: 2px 8px;
