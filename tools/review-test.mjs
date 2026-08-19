@@ -37,6 +37,18 @@ assert.equal(MLBReviews.normalizeType('ABS Challenge', '').key, 'abs');
 assert.equal(MLBReviews.normalizeType('Automated Ball-Strike System', '').key, 'abs');
 assert.equal(MLBReviews.normalizeType('Umpire Review', '').key, 'crew_chief');
 
+/* Real reviewType codes observed on statsapi.mlb.com (2026-08-19):
+ *   MJ = ABS pitch challenge (games 823342, 823667, 824075)
+ *   MA = manager challenge (game 823341, "Tigers challenged (tag play)…")
+ *   MF = manager challenge (game 824075, "Royals challenged (play at 1st)…") */
+assert.equal(MLBReviews.normalizeType('MJ', 'Ball').key, 'abs');
+assert.equal(MLBReviews.normalizeType('MJ', 'Called Strike').label, 'ABS Challenge');
+assert.equal(MLBReviews.normalizeType('MJ', 'challenged (pitch result), call on the field was overturned').key, 'abs');
+assert.equal(MLBReviews.normalizeType('MA', 'Tigers challenged (tag play), call on the field was overturned').key, 'manager');
+assert.equal(MLBReviews.normalizeType('MF', 'Royals challenged (play at 1st), call on the field was overturned').key, 'manager');
+// Unknown codes must NOT be surfaced raw to users.
+assert.equal(MLBReviews.normalizeType('ZZ', 'Something happened').label, 'Replay Review');
+
 /* -------------------------------------------------- 2. Outcome determination */
 
 assert.equal(MLBReviews.determineOutcome({ isOverturned: true }, '').key, 'overturned');
@@ -152,6 +164,109 @@ assert.equal(extracted.summary.inProgress, 1); // Casas review in progress
 assert.equal(extracted.summary.byType.manager, 2);
 assert.equal(extracted.summary.byType.abs, 1);
 assert.equal(extracted.summary.byType.crew_chief, 1);
+
+/* --------------------------------------- 3b. Real feed shapes (2026-08-19) */
+
+// Game 823341 atBatIndex 34 — play-level manager challenge, reviewType "MA".
+const maPlay = {
+  about: { atBatIndex: 34, inning: 6, halfInning: 'bottom', hasReview: false },
+  result: {
+    description: "Tigers challenged (tag play), call on the field was overturned: Jared Triolo reaches on a fielder's choice out, third baseman Kevin McGonigle to catcher Eduardo Valencia. Jake Mangum out at home. Rafael Flores Jr. to 3rd.",
+  },
+  reviewDetails: { isOverturned: true, inProgress: false, reviewType: 'MA', challengeTeamId: 116 },
+  matchup: { batter: { id: 663757, fullName: 'Trent Grisham' }, pitcher: { id: 656302, fullName: 'Dylan Cease' } },
+};
+
+// Game 823342 atBatIndex 15 — event-level ABS challenge, reviewType "MJ",
+// bare "Ball" description, no review text on the play itself.
+const absEventPlay = {
+  about: { atBatIndex: 15, inning: 2, halfInning: 'bottom', hasReview: false },
+  result: { description: 'Jared Triolo grounds out, third baseman Hao-Yu Lee to first baseman Spencer Torkelson.' },
+  matchup: { batter: { id: 668804, fullName: 'Bryan Reynolds' }, pitcher: { id: 695549, fullName: 'Jackson Jobe' } },
+  playEvents: [
+    { isPitch: true, details: { description: 'Ball', hasReview: true }, reviewDetails: { isOverturned: false, inProgress: false, reviewType: 'MJ', challengeTeamId: 116 } },
+  ],
+};
+
+// Game 824075 atBatIndex 33 — play-level ABS challenge, reviewType "MJ",
+// WITH pitch-result text, plus a duplicate event-level entry that must lose.
+const absPlayLevel = {
+  about: { atBatIndex: 33, inning: 5, halfInning: 'bottom', hasReview: false },
+  result: {
+    description: 'Michael Massey challenged (pitch result), call on the field was overturned: Michael Massey walks.',
+  },
+  reviewDetails: { isOverturned: true, inProgress: false, reviewType: 'MJ', challengeTeamId: 118 },
+  matchup: { batter: { id: 621020, fullName: 'Michael Massey' }, pitcher: { id: 660787, fullName: 'Yerry De los Santos' } },
+  playEvents: [
+    { isPitch: true, details: { description: 'Ball', hasReview: true }, reviewDetails: { isOverturned: true, inProgress: false, reviewType: 'MJ', challengeTeamId: 118 } },
+  ],
+};
+
+// Same play can carry BOTH an ABS pitch challenge (event-level MJ) and a
+// play-level manager challenge (MA) — both must survive as separate entries.
+const dualPlay = {
+  about: { atBatIndex: 40, inning: 8, halfInning: 'top', hasReview: false },
+  result: { description: 'Royals challenged (play at 1st), call on the field was overturned: runner is safe.' },
+  reviewDetails: { isOverturned: true, inProgress: false, reviewType: 'MF', challengeTeamId: 118 },
+  matchup: { batter: { id: 592450, fullName: 'Aaron Judge' }, pitcher: { id: 656302, fullName: 'Dylan Cease' } },
+  playEvents: [
+    { isPitch: true, details: { description: 'Called Strike', hasReview: true }, reviewDetails: { isOverturned: false, inProgress: false, reviewType: 'MJ', challengeTeamId: 111 } },
+  ],
+};
+
+const realFeed = {
+  gameData: {
+    status: { detailedState: 'In Progress', abstractGameState: 'Live' },
+    teams: {
+      away: { id: 116, name: 'Detroit Tigers', abbreviation: 'DET' },
+      home: { id: 134, name: 'Pittsburgh Pirates', abbreviation: 'PIT' },
+    },
+  },
+  liveData: {
+    plays: { allPlays: [maPlay, absEventPlay, absPlayLevel, dualPlay], currentPlay: null },
+  },
+};
+
+const realExtracted = MLBReviews.extractReviews(realFeed);
+// MA(34) + MJ-event(15) + MJ-play(33) + MF-play(40) + MJ-event(40) = 5 entries
+assert.equal(realExtracted.reviews.length, 5, 'MA + ABS(event) + ABS(play) + dual(MF+MJ) = 5 entries');
+
+const byAtBat = (idx) => realExtracted.reviews.filter((r) => r.atBatIndex === idx);
+
+// MA play-level → Manager Challenge with team + rich reason.
+const ma = byAtBat(34)[0];
+assert.equal(ma.reviewType, 'Manager Challenge');
+assert.equal(ma.typeKey, 'manager');
+assert.equal(ma.teamAbbrev, 'DET');
+assert.equal(ma.outcome, 'overturned');
+assert.equal(ma.reason, 'tag play');
+
+// Event-level MJ → ABS Challenge, NOT the raw "MJ" code.
+const evAbs = byAtBat(15)[0];
+assert.equal(evAbs.reviewType, 'ABS Challenge');
+assert.equal(evAbs.typeKey, 'abs');
+assert.equal(evAbs.teamAbbrev, 'DET');
+assert.equal(evAbs.outcome, 'stands'); // isOverturned:false
+assert.equal(evAbs.inProgress, false);
+
+// Play-level MJ with text → ABS Challenge, play-level entry wins (rich text).
+const plAbs = byAtBat(33);
+assert.equal(plAbs.length, 1, 'event + play-level MJ dedupe to one entry');
+assert.equal(plAbs[0].description, absPlayLevel.result.description);
+assert.equal(plAbs[0].reason, 'pitch result');
+
+// Dual play → both ABS (MJ) and Manager (MF) entries survive.
+const dual = byAtBat(40);
+assert.equal(dual.length, 2, 'ABS + manager on same play are separate entries');
+assert.ok(dual.some((r) => r.typeKey === 'abs'), 'has ABS entry');
+assert.ok(dual.some((r) => r.typeKey === 'manager'), 'has manager entry');
+
+// Summary counts match.
+assert.equal(realExtracted.summary.total, 5);
+assert.equal(realExtracted.summary.overturned, 3); // MA(34) + MJ-play(33) + MF(40)
+assert.equal(realExtracted.summary.stands, 2);     // MJ-event(15,40) both stood
+assert.equal(realExtracted.summary.byType.abs, 3);
+assert.equal(realExtracted.summary.byType.manager, 2);
 
 /* -------------------------------------------------- 4. Scoreboard Inspection */
 

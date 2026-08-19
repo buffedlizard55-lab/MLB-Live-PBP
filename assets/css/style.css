@@ -1408,3 +1408,246 @@ a:hover { text-decoration: underline; }
   padding: 2px 8px;
   border-radius: 4px;
 }
+
+/* ============================================================================
+ * All-Games Replay Feed (reviews.html)
+ * ==========================================================================*/
+
+/* Header live pill */
+.live-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+.live-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #5c6b80;
+  transition: background 0.3s;
+}
+.live-dot.on {
+  background: var(--live);
+  box-shadow: 0 0 8px var(--live);
+  animation: pulse-live 1.2s infinite;
+}
+
+/* "Replay Feed" buttons on scoreboard / game pages */
+.btn-feed {
+  background: linear-gradient(135deg, rgba(224, 49, 49, 0.9), rgba(210, 153, 34, 0.9));
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: #fff;
+  font-weight: 800;
+}
+.btn-feed:hover {
+  filter: brightness(1.1);
+  text-decoration: none;
+}
+
+/* Ticker footer link to the full feed */
+.ticker-feed-link {
+  display: inline-flex;
+  align-items: center;
+  font-size: 12.5px;
+  font-weight: 800;
+  color: #ffd43b;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px dashed rgba(255, 212, 59, 0.5);
+}
+.ticker-feed-link:hover {
+  background: rgba(210, 153, 34, 0.15);
+  text-decoration: none;
+}
+
+/* Page layout */
+.page-reviews .reviews-main {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 18px 22px 40px;
+}
+.active-strip-wrap {
+  margin-bottom: 14px;
+}
+
+/* "Now under review" strip */
+.feed-active-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: linear-gradient(90deg, rgba(224, 49, 49, 0.28), rgba(224, 49, 49, 0.08));
+  border: 1px solid rgba(224, 49, 49, 0.6);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+}
+.feed-active-badge {
+  background: var(--live);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.8px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  animation: pulse-live 1.2s infinite;
+}
+.feed-active-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 10px;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  transition: border-color 0.15s;
+}
+.feed-active-link:hover {
+  border-color: var(--live);
+  text-decoration: none;
+}
+.feed-active-game { font-weight: 800; }
+.feed-active-type { color: #ff8787; font-size: 11px; font-weight: 800; text-transform: uppercase; }
+.feed-active-reason { color: var(--muted); }
+
+/* Feed list (chatroom) */
+.feed-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.feed-row {
+  display: flex;
+  gap: 14px;
+  background: linear-gradient(180deg, var(--panel) 0%, #0f1a2c 100%);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  box-shadow: var(--shadow);
+}
+.feed-row-live {
+  border-color: rgba(224, 49, 49, 0.75);
+  border-left: 4px solid var(--live);
+  box-shadow: 0 4px 18px rgba(224, 49, 49, 0.22);
+}
+.feed-type-abs { border-left: 4px solid #fb923c; }
+.feed-type-manager { border-left: 4px solid #2f81f7; }
+.feed-type-crew_chief { border-left: 4px solid #a78bfa; }
+.feed-outcome-overturned { border-left-color: var(--green); }
+.feed-outcome-stands { border-left-color: var(--yellow); }
+
+/* New-event flash */
+@keyframes feed-flash {
+  0% { background: rgba(47, 129, 247, 0.35); transform: translateY(-6px); }
+  100% { background: linear-gradient(180deg, var(--panel) 0%, #0f1a2c 100%); transform: translateY(0); }
+}
+.feed-row.feed-new {
+  animation: feed-flash 1.4s ease-out;
+}
+
+.feed-time {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  min-width: 62px;
+  padding-top: 2px;
+  color: var(--muted);
+}
+.feed-time-txt { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; }
+.feed-time-hm { font-size: 12.5px; font-weight: 800; color: var(--text); font-variant-numeric: tabular-nums; }
+
+.feed-body { flex: 1; min-width: 0; }
+.feed-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.feed-game {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  font-weight: 800;
+  font-size: 13px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  padding: 2px 9px;
+  border-radius: 6px;
+  transition: border-color 0.15s;
+}
+.feed-game:hover {
+  border-color: var(--accent);
+  text-decoration: none;
+}
+.feed-game-score {
+  color: var(--muted);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.feed-team {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.feed-inn {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 800;
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+.feed-reason {
+  font-size: 14.5px;
+  font-weight: 800;
+  color: var(--text);
+  margin: 0 0 3px;
+}
+.feed-desc {
+  margin: 0;
+  font-size: 13.5px;
+  color: #c5d4e8;
+  line-height: 1.45;
+}
+.feed-foot {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(34, 51, 82, 0.5);
+  font-size: 12px;
+  color: var(--muted);
+}
+.feed-player {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+/* Stat accent colors used on the feed page */
+.stat-abs .review-stat-value { color: #fdba74; }
+.stat-manager .review-stat-value { color: #74c0fc; }
+
+/* Mobile: stack time above the body */
+@media (max-width: 560px) {
+  .feed-row { flex-direction: column; gap: 6px; }
+  .feed-time { flex-direction: row; align-items: center; gap: 8px; min-width: 0; }
+}

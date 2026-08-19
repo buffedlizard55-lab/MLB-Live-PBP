@@ -147,10 +147,17 @@ window.Props = (() => {
 
   /**
    * Fetch one player's season hitting or pitching bundle. One request returns
-   * season aggregates, expected stats, Statcast quality, platoon splits
-   * (statSplits, sitCodes vl/vr), and the full game log (recent form). Entries
-   * cache the in-flight Promise as well as its resolved value so a timeline
-   * with repeated batters does not make duplicate requests.
+   * season aggregates, expected stats, platoon splits (statSplits, sitCodes
+   * vl/vr), and the full game log (recent form). Entries cache the in-flight
+   * Promise as well as its resolved value so a timeline with repeated batters
+   * does not make duplicate requests.
+   *
+   * NOTE (verified 2026-08-19 against statsapi.mlb.com): requesting the
+   * "statcast" stat for group=hitting returns HTTP 400 "Invalid Request", and
+   * a single invalid stat invalidates the whole CSV. The shared bundle is
+   * therefore expectedStatistics,season,statSplits,gameLog only — xBA comes
+   * from expectedStatistics (estimatedBaUsingSpeedangle), so nothing the model
+   * consumes is lost by omitting statcast.
    */
   function fetchPlayerStats(playerId, group = 'hitting', season = null) {
     if (!playerId) return Promise.resolve(null);
@@ -162,11 +169,7 @@ window.Props = (() => {
     if (cached) return cached.promise;
 
     const params = new URLSearchParams({
-      // Pitcher forecasts only need expected / season rates. Avoid requesting
-      // a hitter-specific Statcast group on pitching-only player records.
-      stats: statGroup === 'pitching'
-        ? 'expectedStatistics,season,statSplits,gameLog'
-        : 'statcast,expectedStatistics,season,statSplits,gameLog',
+      stats: 'expectedStatistics,season,statSplits,gameLog',
       group: statGroup,
       // Platoon splits. For hitters: vs LHP / vs RHP. For pitchers: vs LHB / vs RHB.
       sitCodes: 'vl,vr',

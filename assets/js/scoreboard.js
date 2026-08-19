@@ -168,6 +168,11 @@
       item.appendChild(UI.el('span', 'ticker-cta', 'View →'));
       itemsWrap.appendChild(item);
     });
+    const feedLink = UI.el('a', 'ticker-feed-link', '🚨 Open all-games replay feed →', {
+      href: 'reviews.html',
+      title: 'Chat-style live feed of every challenge / review / ABS pitch challenge across all games',
+    });
+    itemsWrap.appendChild(feedLink);
     bar.appendChild(itemsWrap);
     banner.appendChild(bar);
   }

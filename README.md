@@ -19,10 +19,21 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
 - **Instant Replay Reviews & Challenge Alerts** — real-time alerts and dedicated tracking
   for **Manager Challenges**, **Crew Chief Reviews**, **Umpire Reviews**, and **ABS**
   (Automated Ball-Strike system) pitch challenges across both the Scoreboard and Game views:
-  - **Scoreboard Live Ticker & Alert Badges** — surfaces any game currently in review or challenge.
+  - **All-Games "Replay Feed" page** (`reviews.html`) — a live, chat-style feed that pulls
+    review events from **every game on the schedule** (not just one game): new manager
+    challenges, crew chief reviews, umpire reviews and ABS pitch challenges appear at the
+    top of the feed as they happen, with game link, inning, challenging team, reason,
+    outcome, and batter/pitcher context. Includes an "Under Review" live strip, per-type
+    filters, and summary stats for the whole day.
+  - **Scoreboard Live Ticker & Alert Badges** — surfaces any game currently in review or challenge,
+    with a link straight to the all-games Replay Feed.
   - **Live Game Review Alert Banner** — eye-catching alert at the top of the game and live module when a call is under review.
   - **Dedicated "Challenges & Reviews" Tab** — full breakdown of every review event with summary stats (overturn rate, breakdown by challenge type and team), call reasons, and outcomes (Overturned, Stands, Confirmed).
   - **Play-by-Play Chips** — highlighted review outcome chips directly on affected plays.
+  - All review parsing is validated against the real StatsAPI shapes (`reviewDetails`
+    with codes `MJ` = ABS pitch challenge, `MA`/`MF` = manager challenges, plus
+    `feed.gameData.review` / `feed.gameData.absChallenges` challenge counters) — see
+    `docs/verification-report.md` and `tools/review-test.mjs`.
 - **Two-sided hit forecast** — a transparent per-plate-appearance hit probability that
   compounds the batter's and pitcher's season rates (log5), real platoon splits,
   recent form, head-to-head history, same-game familiarity, and the live count into a
@@ -48,13 +59,14 @@ This project does the same thing with its own front end. The API calls we make:
 
 | What we need | Endpoint |
 | --- | --- |
-| Games for a date (scoreboard cards, probables, live count) | `GET /api/v1/schedule?sportId=1&date=YYYY-MM-DD&hydrate=probablePitcher,linescore,decisions` |
+| Games for a date (scoreboard cards, probables, live count) | `GET /api/v1/schedule?sportId=1&date=YYYY-MM-DD&hydrate=probablePitcher,linescore,decisions,review` |
 | Full game state — play-by-play, current at-bat, linescore, box score, decisions, rosters | `GET /api/v1.1/game/{gamePk}/feed/live` |
 | Fallback feed (older games) | `GET /api/v1/game/{gamePk}/feed/live` |
 | Fallback bundle (if the feed 404s) | `GET /api/v1/game/{gamePk}/playByPlay` + `/boxscore` + `/linescore` |
+| Play-by-play only (all-games Replay Feed scans this per game) | `GET /api/v1/game/{gamePk}/playByPlay` |
 | Team logos | `https://www.mlbstatic.com/team-logos/team-cap-on-dark/{teamId}.svg` |
 | Player headshots | `https://img.mlbstatic.com/mlb-photos/image/upload/.../v1/people/{playerId}/headshot/67/current` |
-| Batter / pitcher season inputs for the forecast | `GET /api/v1/people/{playerId}/stats?stats=statcast,expectedStatistics,season,statSplits,gameLog&group=hitting&sitCodes=vl,vr&season=YYYY`; pitchers request `expectedStatistics,season,statSplits,gameLog` with `group=pitching` |
+| Batter / pitcher season inputs for the forecast | `GET /api/v1/people/{playerId}/stats?stats=expectedStatistics,season,statSplits,gameLog&group=hitting&sitCodes=vl,vr&season=YYYY` (same CSV for `group=pitching`). **Note:** the `statcast` stat is rejected with HTTP 400 for `group=hitting` on the live API (verified 2026-08-19), so it is deliberately not requested — xBA comes from `expectedStatistics`. |
 | Career head-to-head for the live forecast | `GET /api/v1/people/{batterId}/stats?stats=vsPlayer&group=hitting&opposingPlayerId={pitcherId}` |
 
 The live feed is the heart of it — one response contains everything Gameday shows:
@@ -139,6 +151,7 @@ for archived games the request is scoped to the feed's game season.
 .
 ├── index.html                 # Scoreboard page (all games for a date)
 ├── game.html                  # Game page (?gamePk=<id>)
+├── reviews.html               # All-games Replay Feed (live chat-style review feed)
 ├── 404.html
 ├── assets/
 │   ├── css/style.css          # Dark Gameday-style theme (responsive)
@@ -146,6 +159,7 @@ for archived games the request is scoped to the feed's game season.
 │       ├── api.js             # MLB StatsAPI client (fetch, retry, fallbacks, formatters)
 │       ├── ui.js              # Shared UI: team logos, colors, count dots, runners diamond
 │       ├── reviews.js         # Challenge & replay review parser (Manager, Crew Chief, ABS)
+│       ├── reviews-feed.js    # All-games Replay Feed logic (diff helpers + page)
 │       ├── scoreboard.js      # Scoreboard page logic
 │       ├── props.js           # Two-sided hit model, stat cache, Props & Matchup tab
 │       └── game.js            # Game page logic (live "at bat" module, linescore, box, PBP)
@@ -167,10 +181,12 @@ npx serve .
 Then open <http://localhost:8000>. You can also open `index.html` directly in a browser
 (`file://` works — the app uses plain scripts, no modules).
 
-To run the deterministic, network-free model checks:
+To run the deterministic, network-free checks:
 
 ```bash
-node tools/hit-model-test.mjs
+node tools/hit-model-test.mjs      # two-sided hit forecast model
+node tools/review-test.mjs         # challenge / replay review parser (incl. real API shapes)
+node tools/reviews-feed-test.mjs   # all-games Replay Feed diff helpers
 ```
 
 ## Deploy to GitHub Pages
@@ -216,7 +232,12 @@ GitHub Actions**.
   degrades gracefully if a field disappears.
 - Be a good citizen: polling every 10s for a handful of live games is well within
   normal usage, but avoid hammering — the code pauses when the tab is hidden and
-  uses a quiet 30s cadence on the scoreboard.
+  uses a quiet 30s cadence on the scoreboard. The Replay Feed scans live games'
+  playByPlay (the light endpoint, no boxscore/rosters) roughly every 20s and only
+  re-renders when a review event actually changes.
+- Review/challenge data shapes were verified against the live API on 2026-08-19
+  (schedule `hydrate=review`, `reviewDetails` codes `MJ`/`MA`/`MF`, and
+  `gameData.absChallenges`); see `docs/verification-report.md`.
 - Team logos, headshots, and the underlying data are © MLB Advanced Media / MLB and
   their respective owners. This is an unofficial fan project — not affiliated with
   or endorsed by MLB.

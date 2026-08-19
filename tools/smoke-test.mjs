@@ -124,9 +124,79 @@ try {
           t.teamStats.batting && t.teamStats.pitching));
       }
     }
+
+    /* replay-review / challenge data (shapes verified 2026-08-19) */
+    const gd2 = feed.gameData || {};
+    if (gd2.review) {
+      const r = gd2.review;
+      check('gameData.review has per-team counts',
+        !!r.away && typeof r.away.used === 'number' && typeof r.away.remaining === 'number' &&
+        !!r.home && typeof r.home.used === 'number' && typeof r.home.remaining === 'number',
+        JSON.stringify(r));
+    } else {
+      check('gameData.review present', false, 'missing gameData.review');
+    }
+    const abs = gd2.absChallenges;
+    if (abs) {
+      check('gameData.absChallenges has usedSuccessful/usedFailed/remaining',
+        !!abs.away && typeof abs.away.usedSuccessful === 'number' &&
+        typeof abs.away.usedFailed === 'number' && typeof abs.away.remaining === 'number' &&
+        !!abs.home && typeof abs.home.usedSuccessful === 'number' &&
+        typeof abs.home.usedFailed === 'number' && typeof abs.home.remaining === 'number',
+        JSON.stringify(abs));
+    } else {
+      check('gameData.absChallenges present', false, 'missing gameData.absChallenges');
+    }
+
+    // Scan every play for review markers; a feed from an active/recent date
+    // will usually have at least the structures (empty is OK for a clean game).
+    let reviewDetailCount = 0;
+    let hasReviewEventCount = 0;
+    for (const p of plays.allPlays || []) {
+      if (p.reviewDetails) reviewDetailCount += 1;
+      for (const e of p.playEvents || []) {
+        if (e.reviewDetails) reviewDetailCount += 1;
+        if (e.details && e.details.hasReview === true) hasReviewEventCount += 1;
+      }
+    }
+    console.log(`  (reviewDetails entries: ${reviewDetailCount}, details.hasReview events: ${hasReviewEventCount})`);
+    check('reviewDetails shape sane',
+      !(plays.allPlays || []).some((p) => p.reviewDetails && typeof p.reviewDetails.isOverturned !== 'boolean' && !p.reviewDetails.inProgress),
+      'reviewDetails should carry isOverturned or inProgress');
   }
 } catch (err) {
   check('live feed test', false, err.message);
+}
+
+/* ------------------------------------------------------- hit-model stats */
+
+console.log('\n== hit-model people stats (the exact URLs props.js sends) ==');
+for (const [label, url] of [
+  ['hitting bundle', `${V1}/people/592450/stats?stats=expectedStatistics%2Cseason%2CstatSplits%2CgameLog&group=hitting&sitCodes=vl%2Cvr&season=${date.slice(0, 4)}`],
+  ['pitching bundle', `${V1}/people/656302/stats?stats=expectedStatistics%2Cseason%2CstatSplits%2CgameLog&group=pitching&sitCodes=vl%2Cvr&season=${date.slice(0, 4)}`],
+]) {
+  try {
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    const body = await res.json();
+    check(`${label} HTTP 200`, res.status === 200, `HTTP ${res.status}`);
+    check(`${label} returns stats array`, Array.isArray(body && body.stats), body && body.message);
+    check(`${label} includes expectedStatistics`, (body && body.stats || []).some((s) =>
+      /expected/i.test(((s && s.type) || {}).displayName || '')), 'missing expectedStatistics');
+  } catch (err) {
+    check(`${label} fetched`, false, err.message);
+  }
+}
+
+/* schedule hydrate=review regression guard (the scoreboard / feed rely on it) */
+console.log('\n== schedule hydrate=review ==');
+try {
+  const sched = await getJSON(`${V1}/schedule?sportId=1&date=${date}&hydrate=review`);
+  const list = sched.dates && sched.dates[0] ? sched.dates[0].games : [];
+  const bad = list.filter((g) => !g.review || !g.review.away || typeof g.review.away.used !== 'number');
+  check('every game carries review.away/home.used/remaining', bad.length === 0,
+    `${bad.length} games missing review hydration`);
+} catch (err) {
+  check('schedule hydrate=review fetched', false, err.message);
 }
 
 console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');

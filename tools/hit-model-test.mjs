@@ -387,10 +387,14 @@ assert.equal(requests.length, 2, 'same player/group/season should share one in-f
 assert.match(requests[0], /group=hitting/, 'hitting cache entry should request hitter data');
 assert.match(requests[1], /group=pitching/, 'pitching cache entry should request pitcher data');
 assert.match(requests[1], /season=2026/, 'forecast requests should preserve the game season');
-assert.match(requests[0], /stats=statcast%2CexpectedStatistics%2Cseason%2CstatSplits%2CgameLog/,
-  'hitter bundle should include splits and game logs');
+// The "statcast" stat 400s for group=hitting on the live API (verified
+// 2026-08-19), so both bundles request the same valid CSV.
+assert.match(requests[0], /stats=expectedStatistics%2Cseason%2CstatSplits%2CgameLog/,
+  'hitter bundle should include expected, season, splits and game logs');
 assert.match(requests[0], /sitCodes=vl%2Cvr/, 'bundle should request platoon sitCodes');
-assert.ok(!requests[1].includes('statcast%2C'), 'pitcher bundle should skip hitter-only Statcast groups');
+assert.match(requests[1], /stats=expectedStatistics%2Cseason%2CstatSplits%2CgameLog/,
+  'pitcher bundle should use the same valid stat CSV');
+assert.ok(!requests[0].includes('statcast'), 'hitter bundle must not request the invalid statcast stat');
 
 await Props.fetchHeadToHead(7, 8);
 await Props.fetchHeadToHead(7, 8);
