@@ -59,6 +59,37 @@ Every claim below was checked against **live responses**, not documentation or m
    `expectedStatistics` (`estimatedBaUsingSpeedangle`), so nothing the model
    consumes is lost. The fixed URL was verified live (returns all 4 stat groups).
 
+### What the repo got WRONG, round 2 (replay feed "undefined", fixed same day)
+
+4. **The all-games Replay Feed rendered "undefined @ undefined".** Root cause,
+   verified against the live schedule endpoint: the schedule's
+   `teams.away.team` / `teams.home.team` objects carry **only
+   `{ id, name, link }` — there is no `abbreviation` field**. The feed rows and
+   the live-review strip interpolated `${team.abbreviation}` from those objects,
+   printing the literal string `undefined` twice per row.
+   **Fix:** rows now render the official full club names from the schedule
+   (`name` IS the official name, e.g. "Detroit Tigers @ Pittsburgh Pirates");
+   official abbreviations are resolved from `GET /api/v1/teams?sportId=1&season=Y`
+   (`MLB.getTeams()`, cached per season) — never fabricated. Missing data
+   degrades to explicit placeholders (`AWY`/`HOM`) or hides the chip.
+   Regression-guarded by `tools/replay-feed-render-test.mjs` (fails on the old
+   code with exactly `undefined @ undefined`) and `tools/reviews-feed-test.mjs` §8.
+5. **Fabricated abbreviations removed.** `extractReviews` used to fall back to
+   `name.slice(0, 3).toUpperCase()`, which invents wrong codes for real clubs
+   ("SAN" for San Diego Padres — official `SD`; "CHI" for both Chicago clubs —
+   official `CHC`/`CWS`; "LOS" for both LA clubs — official `LAD`/`LAA`).
+   Verified live: `feed/live` `gameData.teams.*.abbreviation` exists ("DET"/"PIT"
+   in game 823342), so game pages keep official abbreviations; schedule-based
+   pseudo-feeds resolve them via the teams directory or leave them null.
+   Covered by `tools/review-test.mjs` §5.
+6. **`/api/v1/teams?sportId=1&season=2026`** verified live: 30 clubs, each with
+   `id`, official `name`, `abbreviation`, `teamName`, `locationName`
+   (e.g. `{ id: 116, name: "Detroit Tigers", abbreviation: "DET" }`,
+   `{ id: 135, name: "San Diego Padres", abbreviation: "SD" }`,
+   `{ id: 133, name: "Athletics", abbreviation: "ATH", locationName: "Sacramento" }`).
+   `tools/smoke-test.mjs` now asserts the directory resolves every schedule team
+   id with an official name + abbreviation, and that schedule teams carry names.
+
 ## 3. Status strings
 
 `status.detailedState` values observed live: `In Progress`, `Final`, `Warmup`,

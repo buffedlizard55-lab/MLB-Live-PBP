@@ -9,6 +9,10 @@
  * Data flow (all shapes verified against statsapi.mlb.com, 2026-08-19):
  *   1. Schedule (hydrate=review,linescore,decisions) -> teams + status +
  *      per-team manager-challenge counts (game.review.away/home.used/remaining).
+ *      NOTE: the schedule's `teams.*.team` objects carry ONLY { id, name, link }
+ *      — no `abbreviation`. `name` is the official full club name ("Detroit
+ *      Tigers") and is what gets rendered; official abbreviations are resolved
+ *      separately from MLB.getTeams() (GET /api/v1/teams). Nothing is guessed.
  *   2. Per live/final game: playByPlay (allPlays + currentPlay) -> the same
  *      review payload the game page reads from feed/live:
  *        - play.reviewDetails            (manager challenges: codes "MA"/"MF")
@@ -105,6 +109,27 @@ function sortFeedEntries(entries) {
   return [...entries].sort((a, b) => stamp(b) - stamp(a));
 }
 
+/**
+ * Official matchup label for one schedule game, e.g.
+ * "Detroit Tigers @ Pittsburgh Pirates".
+ *
+ * Verified live (2026-08-19): schedule `teams.*.team` = { id, name, link } —
+ * `name` IS the official full club name, so it is used directly; there is no
+ * `abbreviation` on schedule teams, and one is never fabricated. The
+ * /teams directory (`MLB.getTeams()`) is only a fallback when a schedule
+ * entry is missing its name. A wholly missing team degrades to an explicit
+ * 'AWY'/'HOM' placeholder — the string "undefined" can never appear.
+ */
+function gameTeamsLabel(game, teamsById) {
+  const side = (which, fallback) => {
+    const t = game && game.teams && game.teams[which] && game.teams[which].team;
+    if (!t) return fallback;
+    const dir = teamsById && t.id != null ? teamsById[t.id] : null;
+    return t.name || (dir && dir.name) || (dir && dir.abbreviation) || fallback;
+  };
+  return `${side('away', 'AWY')} @ ${side('home', 'HOM')}`;
+}
+
 /* ------------------------------------------------------------ page logic */
 
 (() => {
@@ -113,6 +138,7 @@ function sortFeedEntries(entries) {
 
   let dateStr = todayStr();
   let games = [];
+  let teamsById = {};              // teamId -> official {name, abbreviation, ...}
   let filter = 'all';
   let pollTimer = null;
   let requestInFlight = false;
@@ -154,6 +180,21 @@ function sortFeedEntries(entries) {
       const scheduleGames = await MLB.getSchedule(requestDate);
       if (requestDate !== dateStr) return;
       games = scheduleGames;
+
+      // Official team directory for the schedule's season: the schedule's own
+      // team objects have NO abbreviation (verified live 2026-08-19), so
+      // official abbreviations are resolved here — never fabricated. If this
+      // request fails, official full names still render from the schedule and
+      // abbreviation chips simply stay hidden.
+      const season = (games.find((g) => g && g.season) || {}).season
+        || requestDate.slice(0, 4);
+      try {
+        teamsById = await MLB.getTeams(season);
+      } catch (dirErr) {
+        console.warn('team directory unavailable — abbreviations hidden this poll', dirErr);
+        teamsById = {};
+      }
+      if (requestDate !== dateStr) return;
 
       const candidates = games.filter((g) => {
         const state = g.status && g.status.abstractGameState;
@@ -201,17 +242,25 @@ function sortFeedEntries(entries) {
     }
     if (state === 'Final') settledGames.add(gamePk);
 
+    // Schedule team objects carry only { id, name, link } (verified live
+    // 2026-08-19). The official abbreviation comes from the /teams directory;
+    // when it is unavailable it stays null and the chip is hidden — never a
+    // fabricated abbreviation.
+    const pseudoTeam = (side) => {
+      const t = game.teams && game.teams[side] && game.teams[side].team;
+      if (!t || t.id == null) return null;
+      const dir = teamsById[t.id];
+      return {
+        id: t.id,
+        name: t.name || (dir && dir.name) || null,
+        abbreviation: (dir && dir.abbreviation) || null,
+      };
+    };
+
     const pseudoFeed = {
       gameData: {
         status: game.status || {},
-        teams: {
-          away: game.teams && game.teams.away && game.teams.away.team
-            ? { id: game.teams.away.team.id, name: game.teams.away.team.name, abbreviation: game.teams.away.team.abbreviation }
-            : null,
-          home: game.teams && game.teams.home && game.teams.home.team
-            ? { id: game.teams.home.team.id, name: game.teams.home.team.name, abbreviation: game.teams.home.team.abbreviation }
-            : null,
-        },
+        teams: { away: pseudoTeam('away'), home: pseudoTeam('home') },
       },
       liveData: { plays: pbp, linescore: null },
     };
@@ -279,15 +328,13 @@ function sortFeedEntries(entries) {
     activeGames.forEach((entries, gamePk) => {
       const g = games.find((x) => x.gamePk === gamePk);
       if (!g) return;
-      const away = g.teams && g.teams.away && g.teams.away.team;
-      const home = g.teams && g.teams.home && g.teams.home.team;
       const label = entries.length
         ? entries[0].review.reviewType
         : (g.status && g.status.detailedState) || 'Review';
       const item = el('a', 'feed-active-link', '',
         { href: `game.html?gamePk=${gamePk}` });
       item.appendChild(el('span', 'feed-active-game',
-        `${away ? away.abbreviation : 'AWY'} @ ${home ? home.abbreviation : 'HOM'}`));
+        gameTeamsLabel(g, teamsById)));
       item.appendChild(el('span', 'feed-active-type', label));
       if (entries.length && entries[0].review.reason) {
         item.appendChild(el('span', 'feed-active-reason', entries[0].review.reason));
@@ -360,12 +407,10 @@ function sortFeedEntries(entries) {
 
     const head = el('div', 'feed-head');
     if (game) {
-      const away = game.teams && game.teams.away && game.teams.away.team;
-      const home = game.teams && game.teams.home && game.teams.home.team;
+      const matchup = gameTeamsLabel(game, teamsById); // official full names
       const link = el('a', 'feed-game', '',
-        { href: `game.html?gamePk=${entry.gamePk}`, title: 'Open game' });
-      link.appendChild(el('span', 'feed-game-txt',
-        `${away ? away.abbreviation : 'AWY'} @ ${home ? home.abbreviation : 'HOM'}`));
+        { href: `game.html?gamePk=${entry.gamePk}`, title: `Open game — ${matchup}` });
+      link.appendChild(el('span', 'feed-game-txt', matchup));
       if (game.linescore && game.linescore.teams) {
         const ls = game.linescore;
         link.appendChild(el('span', 'feed-game-score',
@@ -374,7 +419,17 @@ function sortFeedEntries(entries) {
       head.appendChild(link);
     }
     head.appendChild(el('span', `chip-review-type chip-${r.typeKey}`, r.reviewType));
-    if (r.teamAbbrev) head.appendChild(el('span', 'feed-team', r.teamAbbrev));
+    // Challenging team: official abbreviation (from the /teams directory —
+    // schedule objects have none), official full name on hover. Hidden rather
+    // than guessed when the directory is unavailable.
+    const dirTeam = r.teamId != null ? teamsById[r.teamId] : null;
+    const teamAbbrev = r.teamAbbrev || (dirTeam && dirTeam.abbreviation) || null;
+    const teamFullName = r.teamName || (dirTeam && dirTeam.name) || null;
+    if (teamAbbrev) {
+      const chip = el('span', 'feed-team', teamAbbrev);
+      if (teamFullName) chip.title = teamFullName;
+      head.appendChild(chip);
+    }
     if (r.inningLabel) head.appendChild(el('span', 'feed-inn', r.inningLabel));
     head.appendChild(outcomePill(r));
     body.appendChild(head);
@@ -385,10 +440,13 @@ function sortFeedEntries(entries) {
     const desc = el('div', 'feed-desc', r.description);
     body.appendChild(desc);
 
-    if (r.batter || r.pitcher) {
+    if ((r.batter && r.batter.fullName) || (r.pitcher && r.pitcher.fullName)) {
       const foot = el('div', 'feed-foot');
-      if (r.batter) foot.appendChild(el('span', 'feed-player', `Batter: ${r.batter.fullName}`));
-      if (r.pitcher) foot.appendChild(el('span', 'feed-player', `Pitcher: ${r.pitcher.fullName}${r.pitchVelo ? ` (${r.pitchVelo} mph)` : ''}`));
+      if (r.batter && r.batter.fullName) foot.appendChild(el('span', 'feed-player', `Batter: ${r.batter.fullName}`));
+      if (r.pitcher && r.pitcher.fullName) {
+        foot.appendChild(el('span', 'feed-player',
+          `Pitcher: ${r.pitcher.fullName}${r.pitchVelo ? ` (${r.pitchVelo} mph)` : ''}`));
+      }
       body.appendChild(foot);
     }
 
@@ -489,6 +547,6 @@ function sortFeedEntries(entries) {
 
   /* Node test export (pure helpers only). */
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { buildEventKey, mergeFeedEvents, sortFeedEntries };
+    module.exports = { buildEventKey, mergeFeedEvents, sortFeedEntries, gameTeamsLabel };
   }
 })();

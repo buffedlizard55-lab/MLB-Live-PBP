@@ -113,6 +113,45 @@ const MLB = (() => {
   }
 
   /**
+   * Official team directory for a season: resolves teamId -> full club
+   * metadata { id, name, abbreviation, teamName, locationName }.
+   *
+   * Why this exists (verified against live responses, 2026-08-19): the
+   * SCHEDULE endpoint's `teams.away.team` objects carry only
+   * `{ id, name, link }` — NO `abbreviation`. The official abbreviations
+   * therefore come from this directory instead of being invented. Cached per
+   * season for the page's lifetime; one small request per page load.
+   */
+  const teamsCache = {};
+
+  async function getTeams(season) {
+    const seasonId = season || new Date().getFullYear();
+    if (!teamsCache[seasonId]) {
+      teamsCache[seasonId] = getJSON(`${V1}/teams?sportId=${SPORT_ID}&season=${seasonId}`)
+        .then((data) => {
+          const byId = {};
+          ((data && data.teams) || []).forEach((t) => {
+            if (t && t.id != null) {
+              byId[t.id] = {
+                id: t.id,
+                name: t.name || null,
+                abbreviation: t.abbreviation || null,
+                teamName: t.teamName || null,
+                locationName: t.locationName || null,
+              };
+            }
+          });
+          return byId;
+        })
+        .catch((err) => {
+          delete teamsCache[seasonId]; // allow a retry on a later poll
+          throw err;
+        });
+    }
+    return teamsCache[seasonId];
+  }
+
+  /**
    * Play-by-play only for one game (allPlays + currentPlay + scoringPlays).
    * Much leaner than feed/live (no boxscore/players), and carries the same
    * review data: play-level reviewDetails, event-level details.hasReview and
@@ -224,7 +263,7 @@ const MLB = (() => {
   }
 
   return {
-    getSchedule, getLiveFeed, getPlayByPlay,
+    getSchedule, getLiveFeed, getPlayByPlay, getTeams,
     teamLogoUrl, teamLogoFallbackUrl, headshotUrl,
     ordinal, localTime, localDate, localDateTime,
     inningLabel, inningGlyph, sides, scoreOf,

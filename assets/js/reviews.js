@@ -167,8 +167,18 @@ const MLBReviews = (() => {
     if (gameData.teams) {
       ['away', 'home'].forEach((side) => {
         const t = gameData.teams[side];
-        if (t && t.id) {
-          teamNames[t.id] = { name: t.name, abbrev: t.abbreviation || t.name.slice(0, 3).toUpperCase(), side };
+        if (t && t.id != null) {
+          // Official values only. feed/live teams carry `abbreviation`
+          // (verified live: gameData.teams.away.abbreviation === "DET");
+          // schedule-based pseudo-feeds carry only { id, name, link }, in
+          // which case abbrev stays null and the caller resolves it from
+          // MLB.getTeams(). An abbreviation is never fabricated from the name
+          // (name.slice(0,3) produced wrong codes like "SAN"/"CHI"/"LOS").
+          teamNames[t.id] = {
+            name: t.name || null,
+            abbrev: t.abbreviation || null,
+            side,
+          };
         }
       });
     }
@@ -455,13 +465,14 @@ const MLBReviews = (() => {
     body.appendChild(UI.el('p', 'review-desc-text', review.description));
     card.appendChild(body);
 
-    // Footer: Batter / Pitcher context
-    if (review.batter || review.pitcher) {
+    // Footer: Batter / Pitcher context (only when a name actually exists —
+    // never render "Batter: undefined")
+    if ((review.batter && review.batter.fullName) || (review.pitcher && review.pitcher.fullName)) {
       const foot = UI.el('div', 'review-card-foot');
-      if (review.batter) {
+      if (review.batter && review.batter.fullName) {
         foot.appendChild(UI.el('span', 'review-player-tag', `Batter: ${review.batter.fullName}`));
       }
-      if (review.pitcher) {
+      if (review.pitcher && review.pitcher.fullName) {
         foot.appendChild(UI.el('span', 'review-player-tag',
           `Pitcher: ${review.pitcher.fullName}${review.pitchVelo ? ` (${review.pitchVelo} mph)` : ''}`));
       }

@@ -199,5 +199,36 @@ try {
   check('schedule hydrate=review fetched', false, err.message);
 }
 
+/* official team names / abbreviations (replay feed regression guard, 2026-08-19):
+ * the schedule's team objects carry ONLY { id, name, link } — the replay feed
+ * rendered `${team.abbreviation}` from them and showed "undefined @ undefined".
+ * Official full names must come from the schedule; official abbreviations from
+ * GET /teams. Both are asserted here so an upstream shape change fails CI. */
+console.log('\n== official team names + abbreviations ==');
+try {
+  const dir = await getJSON(`${V1}/teams?sportId=1&season=${date.slice(0, 4)}`);
+  const clubs = dir.teams || [];
+  check('teams directory returns 30 clubs', clubs.length === 30, `${clubs.length} clubs`);
+  check('every club has id + official name + abbreviation',
+    clubs.every((t) => typeof t.id === 'number' && typeof t.name === 'string' && t.name.length > 0 &&
+      typeof t.abbreviation === 'string' && t.abbreviation.length > 0));
+
+  const ids = new Set(clubs.map((t) => t.id));
+  const schedTeams = games.flatMap((g) => [
+    g.teams && g.teams.away && g.teams.away.team,
+    g.teams && g.teams.home && g.teams.home.team,
+  ]).filter(Boolean);
+  check('schedule teams carry official full names',
+    schedTeams.length > 0 && schedTeams.every((t) => typeof t.name === 'string' && t.name.length > 0),
+    `${schedTeams.length} team objects`);
+  check('every schedule team id resolves in the teams directory',
+    schedTeams.every((t) => ids.has(t.id)));
+  const abbrevOnSched = schedTeams.filter((t) => 'abbreviation' in t).length;
+  console.log(`  (schedule team objects with an abbreviation field: ${abbrevOnSched}/${schedTeams.length}` +
+    ' — the app must not depend on it)');
+} catch (err) {
+  check('teams directory fetched', false, err.message);
+}
+
 console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');
 process.exit(failures ? 1 : 0);
