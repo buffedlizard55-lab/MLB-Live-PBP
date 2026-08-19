@@ -43,7 +43,7 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
   single number with a matchup tier (Elite → Pitcher's edge) and per-driver point
   adjustments. It appears in the live at-bat card, the Props & Matchup tab, and
   completed PBP rows.
-- Auto-refreshes every **3 seconds** on a live game page and every **5 seconds** on the all-games Replay Feed; works on desktop and mobile.
+- Auto-refreshes every **2 seconds** on a live game page and the all-games Replay Feed (**1 second** while a review is in progress); works on desktop and mobile.
 - No build step, no frameworks, no API keys — it runs on **GitHub Pages** (or any static
   host, or even `file://`).
 
@@ -84,10 +84,11 @@ liveData.decisions             → winning/losing/saving pitcher
 gameData.players / teams       → names, positions, records, venue, weather, status
 ```
 
-The app polls `feed/live` every 3s while a game is in progress and only rebuilds the
-DOM when the baseball state changes (count, pitch event, score, inning, or play). The
-heavy box-score table is lazy-rendered only when its tab is open. Preview and final
-games use slower cadences, and polling pauses automatically while the tab is hidden.
+The app polls `feed/live` every 2s while a game is in progress (1s while a
+review is in flight) and only rebuilds the DOM when the baseball state changes
+(count, pitch event, score, inning, play, or review outcome). The heavy box-score
+table is lazy-rendered only when its tab is open. Preview and final games use
+slower cadences, and polling pauses automatically while the tab is hidden.
 
 ## Two-sided hit forecast
 
@@ -225,8 +226,9 @@ GitHub Actions**.
 
 - **Season / league:** `SPORT_ID` in `assets/js/api.js` (1 = MLB). Minor-league IDs
   (11–14) also work.
-- **Refresh rate:** `LIVE_POLL_MS`, `PREVIEW_POLL_MS`, and `FINAL_POLL_MS` in
-  `assets/js/game.js`; `LIVE_POLL_MS` / `IDLE_POLL_MS` in `assets/js/scoreboard.js`.
+- **Refresh rate:** `LIVE_POLL_MS`, `REVIEW_POLL_MS`, `PREVIEW_POLL_MS`, and `FINAL_POLL_MS` in
+  `assets/js/game.js`; `LIVE_POLL_MS` / `REVIEW_POLL_MS` / `IDLE_POLL_MS` in
+  `assets/js/scoreboard.js` and `assets/js/reviews-feed.js`.
 - **Team colors:** `TEAM_COLORS` in `assets/js/ui.js`.
 
 ## Notes & etiquette
@@ -234,12 +236,13 @@ GitHub Actions**.
 - The MLB StatsAPI is **unofficial and may change without notice**. The client is
   written defensively (fallbacks for every endpoint and missing fields) and the app
   degrades gracefully if a field disappears.
-- Be a good citizen: polling every 3–5s for a handful of live games is well within
+- Be a good citizen: polling every 1–3s for a handful of live games is well within
   normal usage, but avoid hammering — the code pauses when the tab is hidden and
   uses a quieter cadence on preview/final games. The Replay Feed scans live games'
-  playByPlay (the light endpoint, no boxscore/rosters) every 5s and only
-  re-renders when a review event actually changes. Going faster than 3s (one game)
-  or 5s (all-games scanner) just re-downloads the same pitch.
+  playByPlay (the light endpoint, no boxscore/rosters) every 2s (1s while a review
+  is in flight), subtracts scan time from the next wait, fetches in-review games
+  first, and only re-renders when a review event actually changes. The StatsAPI is
+  pull-only — a shorter poll only reduces how long a landed event sits unseen.
 - Review/challenge data shapes were verified against the live API on 2026-08-19
   (schedule `hydrate=review`, `reviewDetails` codes `MJ`/`MA`/`MF`, and
   `gameData.absChallenges`); see `docs/verification-report.md`.

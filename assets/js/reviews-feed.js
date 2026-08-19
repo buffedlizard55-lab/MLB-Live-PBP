@@ -110,6 +110,63 @@ function sortFeedEntries(entries) {
 }
 
 /**
+ * Poll gap in ms. Active reviews use the short cadence so an outcome flip
+ * is not waiting on the ordinary live interval. Values are passed in so
+ * this stays a pure function (the page IIFE owns the constants).
+ */
+function pollIntervalMs({ hasLive, hasActiveReview, liveMs, reviewMs, idleMs }) {
+  if (hasActiveReview) return reviewMs;
+  if (hasLive) return liveMs;
+  return idleMs;
+}
+
+/**
+ * Wait after a scan so the *cycle* (scan + idle) equals `intervalMs`.
+ * If the scan already used the whole budget, wait 0 — never a negative
+ * timeout, never invent a delay.
+ */
+function waitAfterScan(intervalMs, elapsedMs) {
+  if (!Number.isFinite(intervalMs) || intervalMs < 0) return 0;
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return intervalMs;
+  return Math.max(0, intervalMs - elapsedMs);
+}
+
+/**
+ * Fetch order for the all-games scanner. Lower number = sooner.
+ *   0 — schedule status already says challenge/review, or we already have
+ *       an in-progress entry for that game (catch the outcome first)
+ *   1 — other live games
+ *   2 — finals / everything else
+ * Uses only status.detailedState / abstractGameState plus the boolean the
+ * caller already computed from feed state — no guessed fields.
+ */
+function reviewFetchPriority(game, hasInProgress) {
+  const detailed = (game && game.status && game.status.detailedState) || '';
+  if (hasInProgress || /challenge|review/i.test(detailed)) return 0;
+  const state = game && game.status && game.status.abstractGameState;
+  if (state === 'Live') return 1;
+  return 2;
+}
+
+/** Run `fn` over items with a fixed concurrency cap. Preserves completion of every item. */
+async function mapPool(items, limit, fn) {
+  const list = items || [];
+  const conc = Math.max(1, Number(limit) || 1);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < list.length) {
+      const idx = cursor;
+      cursor += 1;
+      await fn(list[idx], idx);
+    }
+  }
+  const n = Math.min(conc, list.length);
+  const workers = [];
+  for (let i = 0; i < n; i += 1) workers.push(worker());
+  await Promise.all(workers);
+}
+
+/**
  * True only for a real, printable club name. Rejects null/empty and the
  * literal strings "undefined" / "null" so a missing field can never leak
  * into the matchup headline as "undefined @ undefined".
@@ -180,11 +237,19 @@ function gameTeamsLabel(game, teamsById) {
 /* ------------------------------------------------------------ page logic */
 
 (() => {
-  // 5s is the practical floor for an all-games scanner: each cycle hits
-  // playByPlay once per live game. Faster than that just re-downloads the
-  // same pitch. Idle (no live games) backs off to 20s.
-  const LIVE_POLL_MS = 5000;
-  const IDLE_POLL_MS = 20000;
+  // Cadence is the gap between poll STARTS (scan duration is subtracted in
+  // waitAfterScan). The StatsAPI is pull-only — a shorter poll only reduces
+  // how long a landed review sits unseen. Hidden tabs still pause.
+  //   live games          : 2s
+  //   a review in flight  : 1s  (outcome flips are what the feed is for)
+  //   no live games       : 15s
+  const LIVE_POLL_MS = 2000;
+  const REVIEW_POLL_MS = 1000;
+  const IDLE_POLL_MS = 15000;
+  // playByPlay is one request per live / unsettled-final game. 10 at a time
+  // keeps a 15-game slate to two waves instead of three sequential batches
+  // of 5 (the previous scanner). Same host, same CORS-open endpoint.
+  const FETCH_CONCURRENCY = 10;
 
   let dateStr = todayStr();
   let games = [];
@@ -193,6 +258,7 @@ function gameTeamsLabel(game, teamsById) {
   let pollTimer = null;
   let countdownTimer = null;
   let nextRefreshAt = 0;
+  let lastCycleStartedAt = 0;
   let requestInFlight = false;
   let settledGames = new Set();     // Final games: fetched once, immutable
   const feedState = { seen: new Map(), order: [] };
@@ -225,6 +291,7 @@ function gameTeamsLabel(game, teamsById) {
     if (requestInFlight) return;
     const requestDate = dateStr;
     requestInFlight = true;
+    lastCycleStartedAt = Date.now();
     const statusLine = $('#status-line');
     setLivePulse(true);
 
@@ -253,14 +320,17 @@ function gameTeamsLabel(game, teamsById) {
         return state === 'Live' || state === 'Final';
       });
 
-      // Sequential-ish fetch with small concurrency: playByPlay is the same
-      // CORS-open endpoint the game page already uses, but be polite.
-      const batches = [];
-      for (let i = 0; i < candidates.length; i += 5) batches.push(candidates.slice(i, i + 5));
-      for (const batch of batches) {
-        await Promise.all(batch.map((g) => ingestGame(g)));
+      // Games already under review first, then other live games, then finals.
+      // That cuts the wait for an outcome flip on a 15-game slate.
+      candidates.sort((a, b) =>
+        reviewFetchPriority(a, gameHasInProgress(a.gamePk)) -
+        reviewFetchPriority(b, gameHasInProgress(b.gamePk)));
+
+      await mapPool(candidates, FETCH_CONCURRENCY, async (g) => {
         if (requestDate !== dateStr) return;
-      }
+        await ingestGame(g);
+      });
+      if (requestDate !== dateStr) return;
 
       render();
       renderStatusLine();
@@ -577,9 +647,35 @@ function gameTeamsLabel(game, teamsById) {
     if (dot) dot.classList.toggle('on', on);
   }
 
+  function gameHasInProgress(gamePk) {
+    let found = false;
+    feedState.seen.forEach((entry) => {
+      if (entry.gamePk === gamePk && entry.review && entry.review.inProgress) found = true;
+    });
+    return found;
+  }
+
+  function hasActiveReviewSignal() {
+    let inFeed = false;
+    feedState.seen.forEach((entry) => {
+      if (entry.review && entry.review.inProgress) inFeed = true;
+    });
+    if (inFeed) return true;
+    return games.some((g) => {
+      const detailed = (g.status && g.status.detailedState) || '';
+      return /challenge|review/i.test(detailed);
+    });
+  }
+
   function currentInterval() {
     const hasLive = games.some((g) => g.status && g.status.abstractGameState === 'Live');
-    return hasLive ? LIVE_POLL_MS : IDLE_POLL_MS;
+    return pollIntervalMs({
+      hasLive,
+      hasActiveReview: hasActiveReviewSignal(),
+      liveMs: LIVE_POLL_MS,
+      reviewMs: REVIEW_POLL_MS,
+      idleMs: IDLE_POLL_MS,
+    });
   }
 
   function renderStatusLine() {
@@ -613,13 +709,22 @@ function gameTeamsLabel(game, teamsById) {
 
   function scheduleNext(overrideMs) {
     clearTimeout(pollTimer);
-    const interval = overrideMs || currentInterval();
-    nextRefreshAt = Date.now() + interval;
+    const interval = overrideMs != null ? overrideMs : currentInterval();
+    // Subtract the scan we just finished so the *cycle* is `interval`, not
+    // scan + interval. First boot / hidden-tab park (no lastCycleStartedAt)
+    // waits the full gap. Hidden must never subtract a stale scan or
+    // waitAfterScan(interval, hugeElapsed) is 0 and the timer spins.
+    const elapsed = lastCycleStartedAt ? Date.now() - lastCycleStartedAt : 0;
+    const wait = overrideMs != null ? interval : waitAfterScan(interval, elapsed);
+    nextRefreshAt = Date.now() + wait;
     pollTimer = setTimeout(() => {
       if (!document.hidden) load();
-      else scheduleNext();
-    }, interval);
-    startCountdown(interval);
+      else {
+        lastCycleStartedAt = 0;
+        scheduleNext();
+      }
+    }, wait);
+    startCountdown(wait);
   }
 
   function syncUrl() {
@@ -661,6 +766,7 @@ function gameTeamsLabel(game, teamsById) {
     module.exports = {
       buildEventKey, mergeFeedEvents, sortFeedEntries, gameTeamsLabel,
       isUsableName, officialTeamName, gameSideTeam,
+      pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
     };
   }
 })();

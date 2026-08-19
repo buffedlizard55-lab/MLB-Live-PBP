@@ -31,6 +31,7 @@ vm.runInContext(source, context, { filename: 'assets/js/reviews-feed.js' });
 const {
   buildEventKey, mergeFeedEvents, sortFeedEntries, gameTeamsLabel,
   isUsableName, officialTeamName, gameSideTeam,
+  pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
 } = context.module.exports;
 
 /* ------------------------------------------------------- 1. Stable keys */
@@ -174,5 +175,32 @@ const flat = {
 assert.equal(gameSideTeam(flat, 'away').name, 'Detroit Tigers');
 assert.equal(gameTeamsLabel(flat, {}), 'Detroit Tigers @ Pittsburgh Pirates');
 assert.equal(officialTeamName({ id: 116 }, directory, 'AWY'), 'Detroit Tigers');
+
+/* --------------------------- 9. Poll cadence helpers (no invented delays) */
+
+assert.equal(pollIntervalMs({ hasLive: false, hasActiveReview: false, liveMs: 2000, reviewMs: 1000, idleMs: 15000 }), 15000);
+assert.equal(pollIntervalMs({ hasLive: true, hasActiveReview: false, liveMs: 2000, reviewMs: 1000, idleMs: 15000 }), 2000);
+assert.equal(pollIntervalMs({ hasLive: true, hasActiveReview: true, liveMs: 2000, reviewMs: 1000, idleMs: 15000 }), 1000);
+assert.equal(pollIntervalMs({ hasLive: false, hasActiveReview: true, liveMs: 2000, reviewMs: 1000, idleMs: 15000 }), 1000,
+  'an in-progress review still uses the review cadence even if the slate is no longer Live');
+
+assert.equal(waitAfterScan(2000, 0), 2000);
+assert.equal(waitAfterScan(2000, 800), 1200, 'scan time is subtracted from the cycle');
+assert.equal(waitAfterScan(2000, 2500), 0, 'over-budget scan waits 0, never negative');
+assert.equal(waitAfterScan(2000, -5), 2000, 'negative elapsed is ignored, not invented');
+assert.equal(waitAfterScan(NaN, 100), 0);
+assert.equal(waitAfterScan(-10, 0), 0);
+
+assert.equal(reviewFetchPriority({ status: { detailedState: 'Manager Challenge', abstractGameState: 'Live' } }, false), 0);
+assert.equal(reviewFetchPriority({ status: { detailedState: 'In Progress', abstractGameState: 'Live' } }, true), 0);
+assert.equal(reviewFetchPriority({ status: { detailedState: 'In Progress', abstractGameState: 'Live' } }, false), 1);
+assert.equal(reviewFetchPriority({ status: { detailedState: 'Final', abstractGameState: 'Final' } }, false), 2);
+// "In Progress" must NOT match /review/ — that would falsely prioritize every live game.
+assert.equal(reviewFetchPriority({ status: { detailedState: 'In Progress', abstractGameState: 'Live' } }, false), 1);
+
+const seen = [];
+await mapPool(['a', 'b', 'c', 'd'], 2, async (item) => { seen.push(item); });
+assert.deepEqual(seen.slice().sort(), ['a', 'b', 'c', 'd'], 'mapPool visits every item');
+await mapPool([], 4, async () => { throw new Error('must not run on empty'); });
 
 console.log('Replay feed tests passed successfully!');

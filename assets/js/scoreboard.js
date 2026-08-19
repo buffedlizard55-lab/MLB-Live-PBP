@@ -4,7 +4,10 @@
 'use strict';
 
 (() => {
-  const LIVE_POLL_MS = 5000;
+  // Live scoreboard: 3s. While any game's official status says challenge/
+  // review: 1.5s so the ticker is not waiting on the ordinary live interval.
+  const LIVE_POLL_MS = 3000;
+  const REVIEW_POLL_MS = 1500;
   const IDLE_POLL_MS = 30000;
 
   let dateStr = todayStr();
@@ -72,10 +75,18 @@
   function scheduleNext(overrideMs) {
     clearTimeout(pollTimer);
     const hasLiveGame = games.some((g) => g.status.abstractGameState === 'Live');
+    const hasActiveReview = games.some((g) => {
+      const inspection = window.MLBReviews
+        ? window.MLBReviews.inspectScheduleGame(g)
+        : { hasActiveReview: false };
+      return inspection.hasActiveReview;
+    });
+    const interval = overrideMs || (hasActiveReview ? REVIEW_POLL_MS
+      : hasLiveGame ? LIVE_POLL_MS : IDLE_POLL_MS);
     pollTimer = setTimeout(() => {
       if (!document.hidden) load();
       else scheduleNext();
-    }, overrideMs || (hasLiveGame ? LIVE_POLL_MS : IDLE_POLL_MS));
+    }, interval);
   }
 
   function updateDateLabel() {
