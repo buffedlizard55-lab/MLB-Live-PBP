@@ -995,7 +995,12 @@
 
     if (hasReview) {
       row.classList.add('play-has-review');
-      const revType = (revDetails && revDetails.reviewType) ||
+      // reviewDetails.reviewType is a short code ("MJ"=ABS, "MA"/"MF"=manager);
+      // resolve it through the shared parser so chips never show raw codes.
+      const typeMeta = window.MLBReviews
+        ? window.MLBReviews.normalizeType(revDetails && revDetails.reviewType, result.description || '')
+        : null;
+      const revType = (typeMeta && typeMeta.label) ||
         (/abs\b/i.test(result.description || '') ? 'ABS Challenge' :
         /crew chief/i.test(result.description || '') ? 'Crew Chief' : 'Challenge');
       const isOverturned = (revDetails && revDetails.isOverturned === true) ||

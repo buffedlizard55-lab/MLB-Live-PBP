@@ -9,13 +9,47 @@
 
 const MLBReviews = (() => {
   /**
-   * Determine the normalized review type key from raw string or event structure.
+   * MLB StatsAPI sends SHORT CODES in `reviewDetails.reviewType`, not full
+   * sentences. Verified against live feeds (statsapi.mlb.com, 2026-08-19):
+   *
+   *   "MJ"  → ABS (Automated Ball-Strike) pitch challenge. Attached to a pitch
+   *           event (older pattern) or to the play itself with text like
+   *           "… challenged (pitch result), call on the field was …".
+   *           Matches feed.gameData.absChallenges.{away,home}.usedSuccessful/
+   *           usedFailed counts. (Verified in games 823342, 823667, 824075.)
+   *   "MA"  → Manager challenge on a play. Play-level reviewDetails with text
+   *           like "Tigers challenged (tag play), call on the field was
+   *           overturned: …". (Verified in game 823341.)
+   *   "MF"  → Manager challenge on a play. Same shape. (Verified in game 824075:
+   *           "Royals challenged (play at 1st), call on the field was …".)
+   *
+   * Other M-prefixed codes are treated the same as MA/MF (traditional play
+   * reviews); unknown codes fall back to description-text detection and then
+   * to a generic "Replay Review" label — we never invent labels for codes we
+   * have not observed.
    */
   function normalizeType(rawType, text) {
     const combined = `${rawType || ''} ${text || ''}`.toLowerCase();
-    if (combined.includes('abs') || combined.includes('automated ball-strike') || combined.includes('ball-strike') || combined.includes('pitch challenge')) {
+    const raw = String(rawType || '').trim();
+
+    // 1. Explicit ABS language in the description wins (covers feeds whose
+    //    text says "ABS Challenge (…)"/"pitch result" without a reviewType code).
+    if (combined.includes('abs') || combined.includes('automated ball-strike') ||
+        combined.includes('ball-strike') || combined.includes('pitch challenge') ||
+        /pitch result/i.test(combined)) {
       return { key: 'abs', label: 'ABS Challenge' };
     }
+
+    // 2. Short code from reviewDetails.reviewType (observed values above).
+    if (/^[A-Za-z]{1,4}$/.test(raw)) {
+      const code = raw.toUpperCase();
+      if (code === 'MJ') return { key: 'abs', label: 'ABS Challenge' };
+      if (code.startsWith('M')) return { key: 'manager', label: 'Manager Challenge' };
+      // Unverified codes: label honestly as a generic replay review.
+      return { key: 'review', label: 'Replay Review' };
+    }
+
+    // 3. Full-text detection for feeds that use human-readable types.
     if (combined.includes('crew chief') || combined.includes('umpire review') || combined.includes('crew_chief')) {
       return { key: 'crew_chief', label: 'Crew Chief Review' };
     }
@@ -35,16 +69,22 @@ const MLBReviews = (() => {
     if (!text) return 'Play under review';
     const clean = String(text);
 
-    // Common MLB review description patterns:
+    // Common MLB review description patterns (real feeds use "challenged"):
     // "Manager challenge (call at 1st base): ..."
+    // "Tigers challenged (tag play), call on the field was overturned: ..."
     // "Crew chief review (home run): ..."
     // "ABS challenge (called strike): ..."
-    const parenMatch = clean.match(/(?:challenge|review)\s*\(([^)]+)\)/i);
+    const parenMatch = clean.match(/(?:challeng\w*|review|replay)\s*\(([^)]+)\)/i);
     if (parenMatch) return parenMatch[1].trim();
 
     // Specific baseball review trigger patterns
     if (/home run|boundary|fan interference|over the wall/i.test(clean)) return 'Home Run / Boundary Call';
-    if (/ball[-\s]strike|called (?:strike|ball)|abs challenge/i.test(clean)) return 'Ball / Strike Call (ABS)';
+    // Real ABS pitch-challenge events carry bare descriptions on the reviewed
+    // pitch ("Ball", "Called Strike") with reviewDetails.reviewType "MJ".
+    if (/^(?:ball|called strike|foul|swinging strike|missed bunt|ball in dirt)$/i.test(clean) ||
+        /ball[-\s]strike|called (?:strike|ball)|abs challenge|pitch result/i.test(clean)) {
+      return 'Ball / Strike Call (ABS)';
+    }
     if (/tag(?:ged)?|slide|safe|out at (?:1st|2nd|3rd|home)/i.test(clean)) {
       const baseMatch = clean.match(/(?:at|on)\s+([123]st|[123]nd|[123]rd|first|second|third|home)(?:\s+base)?/i);
       return baseMatch ? `Tag / Force Play at ${baseMatch[1]}` : 'Tag / Force Play';
@@ -104,6 +144,13 @@ const MLBReviews = (() => {
   /**
    * Extract all reviews from a live game feed payload.
    * Scans feed.liveData.plays.allPlays, currentPlay, playEvents, and game status.
+   *
+   * Handles both real-world feed patterns (verified against statsapi.mlb.com):
+   *   - play-level  reviewDetails (manager challenges: "MA"/"MF", rich text)
+   *   - event-level reviewDetails on pitch events (ABS challenges: "MJ")
+   * When a play has BOTH (e.g. an ABS pitch event plus a play-level manager
+   * challenge), one entry per review TYPE is kept — the play-level entry wins
+   * for the same type because it carries the full description.
    */
   function extractReviews(feed) {
     if (!feed) return { reviews: [], activeReview: null, summary: emptySummary() };
@@ -126,8 +173,36 @@ const MLBReviews = (() => {
       });
     }
 
-    const reviews = [];
-    const seenKeys = new Set();
+    // One entry per `atBatIndex:typeKey` — play-level entries replace
+    // event-level entries of the same type (they have the full description).
+    const entriesByKey = new Map();
+
+    function buildEntry({ id, about, result, matchup, revDetails, desc, outcome, typeMeta, challengeTeamId, isPitch, pitchVelo, timestamp }) {
+      const team = challengeTeamId ? teamNames[challengeTeamId] : null;
+      return {
+        id,
+        atBatIndex: about.atBatIndex != null ? about.atBatIndex : null,
+        inning: about.inning || 1,
+        halfInning: about.halfInning || 'top',
+        inningLabel: formatInning(about),
+        reviewType: typeMeta.label,
+        typeKey: typeMeta.key,
+        teamId: challengeTeamId,
+        teamName: team ? team.name : null,
+        teamAbbrev: team ? team.abbrev : null,
+        inProgress: outcome.key === 'in_progress',
+        isOverturned: outcome.isOverturned,
+        outcome: outcome.key,
+        outcomeLabel: outcome.label,
+        reason: extractReason(desc),
+        description: desc || 'Play reviewed.',
+        timestamp,
+        isPitch: !!isPitch,
+        pitchVelo,
+        batter: matchup.batter ? { id: matchup.batter.id, fullName: matchup.batter.fullName } : null,
+        pitcher: matchup.pitcher ? { id: matchup.pitcher.id, fullName: matchup.pitcher.fullName } : null,
+      };
+    }
 
     function processPlay(play, isLiveCurrent = false) {
       if (!play) return;
@@ -138,7 +213,7 @@ const MLBReviews = (() => {
       const playReviewDetails = play.reviewDetails || null;
       const hasPlayReview = about.hasReview === true || !!playReviewDetails;
 
-      // 1. Check playEvents for review events / ABS pitch challenges
+      // 1. Event-level candidates (ABS pitch challenges, older feed pattern).
       playEvents.forEach((event, evIdx) => {
         const details = event.details || {};
         const eventReviewDetails = event.reviewDetails || null;
@@ -146,82 +221,59 @@ const MLBReviews = (() => {
         const desc = details.description || details.event || '';
         const isReviewText = /challenge|review|overturned|call stands|call confirmed|abs\b/i.test(desc);
 
-        if (hasEventReview || (hasPlayReview && isReviewText) || (isReviewText && details.eventType === 'review')) {
-          const revDetails = eventReviewDetails || playReviewDetails || {};
-          const isCurrentActive = isLiveCurrent && (revDetails.inProgress || (!about.isComplete && isGameInReviewStatus));
-          const outcome = determineOutcome(revDetails, desc || result.description, isCurrentActive);
-          const typeMeta = normalizeType(revDetails.reviewType, desc || result.description);
-          const challengeTeamId = revDetails.challengeTeamId || null;
-          const team = challengeTeamId ? teamNames[challengeTeamId] : null;
+        if (!(hasEventReview || (hasPlayReview && isReviewText) || (isReviewText && details.eventType === 'review'))) return;
 
-          const key = `play-${about.atBatIndex || 0}-ev-${evIdx}-${typeMeta.key}`;
-          if (!seenKeys.has(key)) {
-            seenKeys.add(key);
-            reviews.push({
-              id: key,
-              atBatIndex: about.atBatIndex != null ? about.atBatIndex : null,
-              inning: about.inning || 1,
-              halfInning: about.halfInning || 'top',
-              inningLabel: formatInning(about),
-              reviewType: typeMeta.label,
-              typeKey: typeMeta.key,
-              teamId: challengeTeamId,
-              teamName: team ? team.name : null,
-              teamAbbrev: team ? team.abbrev : null,
-              inProgress: outcome.key === 'in_progress',
-              isOverturned: outcome.isOverturned,
-              outcome: outcome.key,
-              outcomeLabel: outcome.label,
-              reason: extractReason(desc || result.description),
-              description: desc || result.description || 'Play reviewed.',
-              timestamp: event.startTime || about.endTime || about.startTime || null,
-              isPitch: !!event.isPitch,
-              pitchVelo: event.pitchData && event.pitchData.startSpeed ? Math.round(event.pitchData.startSpeed) : null,
-              batter: matchup.batter ? { id: matchup.batter.id, fullName: matchup.batter.fullName } : null,
-              pitcher: matchup.pitcher ? { id: matchup.pitcher.id, fullName: matchup.pitcher.fullName } : null,
-            });
-          }
+        const revDetails = eventReviewDetails || playReviewDetails || {};
+        const isCurrentActive = isLiveCurrent && (revDetails.inProgress || (!about.isComplete && isGameInReviewStatus));
+        const outcome = determineOutcome(revDetails, desc || result.description, isCurrentActive);
+        const typeMeta = normalizeType(revDetails.reviewType, desc || result.description);
+        const mapKey = `${about.atBatIndex || 0}:${typeMeta.key}`;
+
+        if (!entriesByKey.has(mapKey)) {
+          entriesByKey.set(mapKey, buildEntry({
+            id: `play-${about.atBatIndex || 0}-ev-${evIdx}`,
+            about, result, matchup, revDetails,
+            desc: desc || result.description || 'Play reviewed.',
+            outcome, typeMeta,
+            challengeTeamId: revDetails.challengeTeamId || null,
+            isPitch: event.isPitch,
+            pitchVelo: event.pitchData && event.pitchData.startSpeed ? Math.round(event.pitchData.startSpeed) : null,
+            timestamp: event.startTime || about.endTime || about.startTime || null,
+          }));
         }
       });
 
-      // 2. If play has about.hasReview or reviewDetails or description mentions review but no event added yet
+      // 2. Play-level review (manager challenges "MA"/"MF" — newer pattern).
       const playDesc = result.description || '';
       const isPlayReviewText = /challenge|review|overturned|call stands|call confirmed/i.test(playDesc);
       if (hasPlayReview || isPlayReviewText) {
-        const key = `play-${about.atBatIndex || 0}-main`;
-        if (!seenKeys.has(key) && !reviews.some((r) => r.atBatIndex === about.atBatIndex)) {
-          seenKeys.add(key);
-          const revDetails = playReviewDetails || {};
-          const isCurrentActive = isLiveCurrent && (revDetails.inProgress || (!about.isComplete && isGameInReviewStatus));
-          const outcome = determineOutcome(revDetails, playDesc, isCurrentActive);
-          const typeMeta = normalizeType(revDetails.reviewType, playDesc);
-          const challengeTeamId = revDetails.challengeTeamId || null;
-          const team = challengeTeamId ? teamNames[challengeTeamId] : null;
+        const revDetails = playReviewDetails || {};
+        const isCurrentActive = isLiveCurrent && (revDetails.inProgress || (!about.isComplete && isGameInReviewStatus));
+        const outcome = determineOutcome(revDetails, playDesc, isCurrentActive);
+        const typeMeta = normalizeType(revDetails.reviewType, playDesc);
+        const mapKey = `${about.atBatIndex || 0}:${typeMeta.key}`;
 
-          reviews.push({
-            id: key,
-            atBatIndex: about.atBatIndex != null ? about.atBatIndex : null,
-            inning: about.inning || 1,
-            halfInning: about.halfInning || 'top',
-            inningLabel: formatInning(about),
-            reviewType: typeMeta.label,
-            typeKey: typeMeta.key,
-            teamId: challengeTeamId,
-            teamName: team ? team.name : null,
-            teamAbbrev: team ? team.abbrev : null,
-            inProgress: outcome.key === 'in_progress',
-            isOverturned: outcome.isOverturned,
-            outcome: outcome.key,
-            outcomeLabel: outcome.label,
-            reason: extractReason(playDesc),
-            description: playDesc || 'Play reviewed.',
-            timestamp: about.endTime || about.startTime || null,
-            isPitch: false,
-            pitchVelo: null,
-            batter: matchup.batter ? { id: matchup.batter.id, fullName: matchup.batter.fullName } : null,
-            pitcher: matchup.pitcher ? { id: matchup.pitcher.id, fullName: matchup.pitcher.fullName } : null,
-          });
+        // A bare play-flag (about.hasReview) with no play-level reviewDetails
+        // and no review text adds nothing beyond an event entry already
+        // captured for the same at-bat — don't mint a generic duplicate.
+        if (!playReviewDetails && !isPlayReviewText && typeMeta.key === 'review') {
+          const hasSameBatEntries = [...entriesByKey.keys()]
+            .some((k) => k.startsWith(`${about.atBatIndex || 0}:`));
+          if (hasSameBatEntries) return;
         }
+
+        // Play-level wins over a same-type event-level entry: it carries the
+        // complete "Team challenged (reason), call on the field was …" text.
+        entriesByKey.set(mapKey, buildEntry({
+          id: `play-${about.atBatIndex || 0}-main`,
+          about, result, matchup, revDetails,
+          desc: playDesc || 'Play reviewed.',
+          outcome, typeMeta,
+          challengeTeamId: revDetails.challengeTeamId || null,
+          isPitch: false,
+          pitchVelo: null,
+          timestamp: about.endTime || about.startTime || null,
+        }));
       }
     }
 
@@ -232,6 +284,8 @@ const MLBReviews = (() => {
     if (currentPlay) {
       processPlay(currentPlay, true);
     }
+
+    const reviews = [...entriesByKey.values()];
 
     // If game state explicitly says "Manager Challenge" or "Review" but no in-progress review recorded yet:
     if (isGameInReviewStatus && !reviews.some((r) => r.inProgress)) {

@@ -112,6 +112,23 @@ const MLB = (() => {
     }
   }
 
+  /**
+   * Play-by-play only for one game (allPlays + currentPlay + scoringPlays).
+   * Much leaner than feed/live (no boxscore/players), and carries the same
+   * review data: play-level reviewDetails, event-level details.hasReview and
+   * currentPlay. Used by the all-games Replay Feed to scan many games quickly.
+   * Falls back to feed/live if the split endpoint is unavailable.
+   */
+  async function getPlayByPlay(gamePk, options = {}) {
+    try {
+      return await getJSON(`${V1}/game/${gamePk}/playByPlay`, options);
+    } catch (err) {
+      if (!isLegacyFeedMiss(err)) throw err;
+      const feed = await getLiveFeed(gamePk, options);
+      return (feed.liveData && feed.liveData.plays) || {};
+    }
+  }
+
   /* -------------------------------------------------------------- CDN URLs */
 
   /** Team logo SVG (light-on-dark cap variant, then plain, then a colored circle fallback). */
@@ -207,7 +224,7 @@ const MLB = (() => {
   }
 
   return {
-    getSchedule, getLiveFeed,
+    getSchedule, getLiveFeed, getPlayByPlay,
     teamLogoUrl, teamLogoFallbackUrl, headshotUrl,
     ordinal, localTime, localDate, localDateTime,
     inningLabel, inningGlyph, sides, scoreOf,
