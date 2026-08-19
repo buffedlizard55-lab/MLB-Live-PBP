@@ -16,5 +16,8 @@ jobs:
       - name: Validate two-sided hit forecast model
         run: node tools/hit-model-test.mjs
 
+      - name: Validate challenges and replay reviews
+        run: node tools/review-test.mjs
+
       - name: Run smoke test against live MLB StatsAPI
         run: node tools/smoke-test.mjs

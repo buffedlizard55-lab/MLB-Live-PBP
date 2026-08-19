@@ -86,13 +86,21 @@
     const last = all[all.length - 1] || {};
     const event = current && current.playEvents && current.playEvents[current.playEvents.length - 1];
     const ls = data.liveData && data.liveData.linescore;
+    const status = data.gameData && data.gameData.status;
+    const reviewDetails = (current && current.reviewDetails) || (last && last.reviewDetails);
     return [
       all.length,
       last.about && last.about.atBatIndex,
       last.about && last.about.endTime,
+      last.about && last.about.hasReview,
       current && current.about && current.about.atBatIndex,
+      current && current.about && current.about.hasReview,
+      reviewDetails && reviewDetails.inProgress,
+      reviewDetails && reviewDetails.isOverturned,
+      status && status.detailedState,
       event && (event.playId || event.index),
       event && event.details && event.details.description,
+      event && event.details && event.details.hasReview,
       current && current.count && `${current.count.balls}-${current.count.strikes}-${current.count.outs}`,
       ls && ls.currentInning, ls && ls.inningState,
       ls && ls.teams && ls.teams.away && ls.teams.away.runs,
@@ -182,14 +190,36 @@
 
   function renderAll() {
     document.title = pageTitle();
+    const reviewData = window.MLBReviews ? window.MLBReviews.extractReviews(feed) : { reviews: [], activeReview: null, summary: {} };
+    renderLiveReviewAlert(reviewData.activeReview);
+    renderReviewTabBadge(reviewData.reviews.length);
     renderHeader();
-    renderLivePanel();
+    renderLivePanel(reviewData.activeReview);
     renderLinescore();
     // The box score is the heaviest view; render it only when it can be seen.
     if (activeTab === 'boxscore') renderBoxscore();
-    if (activeTab === 'plays') renderPlays();
+    if (activeTab === 'plays') renderPlays(reviewData);
     if (activeTab === 'props' && window.Props) window.Props.render($('#props-wrap'), feed);
+    if (activeTab === 'reviews' && window.MLBReviews) window.MLBReviews.renderReviewsTab($('#reviews-wrap'), reviewData);
     renderStatusLine();
+  }
+
+  function renderLiveReviewAlert(activeReview) {
+    const wrap = UI.clear($('#live-review-banner-wrap'));
+    if (!activeReview || !window.MLBReviews) return;
+    const banner = window.MLBReviews.renderLiveAlertBanner(activeReview);
+    if (banner) wrap.appendChild(banner);
+  }
+
+  function renderReviewTabBadge(count) {
+    const badge = $('#reviews-tab-count');
+    if (!badge) return;
+    if (count > 0) {
+      badge.textContent = String(count);
+      badge.style.display = 'inline-block';
+    } else {
+      badge.style.display = 'none';
+    }
   }
 
   function pageTitle() {
@@ -303,7 +333,7 @@
 
   /* ------------------------------------------------------- live "now" panel */
 
-  function renderLivePanel() {
+  function renderLivePanel(activeReview) {
     const panel = UI.clear($('#live-panel'));
     const status = gd().status;
     const abstract = status && status.abstractGameState;
@@ -315,6 +345,23 @@
     if (abstract === 'Final') {
       panel.appendChild(finalPanel());
       return;
+    }
+
+    // Prominent live review notification in the live module if active
+    if (activeReview) {
+      const revStrip = UI.el('div', 'live-active-review-card');
+      revStrip.appendChild(UI.el('div', 'live-review-pulse', '🚨'));
+      const textWrap = UI.el('div', 'live-review-body');
+      textWrap.appendChild(UI.el('div', 'live-review-head',
+        `PLAY UNDER REVIEW — ${activeReview.reviewType.toUpperCase()}${activeReview.teamAbbrev ? ` (${activeReview.teamAbbrev})` : ''}`));
+      textWrap.appendChild(UI.el('div', 'live-review-reason', activeReview.reason));
+      textWrap.appendChild(UI.el('div', 'live-review-desc', activeReview.description));
+      revStrip.appendChild(textWrap);
+      const ctaBtn = UI.el('button', 'btn btn-ghost btn-sm', 'View All Reviews', {
+        onclick: "document.querySelector(\"[data-tab='reviews']\").click()",
+      });
+      revStrip.appendChild(ctaBtn);
+      panel.appendChild(revStrip);
     }
 
     const plays = playsData();
@@ -940,6 +987,28 @@
 
     const chips = UI.el('div', 'play-chips');
 
+    /* replay review / challenge chip if applicable */
+    const playEvents = play.playEvents || [];
+    const revDetails = play.reviewDetails || (playEvents.find((e) => e.reviewDetails) && playEvents.find((e) => e.reviewDetails).reviewDetails) || null;
+    const hasReview = about.hasReview === true || !!revDetails ||
+      /challenge|review|overturned|call stands|call confirmed/i.test(result.description || '');
+
+    if (hasReview) {
+      row.classList.add('play-has-review');
+      const revType = (revDetails && revDetails.reviewType) ||
+        (/abs\b/i.test(result.description || '') ? 'ABS Challenge' :
+        /crew chief/i.test(result.description || '') ? 'Crew Chief' : 'Challenge');
+      const isOverturned = (revDetails && revDetails.isOverturned === true) ||
+        /overturned/i.test(result.description || '');
+      const isStands = (revDetails && revDetails.isOverturned === false) ||
+        /stands|confirmed/i.test(result.description || '');
+      const outcomeCls = isOverturned ? 'chip-rev-overturned' : isStands ? 'chip-rev-stands' : 'chip-rev-review';
+      const outcomeText = isOverturned ? 'Overturned' : isStands ? 'Stands' : 'Review';
+      const revChip = UI.el('span', `chip-play-review ${outcomeCls}`, `🔍 ${revType}: ${outcomeText}`);
+      revChip.title = `Replay Review: ${result.description}`;
+      chips.appendChild(revChip);
+    }
+
     /* score after play (only when it changed) */
     if (about.isScoringPlay || (result.rbi || 0) > 0) {
       const away = teamInfo('away');
@@ -1096,10 +1165,13 @@
     $('#panel-plays').style.display = tab === 'plays' ? '' : 'none';
     $('#panel-boxscore').style.display = tab === 'boxscore' ? '' : 'none';
     $('#panel-props').style.display = tab === 'props' ? '' : 'none';
+    $('#panel-reviews').style.display = tab === 'reviews' ? '' : 'none';
     // Lazy rendering keeps live updates fast on the default play-by-play view.
+    const reviewData = window.MLBReviews ? window.MLBReviews.extractReviews(feed) : { reviews: [], activeReview: null, summary: {} };
     if (feed && tab === 'boxscore') renderBoxscore();
-    if (feed && tab === 'plays') renderPlays();
+    if (feed && tab === 'plays') renderPlays(reviewData);
     if (feed && tab === 'props' && window.Props) window.Props.render($('#props-wrap'), feed);
+    if (feed && tab === 'reviews' && window.MLBReviews) window.MLBReviews.renderReviewsTab($('#reviews-wrap'), reviewData);
   }
 
   /* ------------------------------------------------------------ status line */

@@ -1038,3 +1038,373 @@ a:hover { text-decoration: underline; }
 }
 .adj-pos { color: #8ff0ac; background: rgba(46, 160, 67, 0.13); border-color: rgba(46, 160, 67, 0.35); }
 .adj-neg { color: #ffa8a8; background: rgba(224, 49, 49, 0.12); border-color: rgba(224, 49, 49, 0.3); }
+
+/* -------------------------------------------------- challenges & reviews */
+
+.tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--live);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  border-radius: 999px;
+  padding: 1px 6px;
+  min-width: 18px;
+  height: 18px;
+  margin-left: 6px;
+  line-height: 1;
+}
+
+/* Scoreboard Active Review Ticker */
+.scoreboard-review-ticker {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  background: linear-gradient(90deg, rgba(224, 49, 49, 0.22), rgba(210, 153, 34, 0.15));
+  border: 1px solid rgba(224, 49, 49, 0.5);
+  border-radius: var(--radius);
+  padding: 10px 16px;
+  margin-bottom: 14px;
+  box-shadow: 0 4px 14px rgba(224, 49, 49, 0.15);
+}
+.review-ticker-badge {
+  background: var(--live);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.8px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  animation: pulse-live 1.2s infinite;
+}
+@keyframes pulse-live {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.8; transform: scale(0.98); }
+}
+.review-ticker-items {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.review-ticker-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 10px;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  transition: all 0.15s;
+}
+.review-ticker-link:hover {
+  border-color: var(--accent);
+  background: #1b2d4b;
+  text-decoration: none;
+}
+.ticker-game { font-weight: 800; }
+.ticker-inn { color: var(--muted); }
+.ticker-type { color: #ffd43b; font-size: 11.5px; font-weight: 700; }
+.ticker-cta { color: var(--accent); font-weight: 800; font-size: 11.5px; }
+
+.card-review-active {
+  border-color: rgba(224, 49, 49, 0.7) !important;
+  box-shadow: 0 0 16px rgba(224, 49, 49, 0.25) !important;
+}
+.card-review-indicator {
+  color: #ff8787;
+  font-size: 12px;
+  font-weight: 700;
+  animation: pulse 1.2s infinite;
+}
+
+/* Game Page Live Review Banner */
+.live-review-banner-wrap {
+  margin-top: 14px;
+}
+.review-live-alert {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: linear-gradient(90deg, rgba(224, 49, 49, 0.24), rgba(210, 153, 34, 0.16));
+  border: 1px solid rgba(224, 49, 49, 0.6);
+  border-left: 5px solid var(--live);
+  border-radius: var(--radius);
+  padding: 12px 18px;
+  margin-bottom: 16px;
+  box-shadow: 0 6px 20px rgba(224, 49, 49, 0.2);
+  animation: fadein 0.3s ease;
+}
+.review-alert-badge {
+  background: var(--live);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 900;
+  letter-spacing: 0.8px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+  animation: pulse-live 1.2s infinite;
+}
+.review-alert-content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.review-alert-title {
+  color: #fff;
+  font-size: 14.5px;
+  font-weight: 800;
+}
+.review-alert-desc {
+  color: #f1f3f5;
+  font-size: 13px;
+}
+
+/* Live Panel Under Review Card */
+.live-active-review-card {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  background: linear-gradient(180deg, #24131a 0%, #171c2b 100%);
+  border: 1px solid rgba(224, 49, 49, 0.55);
+  border-left: 4px solid var(--live);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin-bottom: 12px;
+}
+.live-review-pulse { font-size: 24px; animation: pulse-live 1.2s infinite; }
+.live-review-body { flex: 1; min-width: 0; }
+.live-review-head {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  color: #ff8787;
+  text-transform: uppercase;
+}
+.live-review-reason { font-size: 14.5px; font-weight: 800; color: #fff; margin: 2px 0; }
+.live-review-desc { font-size: 12.5px; color: var(--muted); }
+
+/* Play Row Review Chip */
+.play-has-review {
+  background: rgba(210, 153, 34, 0.05);
+  border-left: 3px solid rgba(210, 153, 34, 0.6);
+}
+.chip-play-review {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 800;
+  border-radius: 6px;
+  padding: 2px 8px;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+.chip-rev-overturned {
+  background: rgba(46, 160, 67, 0.2);
+  color: #8ff0ac;
+  border: 1px solid rgba(46, 160, 67, 0.5);
+}
+.chip-rev-stands {
+  background: rgba(210, 153, 34, 0.18);
+  color: #ffd43b;
+  border: 1px solid rgba(210, 153, 34, 0.5);
+}
+.chip-rev-review {
+  background: rgba(224, 49, 49, 0.18);
+  color: #ffa8a8;
+  border: 1px solid rgba(224, 49, 49, 0.5);
+}
+
+/* Challenges & Reviews Tab */
+.reviews-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.reviews-summary-bar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  background: linear-gradient(180deg, var(--panel) 0%, #0f1a2c 100%);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 18px;
+  box-shadow: var(--shadow);
+}
+.review-stat-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 6px;
+}
+.review-stat-label {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 3px;
+}
+.review-stat-value {
+  font-size: 20px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.stat-overturned .review-stat-value { color: #7dd3a0; }
+.stat-stands .review-stat-value { color: #ffd43b; }
+.stat-active-pulse .review-stat-value {
+  color: #ff8787;
+  animation: pulse-live 1.2s infinite;
+}
+
+.reviews-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.review-card {
+  background: linear-gradient(180deg, var(--panel) 0%, #0f1a2c 100%);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  box-shadow: var(--shadow);
+  transition: transform 0.1s, border-color 0.1s;
+}
+.review-card-active {
+  border-color: rgba(224, 49, 49, 0.7);
+  border-left: 4px solid var(--live);
+  box-shadow: 0 4px 18px rgba(224, 49, 49, 0.2);
+}
+.review-card-overturned {
+  border-left: 4px solid var(--green);
+}
+.review-card-stands,
+.review-card-confirmed {
+  border-left: 4px solid var(--yellow);
+}
+
+.review-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.review-card-head-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.review-card-head-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.review-inn-badge {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 800;
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+
+.chip-review-type {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+.chip-manager { background: rgba(47, 129, 247, 0.2); color: #74c0fc; border: 1px solid rgba(47, 129, 247, 0.45); }
+.chip-crew_chief { background: rgba(167, 139, 250, 0.2); color: #c4b5fd; border: 1px solid rgba(167, 139, 250, 0.45); }
+.chip-abs { background: rgba(251, 146, 60, 0.2); color: #fdba74; border: 1px solid rgba(251, 146, 60, 0.45); }
+.chip-rules { background: rgba(139, 160, 186, 0.18); color: var(--muted); border: 1px solid var(--line); }
+.chip-review { background: rgba(224, 49, 49, 0.18); color: #ff8787; border: 1px solid rgba(224, 49, 49, 0.45); }
+
+.review-team-tag {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 800;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.review-outcome-pill {
+  font-size: 11.5px;
+  font-weight: 800;
+  padding: 3px 10px;
+  border-radius: 999px;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+.outcome-in-progress {
+  background: rgba(224, 49, 49, 0.2);
+  color: #ff8787;
+  border: 1px solid rgba(224, 49, 49, 0.6);
+  animation: pulse-live 1.2s infinite;
+}
+.outcome-overturned {
+  background: rgba(46, 160, 67, 0.2);
+  color: #8ff0ac;
+  border: 1px solid rgba(46, 160, 67, 0.5);
+}
+.outcome-stands {
+  background: rgba(210, 153, 34, 0.2);
+  color: #ffd43b;
+  border: 1px solid rgba(210, 153, 34, 0.5);
+}
+.outcome-confirmed {
+  background: rgba(47, 129, 247, 0.2);
+  color: #74c0fc;
+  border: 1px solid rgba(47, 129, 247, 0.45);
+}
+
+.review-reason-title {
+  margin: 0 0 6px;
+  font-size: 14.5px;
+  font-weight: 800;
+  color: var(--text);
+}
+.review-desc-text {
+  margin: 0;
+  font-size: 13.5px;
+  color: #c5d4e8;
+  line-height: 1.45;
+}
+.review-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(34, 51, 82, 0.5);
+  font-size: 12px;
+  color: var(--muted);
+  flex-wrap: wrap;
+}
+.review-player-tag {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  padding: 2px 8px;
+  border-radius: 4px;
+}

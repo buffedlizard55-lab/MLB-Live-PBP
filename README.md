@@ -16,6 +16,13 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
   who's pitching, the count, outs, runners on base**, on-deck / in-the-hole hitters,
   pitch counts, last play, inning-by-inning linescore, full box score, and the complete
   play-by-play timeline with pitch-by-pitch details.
+- **Instant Replay Reviews & Challenge Alerts** — real-time alerts and dedicated tracking
+  for **Manager Challenges**, **Crew Chief Reviews**, **Umpire Reviews**, and **ABS**
+  (Automated Ball-Strike system) pitch challenges across both the Scoreboard and Game views:
+  - **Scoreboard Live Ticker & Alert Badges** — surfaces any game currently in review or challenge.
+  - **Live Game Review Alert Banner** — eye-catching alert at the top of the game and live module when a call is under review.
+  - **Dedicated "Challenges & Reviews" Tab** — full breakdown of every review event with summary stats (overturn rate, breakdown by challenge type and team), call reasons, and outcomes (Overturned, Stands, Confirmed).
+  - **Play-by-Play Chips** — highlighted review outcome chips directly on affected plays.
 - **Two-sided hit forecast** — a transparent per-plate-appearance hit probability that
   compounds the batter's and pitcher's season rates (log5), real platoon splits,
   recent form, head-to-head history, same-game familiarity, and the live count into a
@@ -138,6 +145,7 @@ for archived games the request is scoped to the feed's game season.
 │   └── js/
 │       ├── api.js             # MLB StatsAPI client (fetch, retry, fallbacks, formatters)
 │       ├── ui.js              # Shared UI: team logos, colors, count dots, runners diamond
+│       ├── reviews.js         # Challenge & replay review parser (Manager, Crew Chief, ABS)
 │       ├── scoreboard.js      # Scoreboard page logic
 │       ├── props.js           # Two-sided hit model, stat cache, Props & Matchup tab
 │       └── game.js            # Game page logic (live "at bat" module, linescore, box, PBP)

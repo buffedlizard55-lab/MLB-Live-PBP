@@ -36,12 +36,15 @@
     <!-- linescore -->
     <section id="linescore-wrap" class="panel"></section>
 
-    <!-- tabs: play-by-play / box score -->
+    <!-- tabs: play-by-play / box score / props / challenges -->
     <nav class="tabs tabs-game" aria-label="Game views">
       <button class="tab-btn tab-on" data-tab="plays">Play-by-Play</button>
       <button class="tab-btn" data-tab="boxscore">Box Score</button>
       <button class="tab-btn" data-tab="props">Props & Matchup</button>
+      <button class="tab-btn" data-tab="reviews" id="tab-btn-reviews">Challenges & Reviews <span id="reviews-tab-count" class="tab-badge" style="display:none">0</span></button>
     </nav>
+
+    <div id="live-review-banner-wrap" class="live-review-banner-wrap"></div>
 
     <section id="panel-plays" class="panel">
       <div id="plays-wrap" class="plays-wrap"></div>
@@ -53,6 +56,10 @@
 
     <section id="panel-props" class="panel" style="display:none">
       <div id="props-wrap" class="props-wrap"></div>
+    </section>
+
+    <section id="panel-reviews" class="panel" style="display:none">
+      <div id="reviews-wrap" class="reviews-wrap"></div>
     </section>
 
     <div id="status-line" class="status-line"></div>
@@ -68,6 +75,7 @@
 
   <script src="assets/js/api.js"></script>
   <script src="assets/js/ui.js"></script>
+  <script src="assets/js/reviews.js"></script>
   <script src="assets/js/props.js"></script>
   <script src="assets/js/game.js"></script>
 </body>
