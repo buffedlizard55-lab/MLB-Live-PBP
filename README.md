@@ -184,9 +184,10 @@ Then open <http://localhost:8000>. You can also open `index.html` directly in a 
 To run the deterministic, network-free checks:
 
 ```bash
-node tools/hit-model-test.mjs      # two-sided hit forecast model
-node tools/review-test.mjs         # challenge / replay review parser (incl. real API shapes)
-node tools/reviews-feed-test.mjs   # all-games Replay Feed diff helpers
+node tools/hit-model-test.mjs             # two-sided hit forecast model
+node tools/review-test.mjs                # challenge / replay review parser (incl. real API shapes)
+node tools/reviews-feed-test.mjs          # all-games Replay Feed diff helpers
+node tools/replay-feed-render-test.mjs    # end-to-end Replay Feed render (captured live payloads)
 ```
 
 ## Deploy to GitHub Pages

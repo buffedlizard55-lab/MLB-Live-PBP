@@ -24,7 +24,7 @@ const context = {
 vm.createContext(context);
 vm.runInContext(source, context, { filename: 'assets/js/reviews-feed.js' });
 
-const { buildEventKey, mergeFeedEvents, sortFeedEntries } = context.module.exports;
+const { buildEventKey, mergeFeedEvents, sortFeedEntries, gameTeamsLabel } = context.module.exports;
 
 /* ------------------------------------------------------- 1. Stable keys */
 
@@ -99,5 +99,45 @@ const sorted = sortFeedEntries(entries);
 assert.equal(sorted[0].gamePk, 1, 'real timestamp wins');
 assert.equal(sorted[1].gamePk, 3, 'second by timestamp');
 assert.equal(sorted[2].gamePk, 2, 'no timestamp falls back to firstSeen');
+
+/* --------------------------- 8. Official team names, never "undefined" */
+
+// REAL schedule shape (verified live on statsapi.mlb.com, 2026-08-19):
+// teams.*.team carries ONLY { id, name, link } — there is no `abbreviation`.
+// The old renderer interpolated `${team.abbreviation}` here and printed
+// "undefined @ undefined" on every feed row and active-strip item.
+const schedGame = {
+  gamePk: 823342,
+  season: '2026',
+  teams: {
+    away: { team: { id: 116, name: 'Detroit Tigers', link: '/api/v1/teams/116' } },
+    home: { team: { id: 134, name: 'Pittsburgh Pirates', link: '/api/v1/teams/134' } },
+  },
+};
+// Official directory as returned by MLB.getTeams() (GET /api/v1/teams).
+const directory = {
+  116: { id: 116, name: 'Detroit Tigers', abbreviation: 'DET', teamName: 'Tigers' },
+  134: { id: 134, name: 'Pittsburgh Pirates', abbreviation: 'PIT', teamName: 'Pirates' },
+};
+
+const label = gameTeamsLabel(schedGame, directory);
+assert.equal(label, 'Detroit Tigers @ Pittsburgh Pirates');
+assert.ok(!label.includes('undefined'), 'row headline must never contain "undefined"');
+
+// Directory empty (its request failed): official full names still come from
+// the schedule itself — the label must be identical, not degraded.
+assert.equal(gameTeamsLabel(schedGame, {}), 'Detroit Tigers @ Pittsburgh Pirates');
+
+// Missing team objects entirely -> explicit placeholders, never "undefined".
+assert.equal(gameTeamsLabel({}, directory), 'AWY @ HOM');
+assert.equal(gameTeamsLabel({ teams: {} }, directory), 'AWY @ HOM');
+
+// Degenerate schedule entry with no name: fall back to the official
+// directory name, then its abbreviation, then the placeholder — in order.
+const noNames = { teams: { away: { team: { id: 116 } }, home: { team: { id: 134 } } } };
+assert.equal(gameTeamsLabel(noNames, directory), 'Detroit Tigers @ Pittsburgh Pirates');
+const abbrevOnly = { 116: { id: 116, name: null, abbreviation: 'DET' } };
+assert.equal(gameTeamsLabel(noNames, abbrevOnly), 'DET @ HOM');
+assert.equal(gameTeamsLabel(noNames, {}), 'AWY @ HOM');
 
 console.log('Replay feed tests passed successfully!');

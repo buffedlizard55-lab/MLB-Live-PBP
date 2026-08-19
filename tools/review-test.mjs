@@ -279,4 +279,55 @@ const schedGameNormal = {
 assert.equal(MLBReviews.inspectScheduleGame(schedGameReview).hasActiveReview, true);
 assert.equal(MLBReviews.inspectScheduleGame(schedGameNormal).hasActiveReview, false);
 
+/* ------------- 5. Schedule-shaped feeds: no fabricated team data ---------- */
+
+// The all-games Replay Feed calls extractReviews with a pseudo-feed built
+// from the SCHEDULE (verified live 2026-08-19: teams.*.team = { id, name,
+// link } only — no abbreviation). extractReviews must pass the official full
+// name through and leave the abbreviation null for the caller to resolve
+// from MLB.getTeams(); the old `name.slice(0, 3)` fallback invented wrong
+// codes ("SAN" for the Padres, "CHI" for both Chicago clubs, "LOS" for both
+// LA clubs).
+const scheduleShapedFeed = {
+  gameData: {
+    status: { detailedState: 'Final', abstractGameState: 'Final' },
+    teams: {
+      away: { id: 135, name: 'San Diego Padres' },   // real schedule shape
+      home: { id: 121, name: 'New York Mets' },
+    },
+  },
+  liveData: {
+    plays: {
+      allPlays: [{
+        about: { atBatIndex: 15, inning: 2, halfInning: 'bottom', hasReview: false },
+        result: { description: 'Jared Triolo grounds out, third baseman to first baseman.' },
+        matchup: { batter: { id: 668804, fullName: 'Bryan Reynolds' }, pitcher: { id: 695549, fullName: 'Jackson Jobe' } },
+        playEvents: [
+          { isPitch: true, details: { description: 'Ball', hasReview: true },
+            reviewDetails: { isOverturned: false, inProgress: false, reviewType: 'MJ', challengeTeamId: 135 } },
+        ],
+      }],
+      currentPlay: null,
+    },
+  },
+};
+const schedExtracted = MLBReviews.extractReviews(scheduleShapedFeed);
+assert.equal(schedExtracted.reviews.length, 1);
+assert.equal(schedExtracted.reviews[0].teamName, 'San Diego Padres', 'official full name passes through');
+assert.equal(schedExtracted.reviews[0].teamAbbrev, null, 'no fabricated abbreviation (old code produced "SAN")');
+
+// Every string the renderers put on screen must be official text — sweep all
+// extracted entries (synthetic §3 feed + real-shaped §3b feed) for the
+// literal string "undefined" leaking into any rendered field.
+const RENDERED_FIELDS = ['reviewType', 'reason', 'description', 'outcomeLabel', 'teamName', 'inningLabel'];
+const allReviews = [...extracted.reviews, ...realExtracted.reviews, ...schedExtracted.reviews];
+assert.ok(allReviews.length > 0, 'fixtures produced reviews to sweep');
+for (const r of allReviews) {
+  for (const field of RENDERED_FIELDS) {
+    const v = r[field];
+    assert.ok(v == null || !String(v).includes('undefined'),
+      `rendered field "${field}" leaked "undefined": ${JSON.stringify(v)}`);
+  }
+}
+
 console.log('MLBReviews tests passed successfully!');
