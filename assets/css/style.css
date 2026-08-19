@@ -1167,6 +1167,12 @@ a:hover { text-decoration: underline; }
   color: #f1f3f5;
   font-size: 13px;
 }
+.review-alert-abs {
+  color: #fdba74;
+  font-size: 12.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
 
 /* Live Panel Under Review Card */
 .live-active-review-card {
@@ -1192,6 +1198,13 @@ a:hover { text-decoration: underline; }
 }
 .live-review-reason { font-size: 14.5px; font-weight: 800; color: #fff; margin: 2px 0; }
 .live-review-desc { font-size: 12.5px; color: var(--muted); }
+.live-review-abs {
+  margin-top: 4px;
+  color: #fdba74;
+  font-size: 12.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
 
 /* Play Row Review Chip */
 .play-has-review {
@@ -1629,6 +1642,22 @@ a:hover { text-decoration: underline; }
   font-size: 13.5px;
   color: #c5d4e8;
   line-height: 1.45;
+}
+.feed-abs-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.feed-abs-line {
+  background: rgba(251, 146, 60, 0.12);
+  border: 1px solid rgba(251, 146, 60, 0.4);
+  color: #fdba74;
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 8px;
+  border-radius: 6px;
 }
 .feed-foot {
   display: flex;

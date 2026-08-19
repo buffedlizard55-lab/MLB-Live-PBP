@@ -23,7 +23,10 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
     review events from **every game on the schedule** (not just one game): new manager
     challenges, crew chief reviews, umpire reviews and ABS pitch challenges appear at the
     top of the feed as they happen, with game link, inning, challenging team, reason,
-    outcome, and batter/pitcher context. Includes an "Under Review" live strip, per-type
+    outcome, batter/pitcher context, and — for ABS — the pitch count before the
+    challenge, who challenged (batter / catcher / pitcher, from official play text
+    or the challenging team's batting/fielding side), and the count after the call
+    is overturned or stands. Includes an "Under Review" live strip, per-type
     filters, and summary stats for the whole day.
   - **Scoreboard Live Ticker & Alert Badges** — surfaces any game currently in review or challenge,
     with a link straight to the all-games Replay Feed.

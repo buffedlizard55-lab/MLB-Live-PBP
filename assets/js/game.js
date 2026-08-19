@@ -357,6 +357,10 @@
         `PLAY UNDER REVIEW — ${activeReview.reviewType.toUpperCase()}${activeReview.teamAbbrev ? ` (${activeReview.teamAbbrev})` : ''}`));
       textWrap.appendChild(UI.el('div', 'live-review-reason', activeReview.reason));
       textWrap.appendChild(UI.el('div', 'live-review-desc', activeReview.description));
+      const absLine = window.MLBReviews && window.MLBReviews.absContextSummary
+        ? window.MLBReviews.absContextSummary(activeReview)
+        : null;
+      if (absLine) textWrap.appendChild(UI.el('div', 'live-review-abs', absLine));
       revStrip.appendChild(textWrap);
       const ctaBtn = UI.el('button', 'btn btn-ghost btn-sm', 'View All Reviews', {
         onclick: "document.querySelector(\"[data-tab='reviews']\").click()",
@@ -826,7 +830,7 @@
 
   /* --------------------------------------------------------- play-by-play */
 
-  function renderPlays() {
+  function renderPlays(reviewData) {
     const wrap = UI.clear($('#plays-wrap'));
     const plays = playsData();
     if (!plays || !plays.allPlays || !plays.allPlays.length) {
@@ -836,6 +840,12 @@
 
     const atBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 80;
     const list = UI.el('div', 'plays-list');
+    const absByAtBat = new Map();
+    ((reviewData && reviewData.reviews) || []).forEach((r) => {
+      if (r && r.typeKey === 'abs' && r.atBatIndex != null && !absByAtBat.has(r.atBatIndex)) {
+        absByAtBat.set(r.atBatIndex, r);
+      }
+    });
 
     // Collect finished at-bats that need a pre-at-bat hit-probability chip.
     const probItems = [];
@@ -849,7 +859,7 @@
         curKey = key;
         list.appendChild(playSectionHeader(about));
       }
-      list.appendChild(playRow(play, probItems));
+      list.appendChild(playRow(play, probItems, absByAtBat.get(about.atBatIndex) || null));
     });
     wrap.appendChild(list);
     if (atBottom) wrap.scrollTop = wrap.scrollHeight;
@@ -976,7 +986,7 @@
     return head;
   }
 
-  function playRow(play, probItems) {
+  function playRow(play, probItems, absReview) {
     const result = play.result;
     const about = play.about || {};
     const count = play.count || {};
@@ -1174,6 +1184,29 @@
     $('#panel-reviews').style.display = tab === 'reviews' ? '' : 'none';
     // Lazy rendering keeps live updates fast on the default play-by-play view.
     const reviewData = window.MLBReviews ? window.MLBReviews.extractReviews(feed) : { reviews: [], activeReview: null, summary: {} };
+    if (feed && tab === 'boxscore') renderBoxscore();
+    if (feed && tab === 'plays') renderPlays(reviewData);
+    if (feed && tab === 'props' && window.Props) window.Props.render($('#props-wrap'), feed);
+    if (feed && tab === 'reviews' && window.MLBReviews) window.MLBReviews.renderReviewsTab($('#reviews-wrap'), reviewData);
+  }
+
+  /* ------------------------------------------------------------ status line */
+
+  function renderStatusLine() {
+    const line = $('#status-line');
+    const updated = new Date().toLocaleTimeString();
+    const ls = linescore();
+    const bits = [`Updated ${updated}`];
+    if (isLive()) {
+      const interval = LIVE_POLL_MS / 1000;
+      bits.push(`refreshing every ${interval}s`);
+    }
+    line.textContent = bits.join(' · ');
+  }
+
+  function $(sel) { return document.querySelector(sel); }
+})();
+ll, summary: {} };
     if (feed && tab === 'boxscore') renderBoxscore();
     if (feed && tab === 'plays') renderPlays(reviewData);
     if (feed && tab === 'props' && window.Props) window.Props.render($('#props-wrap'), feed);

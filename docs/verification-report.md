@@ -135,3 +135,13 @@ scan, and the exact people-stats URLs (regression guards for the two bugs above)
   live mid-review snapshot (transient); detection also covers the status string
   and `currentPlay` paths.
 - Unknown `reviewType` codes are labeled "Replay Review" until observed.
+
+## 8. ABS pitch-count + challenger (added 2026-08-19)
+
+| Claim | Verified? | Evidence |
+| --- | --- | --- |
+| `playEvents[i].count.balls/strikes` is the count **after** that pitch | ✅ | Official GUMBO feed spec: "`count.balls` — Balls after the pitch event." Same object is what `tools/smoke-test.mjs` already asserts on `play.count`. |
+| Count **before** the challenged pitch | ✅ | Previous pitch event's `count` (after the previous pitch = entering this one). First pitch of a PA is `0-0` by rule. If earlier pitches exist but carry no `count`, the UI shows nothing — it does not reconstruct. |
+| Count **after** overturn / stands | ✅ | The reviewed pitch event's own `count` (final official call). Omitted when that field is absent (the captured 823342 MJ event in `replay-feed-render-test.mjs` has no `count`, so no after-line is rendered). |
+| Who challenged an ABS pitch | ✅ | Official play text `"Michael Massey challenged (pitch result)…"` (game 824075) is matched to `matchup.batter` / `matchup.pitcher`. `reviewDetails` observed on 2026-08-19 is only `{isOverturned,inProgress,reviewType,challengeTeamId}` — **no** `challengePlayerId`. When only the team id is known, batting team → Batter, fielding team → **"Catcher or pitcher"** (ABS allows batter / catcher / pitcher; we do not invent which fielder). |
+| `play.count` is the at-bat's current/final count, not the challenge count | ✅ | A later groundout after a first-pitch ABS ball (823342 shape) leaves `play.count` at the PA's end; it is labeled "At-bat count" only when it differs from the reviewed pitch's after-count. |

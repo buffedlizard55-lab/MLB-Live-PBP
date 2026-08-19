@@ -182,9 +182,15 @@ const maPlay = {
 const absEventPlay = {
   about: { atBatIndex: 15, inning: 2, halfInning: 'bottom', hasReview: false },
   result: { description: 'Jared Triolo grounds out, third baseman Hao-Yu Lee to first baseman Spencer Torkelson.' },
+  count: { balls: 1, strikes: 2, outs: 1 },
   matchup: { batter: { id: 668804, fullName: 'Bryan Reynolds' }, pitcher: { id: 695549, fullName: 'Jackson Jobe' } },
   playEvents: [
-    { isPitch: true, details: { description: 'Ball', hasReview: true }, reviewDetails: { isOverturned: false, inProgress: false, reviewType: 'MJ', challengeTeamId: 116 } },
+    {
+      isPitch: true,
+      count: { balls: 1, strikes: 0 },
+      details: { description: 'Ball', hasReview: true },
+      reviewDetails: { isOverturned: false, inProgress: false, reviewType: 'MJ', challengeTeamId: 116 },
+    },
   ],
 };
 
@@ -195,10 +201,21 @@ const absPlayLevel = {
   result: {
     description: 'Michael Massey challenged (pitch result), call on the field was overturned: Michael Massey walks.',
   },
+  count: { balls: 4, strikes: 2, outs: 1 },
   reviewDetails: { isOverturned: true, inProgress: false, reviewType: 'MJ', challengeTeamId: 118 },
   matchup: { batter: { id: 621020, fullName: 'Michael Massey' }, pitcher: { id: 660787, fullName: 'Yerry De los Santos' } },
   playEvents: [
-    { isPitch: true, details: { description: 'Ball', hasReview: true }, reviewDetails: { isOverturned: true, inProgress: false, reviewType: 'MJ', challengeTeamId: 118 } },
+    { isPitch: true, count: { balls: 1, strikes: 0 } },
+    { isPitch: true, count: { balls: 2, strikes: 0 } },
+    { isPitch: true, count: { balls: 2, strikes: 1 } },
+    { isPitch: true, count: { balls: 3, strikes: 1 } },
+    { isPitch: true, count: { balls: 3, strikes: 2 } },
+    {
+      isPitch: true,
+      count: { balls: 4, strikes: 2 },
+      details: { description: 'Ball', hasReview: true },
+      reviewDetails: { isOverturned: true, inProgress: false, reviewType: 'MJ', challengeTeamId: 118 },
+    },
   ],
 };
 
@@ -248,12 +265,28 @@ assert.equal(evAbs.typeKey, 'abs');
 assert.equal(evAbs.teamAbbrev, 'DET');
 assert.equal(evAbs.outcome, 'stands'); // isOverturned:false
 assert.equal(evAbs.inProgress, false);
+// First pitch of the PA → 0-0 before; event.count is AFTER the pitch (GUMBO).
+assert.equal(evAbs.countBefore.balls, 0);
+assert.equal(evAbs.countBefore.strikes, 0);
+assert.equal(evAbs.countAfter.balls, 1);
+assert.equal(evAbs.countAfter.strikes, 0);
+// Bottom inning, DET (away) challenged → fielding side = catcher or pitcher.
+assert.equal(evAbs.challenger.role, 'defense');
+assert.equal(evAbs.challenger.label, 'Catcher or pitcher');
 
 // Play-level MJ with text → ABS Challenge, play-level entry wins (rich text).
 const plAbs = byAtBat(33);
 assert.equal(plAbs.length, 1, 'event + play-level MJ dedupe to one entry');
 assert.equal(plAbs[0].description, absPlayLevel.result.description);
 assert.equal(plAbs[0].reason, 'pitch result');
+assert.equal(plAbs[0].countBefore.balls, 3);
+assert.equal(plAbs[0].countBefore.strikes, 2);
+assert.equal(plAbs[0].countAfter.balls, 4);
+assert.equal(plAbs[0].countAfter.strikes, 2);
+assert.equal(plAbs[0].challenger.role, 'batter');
+assert.equal(plAbs[0].challenger.label, 'Batter Michael Massey');
+assert.equal(MLBReviews.absContextLines(plAbs[0]).join(' | '),
+  'Count before challenge: 3-2 | Batter Michael Massey challenged | After call overturned: 4-2');
 
 // Dual play → both ABS (MJ) and Manager (MF) entries survive.
 const dual = byAtBat(40);
@@ -328,6 +361,96 @@ for (const r of allReviews) {
     assert.ok(v == null || !String(v).includes('undefined'),
       `rendered field "${field}" leaked "undefined": ${JSON.stringify(v)}`);
   }
+  const absLines = MLBReviews.absContextLines(r);
+  absLines.forEach((line) => {
+    assert.ok(!String(line).includes('undefined') && !String(line).includes('null'),
+      `ABS context line leaked placeholder: ${line}`);
+  });
 }
+
+/* ----------------------------- 6. ABS count / challenger helpers --------- */
+
+assert.equal(MLBReviews.formatCount({ balls: 3, strikes: 2 }), '3-2');
+assert.equal(MLBReviews.formatCount(null), null);
+assert.equal(MLBReviews.formatCount({ balls: 1 }), null);
+assert.equal(MLBReviews.readPitchCount({ balls: 2, strikes: 1, outs: 0 }).strikes, 1);
+assert.equal(MLBReviews.readPitchCount({ balls: '2', strikes: 1 }), null, 'string counts are not numbers — reject');
+assert.equal(MLBReviews.readPitchCount({}), null);
+
+const firstPitch = { isPitch: true, count: { balls: 1, strikes: 0 } };
+const firstEnter = MLBReviews.countEnteringPitch([firstPitch], firstPitch);
+assert.equal(firstEnter.balls, 0);
+assert.equal(firstEnter.strikes, 0);
+
+const p1 = { isPitch: true, count: { balls: 0, strikes: 1 } };
+const p2 = { isPitch: true, count: { balls: 1, strikes: 1 } };
+const midEnter = MLBReviews.countEnteringPitch([p1, p2], p2);
+assert.equal(midEnter.balls, 0);
+assert.equal(midEnter.strikes, 1);
+
+const noCountPrev = { isPitch: true };
+const reviewedNoPrevCount = { isPitch: true, count: { balls: 2, strikes: 0 } };
+assert.equal(MLBReviews.countEnteringPitch([noCountPrev, reviewedNoPrevCount], reviewedNoPrevCount), null,
+  'do not invent a before-count when previous pitches have no count field');
+
+const batterChal = MLBReviews.resolveChallenger({
+  desc: 'Michael Massey challenged (pitch result), call on the field was overturned: Michael Massey walks.',
+  typeKey: 'abs',
+  challengeTeamId: 118,
+  about: { halfInning: 'bottom' },
+  matchup: { batter: { fullName: 'Michael Massey' }, pitcher: { fullName: 'Yerry De los Santos' } },
+  teamNames: { 118: { name: 'Kansas City Royals', abbrev: 'KC' } },
+  teamIdBySide: { away: 118, home: 136 },
+});
+assert.equal(batterChal.role, 'batter');
+assert.equal(batterChal.label, 'Batter Michael Massey');
+
+const catcherNamed = MLBReviews.resolveChallenger({
+  desc: 'Salvador Perez challenged (pitch result), call on the field was overturned.',
+  typeKey: 'abs',
+  challengeTeamId: 118,
+  about: { halfInning: 'top' },
+  matchup: { batter: { fullName: 'Aaron Judge' }, pitcher: { fullName: 'Cole Ragans' } },
+  teamNames: { 118: { name: 'Kansas City Royals', abbrev: 'KC' } },
+  teamIdBySide: { away: 147, home: 118 },
+});
+assert.equal(catcherNamed.role, 'catcher');
+assert.equal(catcherNamed.label, 'Catcher Salvador Perez');
+
+const defenseOnly = MLBReviews.resolveChallenger({
+  desc: 'Ball',
+  typeKey: 'abs',
+  challengeTeamId: 116,
+  about: { halfInning: 'bottom' },
+  matchup: { batter: { fullName: 'Bryan Reynolds' }, pitcher: { fullName: 'Jackson Jobe' } },
+  teamNames: { 116: { name: 'Detroit Tigers', abbrev: 'DET' }, 134: { name: 'Pittsburgh Pirates', abbrev: 'PIT' } },
+  teamIdBySide: { away: 116, home: 134 },
+});
+assert.equal(defenseOnly.role, 'defense');
+assert.equal(defenseOnly.label, 'Catcher or pitcher');
+assert.equal(defenseOnly.name, null, 'do not invent a catcher name');
+
+const teamChal = MLBReviews.resolveChallenger({
+  desc: 'Tigers challenged (tag play), call on the field was overturned.',
+  typeKey: 'manager',
+  challengeTeamId: 116,
+  about: { halfInning: 'bottom' },
+  matchup: { batter: { fullName: 'Jared Triolo' }, pitcher: { fullName: 'Tarik Skubal' } },
+  teamNames: { 116: { name: 'Detroit Tigers', abbrev: 'DET' } },
+  teamIdBySide: { away: 116, home: 134 },
+});
+assert.equal(teamChal.role, 'team');
+assert.equal(teamChal.label, 'Detroit Tigers');
+
+assert.equal(MLBReviews.absContextLines({ typeKey: 'manager' }).length, 0);
+assert.equal(MLBReviews.absContextLines({
+  typeKey: 'abs',
+  inProgress: false,
+  outcome: 'stands',
+  countBefore: null,
+  countAfter: null,
+  atBatCount: null,
+  challenger: { label: null },
+}).length, 0, 'no official fields → no ABS lines');
 
 console.log('MLBReviews tests passed successfully!');
