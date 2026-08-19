@@ -7,9 +7,11 @@
 'use strict';
 
 (() => {
-  // 3s is the useful floor for a single game: a pitch takes longer than that,
-  // and the StatsAPI itself does not update faster. Preview/final games back off.
-  const LIVE_POLL_MS = 3000;
+  // Cadence is the gap between poll STARTS (scan duration is subtracted).
+  // Live play-by-play: 2s. While a review is in flight: 1s so the outcome
+  // flip is not waiting on the ordinary live interval. Preview/final back off.
+  const LIVE_POLL_MS = 2000;
+  const REVIEW_POLL_MS = 1000;
   const PREVIEW_POLL_MS = 60000;
   const FINAL_POLL_MS = 180000;
 
@@ -18,7 +20,9 @@
   let pollTimer = null;
   let countdownTimer = null;
   let nextRefreshAt = 0;
+  let lastCycleStartedAt = 0;
   let lastToken = null;
+  let lastActiveReview = false;
   let activeTab = 'plays';
   let requestInFlight = false;
 
@@ -51,6 +55,7 @@
   async function load(showSpinner) {
     if (!gamePk || requestInFlight) return;
     requestInFlight = true;
+    lastCycleStartedAt = Date.now();
     if (showSpinner && !feed) $('#loading').classList.add('visible');
     try {
       const data = await MLB.getLiveFeed(gamePk);
@@ -89,6 +94,17 @@
     const ls = data.liveData && data.liveData.linescore;
     const status = data.gameData && data.gameData.status;
     const reviewDetails = (current && current.reviewDetails) || (last && last.reviewDetails);
+    const eventReview = event && event.reviewDetails;
+    // ABS challenges live on playEvents[].reviewDetails (code MJ). The last
+    // event's playId/description can stay put while inProgress/isOverturned
+    // flip — include those fields or the reviews tab would miss the outcome.
+    const currentReviewSig = ((current && current.playEvents) || []).map((e) => {
+      if (!e) return '';
+      const rd = e.reviewDetails;
+      if (!rd && !(e.details && e.details.hasReview)) return '';
+      return [rd && rd.inProgress, rd && rd.isOverturned, rd && rd.reviewType,
+        e.details && e.details.description].join(':');
+    }).filter(Boolean).join(',');
     return [
       all.length,
       last.about && last.about.atBatIndex,
@@ -98,6 +114,10 @@
       current && current.about && current.about.hasReview,
       reviewDetails && reviewDetails.inProgress,
       reviewDetails && reviewDetails.isOverturned,
+      eventReview && eventReview.inProgress,
+      eventReview && eventReview.isOverturned,
+      eventReview && eventReview.reviewType,
+      currentReviewSig,
       status && status.detailedState,
       event && (event.playId || event.index),
       event && event.details && event.details.description,
@@ -116,13 +136,22 @@
            feed.gameData.status.abstractGameState === 'Live';
   }
 
+  function currentInterval() {
+    if (!isLive()) {
+      return gd().status && gd().status.abstractGameState === 'Final'
+        ? FINAL_POLL_MS : PREVIEW_POLL_MS;
+    }
+    return lastActiveReview ? REVIEW_POLL_MS : LIVE_POLL_MS;
+  }
+
   function scheduleNext(overrideMs) {
-    const interval = overrideMs || (isLive() ? LIVE_POLL_MS :
-      (gd().status && gd().status.abstractGameState === 'Final' ? FINAL_POLL_MS : PREVIEW_POLL_MS));
-    nextRefreshAt = Date.now() + interval;
+    const interval = overrideMs != null ? overrideMs : currentInterval();
+    const elapsed = lastCycleStartedAt ? Date.now() - lastCycleStartedAt : 0;
+    const wait = overrideMs != null ? interval : Math.max(0, interval - elapsed);
+    nextRefreshAt = Date.now() + wait;
     clearTimeout(pollTimer);
-    pollTimer = setTimeout(() => { load(false); }, interval);
-    startCountdown(interval);
+    pollTimer = setTimeout(() => { load(false); }, wait);
+    startCountdown(wait);
   }
 
   function stopPolling() {
@@ -192,6 +221,7 @@
   function renderAll() {
     document.title = pageTitle();
     const reviewData = window.MLBReviews ? window.MLBReviews.extractReviews(feed) : { reviews: [], activeReview: null, summary: {} };
+    lastActiveReview = !!(reviewData && reviewData.activeReview);
     renderLiveReviewAlert(reviewData.activeReview);
     renderReviewTabBadge(reviewData.reviews.length);
     renderHeader();
@@ -1198,30 +1228,7 @@
     const ls = linescore();
     const bits = [`Updated ${updated}`];
     if (isLive()) {
-      const interval = LIVE_POLL_MS / 1000;
-      bits.push(`refreshing every ${interval}s`);
-    }
-    line.textContent = bits.join(' · ');
-  }
-
-  function $(sel) { return document.querySelector(sel); }
-})();
-ll, summary: {} };
-    if (feed && tab === 'boxscore') renderBoxscore();
-    if (feed && tab === 'plays') renderPlays(reviewData);
-    if (feed && tab === 'props' && window.Props) window.Props.render($('#props-wrap'), feed);
-    if (feed && tab === 'reviews' && window.MLBReviews) window.MLBReviews.renderReviewsTab($('#reviews-wrap'), reviewData);
-  }
-
-  /* ------------------------------------------------------------ status line */
-
-  function renderStatusLine() {
-    const line = $('#status-line');
-    const updated = new Date().toLocaleTimeString();
-    const ls = linescore();
-    const bits = [`Updated ${updated}`];
-    if (isLive()) {
-      const interval = LIVE_POLL_MS / 1000;
+      const interval = currentInterval() / 1000;
       bits.push(`refreshing every ${interval}s`);
     }
     line.textContent = bits.join(' · ');

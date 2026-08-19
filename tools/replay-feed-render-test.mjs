@@ -267,6 +267,6 @@ assert.equal(leaked.length, 0, `no rendered string may contain "undefined": ${JS
 
 // 6. Status line summarizes the poll.
 assert.match(registry['#status-line'].textContent, /1 game · 1 review event · updated /);
-assert.match(registry['#status-line'].textContent, /refreshing every 5s/);
+assert.match(registry['#status-line'].textContent, /refreshing every 2s/);
 
 console.log('Replay-feed render test passed successfully!');
