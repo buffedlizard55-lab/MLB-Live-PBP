@@ -40,7 +40,7 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
   single number with a matchup tier (Elite → Pitcher's edge) and per-driver point
   adjustments. It appears in the live at-bat card, the Props & Matchup tab, and
   completed PBP rows.
-- Auto-refreshes every **5 seconds** during live games; works on desktop and mobile.
+- Auto-refreshes every **3 seconds** on a live game page and every **5 seconds** on the all-games Replay Feed; works on desktop and mobile.
 - No build step, no frameworks, no API keys — it runs on **GitHub Pages** (or any static
   host, or even `file://`).
 
@@ -81,7 +81,7 @@ liveData.decisions             → winning/losing/saving pitcher
 gameData.players / teams       → names, positions, records, venue, weather, status
 ```
 
-The app polls `feed/live` every 5s while a game is in progress and only rebuilds the
+The app polls `feed/live` every 3s while a game is in progress and only rebuilds the
 DOM when the baseball state changes (count, pitch event, score, inning, or play). The
 heavy box-score table is lazy-rendered only when its tab is open. Preview and final
 games use slower cadences, and polling pauses automatically while the tab is hidden.
@@ -231,11 +231,12 @@ GitHub Actions**.
 - The MLB StatsAPI is **unofficial and may change without notice**. The client is
   written defensively (fallbacks for every endpoint and missing fields) and the app
   degrades gracefully if a field disappears.
-- Be a good citizen: polling every 10s for a handful of live games is well within
+- Be a good citizen: polling every 3–5s for a handful of live games is well within
   normal usage, but avoid hammering — the code pauses when the tab is hidden and
-  uses a quiet 30s cadence on the scoreboard. The Replay Feed scans live games'
-  playByPlay (the light endpoint, no boxscore/rosters) roughly every 20s and only
-  re-renders when a review event actually changes.
+  uses a quieter cadence on preview/final games. The Replay Feed scans live games'
+  playByPlay (the light endpoint, no boxscore/rosters) every 5s and only
+  re-renders when a review event actually changes. Going faster than 3s (one game)
+  or 5s (all-games scanner) just re-downloads the same pitch.
 - Review/challenge data shapes were verified against the live API on 2026-08-19
   (schedule `hydrate=review`, `reviewDetails` codes `MJ`/`MA`/`MF`, and
   `gameData.absChallenges`); see `docs/verification-report.md`.

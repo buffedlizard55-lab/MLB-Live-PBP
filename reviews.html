@@ -23,8 +23,12 @@
       <button class="btn" onclick="ReplayFeed.today()">Today</button>
     </div>
     <div id="date-label" class="date-label"></div>
-    <div class="live-pill" title="Polling the MLB StatsAPI">
-      <span id="live-dot" class="live-dot"></span><span>LIVE</span>
+    <div class="feed-controls">
+      <button id="refresh-btn" class="btn">Refresh</button>
+      <span class="countdown" id="countdown" title="Seconds until the next poll"></span>
+      <div class="live-pill" title="Polling the MLB StatsAPI">
+        <span id="live-dot" class="live-dot"></span><span>LIVE</span>
+      </div>
     </div>
   </header>
 
