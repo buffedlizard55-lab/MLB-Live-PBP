@@ -93,10 +93,19 @@
     UI.clear(listEl);
 
     const byState = { Preview: [], Live: [], Final: [], Other: [] };
+    const gamesWithReviews = [];
+
     games.forEach((g) => {
       const key = byState[g.status.abstractGameState] ? g.status.abstractGameState : 'Other';
       byState[key].push(g);
+      const inspection = window.MLBReviews ? window.MLBReviews.inspectScheduleGame(g) : { hasActiveReview: false };
+      if (inspection.hasActiveReview || /challenge|review/i.test((g.status && g.status.detailedState) || '')) {
+        gamesWithReviews.push(g);
+      }
     });
+
+    // Scoreboard Review Alert Banner if any games are currently under review/challenge
+    renderActiveReviewsBanner(gamesWithReviews);
 
     const ordered =
       [...byState.Live, ...byState.Preview, ...byState.Final, ...byState.Other];
@@ -105,6 +114,10 @@
       if (filter === 'live') return g.status.abstractGameState === 'Live';
       if (filter === 'scheduled') return g.status.abstractGameState === 'Preview';
       if (filter === 'final') return g.status.abstractGameState === 'Final';
+      if (filter === 'challenges') {
+        const inspection = window.MLBReviews ? window.MLBReviews.inspectScheduleGame(g) : { hasActiveReview: false };
+        return inspection.hasActiveReview || /challenge|review/i.test((g.status && g.status.detailedState) || '');
+      }
       return true;
     });
 
@@ -113,6 +126,7 @@
       live: byState.Live.length,
       scheduled: byState.Preview.length,
       final: byState.Final.length,
+      challenges: gamesWithReviews.length,
     };
     renderTabs(counts);
 
@@ -129,6 +143,35 @@
     wireScoreBumps();
   }
 
+  function renderActiveReviewsBanner(reviewGames) {
+    const banner = $('#banner');
+    if (banner.querySelector('.banner-error')) return;
+    UI.clear(banner);
+
+    if (!reviewGames || !reviewGames.length) return;
+
+    const bar = UI.el('div', 'scoreboard-review-ticker');
+    const badge = UI.el('span', 'review-ticker-badge', '🚨 ACTIVE REVIEWS');
+    bar.appendChild(badge);
+
+    const itemsWrap = UI.el('div', 'review-ticker-items');
+    reviewGames.forEach((g) => {
+      const away = g.teams && g.teams.away && g.teams.away.team;
+      const home = g.teams && g.teams.home && g.teams.home.team;
+      const ls = g.linescore;
+      const inn = ls ? MLB.inningLabel(ls, g.status) : '';
+      const detailed = (g.status && g.status.detailedState) || 'In Review';
+      const item = UI.el('a', 'review-ticker-link', '', { href: `game.html?gamePk=${g.gamePk}` });
+      item.appendChild(UI.el('span', 'ticker-game', `${away ? (away.abbreviation || away.name) : 'AWY'} vs ${home ? (home.abbreviation || home.name) : 'HOM'}`));
+      if (inn) item.appendChild(UI.el('span', 'ticker-inn', inn));
+      item.appendChild(UI.el('span', 'ticker-type', detailed));
+      item.appendChild(UI.el('span', 'ticker-cta', 'View →'));
+      itemsWrap.appendChild(item);
+    });
+    bar.appendChild(itemsWrap);
+    banner.appendChild(bar);
+  }
+
   function renderTabs(counts) {
     const tabs = [
       ['all', `All (${counts.all})`],
@@ -136,6 +179,9 @@
       ['scheduled', `Scheduled (${counts.scheduled})`],
       ['final', `Final (${counts.final})`],
     ];
+    if (counts.challenges > 0) {
+      tabs.push(['challenges', `🚨 Challenges (${counts.challenges})`]);
+    }
     const wrap = UI.clear($('#tabs'));
     tabs.forEach(([key, label]) => {
       wrap.appendChild(UI.el('button', `tab ${filter === key ? 'tab-on' : ''}`, label, {
@@ -154,8 +200,10 @@
     const away = game.teams.away;
     const home = game.teams.home;
     const ls = game.linescore || null;
+    const inspection = window.MLBReviews ? window.MLBReviews.inspectScheduleGame(game) : { hasActiveReview: false };
+    const hasReviewActive = inspection.hasActiveReview;
 
-    const card = UI.el('a', `card game-card ${isLive ? 'card-live' : ''}`);
+    const card = UI.el('a', `card game-card ${isLive ? 'card-live' : ''} ${hasReviewActive ? 'card-review-active' : ''}`);
     card.href = `game.html?gamePk=${game.gamePk}`;
 
     /* header: status chip + start time / venue */
@@ -193,6 +241,10 @@
 
     /* footer: probables / count / decisions */
     const foot = UI.el('div', 'card-foot');
+    if (hasReviewActive) {
+      foot.appendChild(UI.el('span', 'card-review-indicator',
+        `🚨 ${inspection.typeLabel || 'Review in Progress'}`));
+    }
     if (isLive && ls) {
       foot.appendChild(UI.countDots(ls.balls, ls.strikes, ls.outs, 'card-count'));
       const last = lastPlayText(game);

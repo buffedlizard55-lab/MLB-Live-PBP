@@ -94,7 +94,12 @@ const UI = (() => {
     Warmup:      { cls: 'chip-live',   label: 'Warmup' },
     'In Progress': { cls: 'chip-live', label: 'LIVE' },
     Delayed:     { cls: 'chip-warn',   label: 'Delayed' },
-    'Manager Challenge': { cls: 'chip-warn', label: 'Challenge' },
+    'Manager Challenge': { cls: 'chip-review', label: 'Challenge' },
+    Review:      { cls: 'chip-review', label: 'Review' },
+    'In Review': { cls: 'chip-review', label: 'In Review' },
+    'Crew Chief Review': { cls: 'chip-review', label: 'Crew Review' },
+    'ABS Challenge': { cls: 'chip-review', label: 'ABS Challenge' },
+    'Umpire Review': { cls: 'chip-review', label: 'Umpire Review' },
     Final:       { cls: 'chip-final',  label: 'Final' },
     'Game Over': { cls: 'chip-final',  label: 'Final' },
     Postponed:   { cls: 'chip-muted',  label: 'Postponed' },
@@ -103,11 +108,13 @@ const UI = (() => {
   };
 
   function statusChip(status, labelOverride) {
-    const meta = STATUS_META[status.detailedState] ||
-                 { cls: 'chip-muted', label: status.detailedState || status.abstractGameState };
+    const detailed = status && status.detailedState;
+    const isReview = /challenge|review/i.test(detailed || '');
+    const meta = STATUS_META[detailed] || (isReview ? { cls: 'chip-review', label: detailed } :
+                 { cls: 'chip-muted', label: detailed || (status && status.abstractGameState) });
     const label = labelOverride || meta.label;
     const chip = el('span', `chip ${meta.cls}`, label);
-    if (meta.cls === 'chip-live' || label === 'LIVE' || label === 'Warmup') {
+    if (meta.cls === 'chip-live' || meta.cls === 'chip-review' || label === 'LIVE' || label === 'Warmup' || isReview) {
       const dot = el('span', 'chip-dot');
       chip.prepend(dot);
     }

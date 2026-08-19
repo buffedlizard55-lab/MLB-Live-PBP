@@ -72,7 +72,7 @@ const MLB = (() => {
    */
   async function getSchedule(dateStr, options = {}) {
     const url = `${V1}/schedule?sportId=${SPORT_ID}&date=${dateStr}` +
-                '&hydrate=probablePitcher,linescore,decisions';
+                '&hydrate=probablePitcher,linescore,decisions,review';
     const data = await getJSON(url, options);
     const dates = (data && data.dates) || [];
     return dates.length ? dates[0].games || [] : [];
