@@ -502,6 +502,15 @@ function gameTeamsLabel(game, teamsById) {
     const desc = el('div', 'feed-desc', r.description);
     body.appendChild(desc);
 
+    if (window.MLBReviews && window.MLBReviews.absContextLines) {
+      const absLines = window.MLBReviews.absContextLines(r);
+      if (absLines.length) {
+        const abs = el('div', 'feed-abs-meta');
+        absLines.forEach((line) => abs.appendChild(el('span', 'feed-abs-line', line)));
+        body.appendChild(abs);
+      }
+    }
+
     if ((r.batter && r.batter.fullName) || (r.pitcher && r.pitcher.fullName)) {
       const foot = el('div', 'feed-foot');
       if (r.batter && r.batter.fullName) foot.appendChild(el('span', 'feed-player', `Batter: ${r.batter.fullName}`));

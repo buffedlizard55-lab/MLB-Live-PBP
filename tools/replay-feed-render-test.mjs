@@ -248,6 +248,12 @@ assert.ok(rowBlob.includes('ABS Challenge'), 'type chip');
 assert.ok(rowBlob.includes('Call Stands'), `outcome pill (isOverturned:false), got: ${rowBlob}`);
 assert.ok(rowBlob.includes('Batter: Bryan Reynolds'), 'batter footer');
 assert.ok(rowBlob.includes('Pitcher: Jackson Jobe'), 'pitcher footer');
+// First pitch of the PA, no event.count in the captured payload: show 0-0
+// before and the fielding-side role (DET challenged in the bottom). Do not
+// invent an after-count.
+assert.ok(rowBlob.includes('Count before challenge: 0-0'), `ABS before-count, got: ${rowBlob}`);
+assert.ok(rowBlob.includes('Catcher or pitcher challenged'), `ABS challenger role, got: ${rowBlob}`);
+assert.ok(!/After call/.test(rowBlob), `no invented after-count when event.count is missing: ${rowBlob}`);
 assert.ok(rowBlob.includes('▼ Bot 2nd'), `inning label from the play's about, got: ${rowBlob}`);
 const scoreChip = findIn(rows[0], '.feed-game-score');
 assert.ok(scoreChip && scoreChip.text === '3–1',

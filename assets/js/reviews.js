@@ -99,6 +99,189 @@ const MLBReviews = (() => {
   }
 
   /**
+   * Read a StatsAPI count object. GUMBO (the official feed spec) documents
+   * playEvents[].count as balls/strikes AFTER the pitch event. play.count is
+   * the at-bat's current/final count (verified by tools/smoke-test.mjs).
+   * Returns null unless both balls and strikes are real numbers — never guess.
+   */
+  function readPitchCount(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    const balls = obj.balls;
+    const strikes = obj.strikes;
+    if (typeof balls !== 'number' || typeof strikes !== 'number') return null;
+    if (!Number.isFinite(balls) || !Number.isFinite(strikes)) return null;
+    const out = { balls, strikes };
+    if (typeof obj.outs === 'number' && Number.isFinite(obj.outs)) out.outs = obj.outs;
+    return out;
+  }
+
+  /** Official baseball notation, e.g. "3-2". Null-safe. */
+  function formatCount(count) {
+    if (!count || typeof count.balls !== 'number' || typeof count.strikes !== 'number') return null;
+    return `${count.balls}-${count.strikes}`;
+  }
+
+  /**
+   * Count entering the reviewed pitch.
+   *   - first pitch of the PA → 0-0 (every at-bat starts there)
+   *   - otherwise the previous pitch event's count (GUMBO: that count is
+   *     AFTER the previous pitch, which is the count BEFORE this one)
+   * Missing previous-pitch counts stay null — we do not reconstruct them.
+   */
+  function countEnteringPitch(playEvents, reviewedEvent) {
+    if (!reviewedEvent) return null;
+    const pitches = (playEvents || []).filter((e) => e && e.isPitch);
+    const idx = pitches.indexOf(reviewedEvent);
+    if (idx < 0) return null;
+    if (idx === 0) return { balls: 0, strikes: 0 };
+    for (let i = idx - 1; i >= 0; i -= 1) {
+      const prev = readPitchCount(pitches[i].count);
+      if (prev) return { balls: prev.balls, strikes: prev.strikes };
+    }
+    return null;
+  }
+
+  function namesMatch(a, b) {
+    if (!a || !b) return false;
+    const norm = (s) => String(s).toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
+    const na = norm(a);
+    const nb = norm(b);
+    if (!na || !nb) return false;
+    if (na === nb) return true;
+    const pa = na.split(' ');
+    const pb = nb.split(' ');
+    if (pa.length >= 2 && pb.length >= 2 &&
+        pa[pa.length - 1] === pb[pb.length - 1] &&
+        pa[0].charAt(0) === pb[0].charAt(0)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Who initiated the challenge, from official feed text + IDs only.
+   *
+   * Observed play descriptions (2026-08-19):
+   *   "Michael Massey challenged (pitch result), call on the field was …"
+   *   "Tigers challenged (tag play), call on the field was …"
+   * reviewDetails.challengeTeamId is the challenging club (verified).
+   *
+   * ABS rules (MLB 2026): only the batter, catcher, or pitcher may
+   * challenge. We therefore:
+   *   - label Batter / Pitcher when the official "X challenged" name
+   *     matches matchup.batter / matchup.pitcher
+   *   - label Catcher when the official name is a person who is neither
+   *   - otherwise, if only challengeTeamId is known: batting team → Batter,
+   *     fielding team → "Catcher or pitcher" (we do not invent which)
+   * reviewDetails has no challengePlayerId in observed feeds.
+   */
+  function resolveChallenger({ desc, typeKey, challengeTeamId, about, matchup, teamNames, teamIdBySide }) {
+    const batter = matchup && matchup.batter;
+    const pitcher = matchup && matchup.pitcher;
+    const text = String(desc || '');
+    const challenged = text.match(/^(.{2,80}?)\s+challenged\b/i);
+    const parsed = challenged ? challenged[1].replace(/^the\s+/i, '').trim() : null;
+
+    if (parsed && batter && namesMatch(parsed, batter.fullName)) {
+      return { role: 'batter', name: batter.fullName, label: `Batter ${batter.fullName}` };
+    }
+    if (parsed && pitcher && namesMatch(parsed, pitcher.fullName)) {
+      return { role: 'pitcher', name: pitcher.fullName, label: `Pitcher ${pitcher.fullName}` };
+    }
+
+    if (parsed && challengeTeamId && teamNames && teamNames[challengeTeamId]) {
+      const t = teamNames[challengeTeamId];
+      const teamBits = [t.name, t.abbrev];
+      if (t.name && t.name.indexOf(' ') >= 0) teamBits.push(t.name.slice(t.name.lastIndexOf(' ') + 1));
+      if (teamBits.filter(Boolean).some((bit) => String(bit).toLowerCase() === parsed.toLowerCase())) {
+        return { role: 'team', name: t.name || parsed, label: t.name || parsed };
+      }
+    }
+
+    // Named person who is not the batter or pitcher. ABS: only B/P/C
+    // may challenge, so this is the catcher. Name comes from official text.
+    if (typeKey === 'abs' && parsed && /\s/.test(parsed) &&
+        !/^(call|review|manager|crew|umpire)\b/i.test(parsed)) {
+      return { role: 'catcher', name: parsed, label: `Catcher ${parsed}` };
+    }
+
+    if (typeKey === 'abs' && challengeTeamId != null && about && teamIdBySide) {
+      const half = String(about.halfInning || '').toLowerCase();
+      const battingSide = half === 'bottom' ? 'home' : half === 'top' ? 'away' : null;
+      if (battingSide && teamIdBySide[battingSide] != null) {
+        if (challengeTeamId === teamIdBySide[battingSide]) {
+          return {
+            role: 'batter',
+            name: (batter && batter.fullName) || null,
+            label: batter && batter.fullName ? `Batter ${batter.fullName}` : 'Batter',
+          };
+        }
+        const fieldingSide = battingSide === 'home' ? 'away' : 'home';
+        if (challengeTeamId === teamIdBySide[fieldingSide]) {
+          return { role: 'defense', name: null, label: 'Catcher or pitcher' };
+        }
+      }
+    }
+
+    if (parsed) return { role: null, name: parsed, label: parsed };
+    return { role: null, name: null, label: null };
+  }
+
+  function findReviewedPitch(playEvents, preferredEvent) {
+    if (preferredEvent && preferredEvent.isPitch) return preferredEvent;
+    return (playEvents || []).find((e) =>
+      e && e.isPitch && (e.reviewDetails || (e.details && e.details.hasReview === true))) || null;
+  }
+
+  function buildAbsContext({ play, event, typeKey, desc, challengeTeamId, teamNames, teamIdBySide }) {
+    const playEvents = (play && play.playEvents) || [];
+    const reviewed = findReviewedPitch(playEvents, event);
+    const countAfter = readPitchCount(reviewed && reviewed.count);
+    const countBefore = countEnteringPitch(playEvents, reviewed);
+    const atBatCount = readPitchCount(play && play.count);
+    const challenger = resolveChallenger({
+      desc,
+      typeKey,
+      challengeTeamId,
+      about: (play && play.about) || {},
+      matchup: (play && play.matchup) || {},
+      teamNames,
+      teamIdBySide,
+    });
+    return {
+      countBefore,
+      countAfter: countAfter ? { balls: countAfter.balls, strikes: countAfter.strikes } : null,
+      atBatCount,
+      challenger,
+    };
+  }
+
+  /**
+   * Plain-text lines for ABS count / challenger UI. Empty array when the
+   * feed did not supply the underlying fields — callers must not invent text.
+   */
+  function absContextLines(review) {
+    if (!review || review.typeKey !== 'abs') return [];
+    const lines = [];
+    const before = formatCount(review.countBefore);
+    if (before) lines.push(`Count before challenge: ${before}`);
+    const who = review.challenger && review.challenger.label;
+    if (who) lines.push(`${who} challenged`);
+    const after = formatCount(review.countAfter);
+    if (after && !review.inProgress) {
+      const word = review.outcome === 'overturned' ? 'overturned'
+        : review.outcome === 'stands' ? 'stands'
+        : review.outcome === 'confirmed' ? 'confirmed'
+        : 'resolved';
+      lines.push(`After call ${word}: ${after}`);
+    }
+    const atBat = formatCount(review.atBatCount);
+    const afterSame = after && atBat && after === atBat;
+    if (atBat && !afterSame) lines.push(`At-bat count: ${atBat}`);
+    return lines;
+  }
+
+  /**
    * Determine the outcome of a review.
    */
   function determineOutcome(reviewDetails, text, inProgressState) {
@@ -164,6 +347,7 @@ const MLBReviews = (() => {
     const isGameInReviewStatus = /challenge|review/i.test(status);
 
     const teamNames = {};
+    const teamIdBySide = { away: null, home: null };
     if (gameData.teams) {
       ['away', 'home'].forEach((side) => {
         const t = gameData.teams[side];
@@ -179,6 +363,7 @@ const MLBReviews = (() => {
             abbrev: t.abbreviation || null,
             side,
           };
+          teamIdBySide[side] = t.id;
         }
       });
     }
@@ -187,8 +372,17 @@ const MLBReviews = (() => {
     // event-level entries of the same type (they have the full description).
     const entriesByKey = new Map();
 
-    function buildEntry({ id, about, result, matchup, revDetails, desc, outcome, typeMeta, challengeTeamId, isPitch, pitchVelo, timestamp }) {
+    function buildEntry({ id, about, result, matchup, revDetails, desc, outcome, typeMeta, challengeTeamId, isPitch, pitchVelo, timestamp, play, event }) {
       const team = challengeTeamId ? teamNames[challengeTeamId] : null;
+      const abs = buildAbsContext({
+        play,
+        event,
+        typeKey: typeMeta.key,
+        desc,
+        challengeTeamId,
+        teamNames,
+        teamIdBySide,
+      });
       return {
         id,
         atBatIndex: about.atBatIndex != null ? about.atBatIndex : null,
@@ -211,6 +405,10 @@ const MLBReviews = (() => {
         pitchVelo,
         batter: matchup.batter ? { id: matchup.batter.id, fullName: matchup.batter.fullName } : null,
         pitcher: matchup.pitcher ? { id: matchup.pitcher.id, fullName: matchup.pitcher.fullName } : null,
+        countBefore: abs.countBefore,
+        countAfter: abs.countAfter,
+        atBatCount: abs.atBatCount,
+        challenger: abs.challenger,
       };
     }
 
@@ -249,6 +447,8 @@ const MLBReviews = (() => {
             isPitch: event.isPitch,
             pitchVelo: event.pitchData && event.pitchData.startSpeed ? Math.round(event.pitchData.startSpeed) : null,
             timestamp: event.startTime || about.endTime || about.startTime || null,
+            play,
+            event,
           }));
         }
       });
@@ -283,6 +483,8 @@ const MLBReviews = (() => {
           isPitch: false,
           pitchVelo: null,
           timestamp: about.endTime || about.startTime || null,
+          play,
+          event: null,
         }));
       }
     }
@@ -303,6 +505,16 @@ const MLBReviews = (() => {
       const cp = currentPlay || (allPlays.length ? allPlays[allPlays.length - 1] : null) || {};
       const about = cp.about || {};
       const matchup = cp.matchup || {};
+      const liveDesc = (cp.result && cp.result.description) || 'Play currently under review.';
+      const liveAbs = buildAbsContext({
+        play: cp,
+        event: null,
+        typeKey: activeTypeMeta.key,
+        desc: liveDesc,
+        challengeTeamId: (cp.reviewDetails && cp.reviewDetails.challengeTeamId) || null,
+        teamNames,
+        teamIdBySide,
+      });
       const activeEntry = {
         id: 'live-active-review',
         atBatIndex: about.atBatIndex != null ? about.atBatIndex : null,
@@ -319,12 +531,16 @@ const MLBReviews = (() => {
         outcome: 'in_progress',
         outcomeLabel: 'In Progress',
         reason: 'Call under replay review',
-        description: (cp.result && cp.result.description) || 'Play currently under review.',
+        description: liveDesc,
         timestamp: new Date().toISOString(),
         isPitch: false,
         pitchVelo: null,
         batter: matchup.batter ? { id: matchup.batter.id, fullName: matchup.batter.fullName } : null,
         pitcher: matchup.pitcher ? { id: matchup.pitcher.id, fullName: matchup.pitcher.fullName } : null,
+        countBefore: liveAbs.countBefore,
+        countAfter: liveAbs.countAfter,
+        atBatCount: liveAbs.atBatCount,
+        challenger: liveAbs.challenger,
       };
       reviews.unshift(activeEntry);
     }
@@ -425,6 +641,8 @@ const MLBReviews = (() => {
     const desc = UI.el('span', 'review-alert-desc', activeReview.description);
     content.appendChild(title);
     content.appendChild(desc);
+    const absLine = absContextSummary(activeReview);
+    if (absLine) content.appendChild(UI.el('span', 'review-alert-abs', absLine));
 
     banner.appendChild(badge);
     banner.appendChild(typeChip);
@@ -462,6 +680,8 @@ const MLBReviews = (() => {
     // Body: Reason headline + Play description
     const body = UI.el('div', 'review-card-body');
     body.appendChild(UI.el('h4', 'review-reason-title', review.reason));
+    const absMeta = renderAbsContext(review);
+    if (absMeta) body.appendChild(absMeta);
     body.appendChild(UI.el('p', 'review-desc-text', review.description));
     card.appendChild(body);
 
@@ -480,6 +700,20 @@ const MLBReviews = (() => {
     }
 
     return card;
+  }
+
+  /** Single compact sentence for banners / chips. Null if nothing official to show. */
+  function absContextSummary(review) {
+    const lines = absContextLines(review);
+    return lines.length ? lines.join(' · ') : null;
+  }
+
+  function renderAbsContext(review) {
+    const lines = absContextLines(review);
+    if (!lines.length) return null;
+    const wrap = UI.el('div', 'review-abs-meta');
+    lines.forEach((line) => wrap.appendChild(UI.el('span', 'review-abs-line', line)));
+    return wrap;
   }
 
   /**
@@ -535,6 +769,13 @@ const MLBReviews = (() => {
     renderLiveAlertBanner,
     renderReviewCard,
     renderReviewsTab,
+    readPitchCount,
+    formatCount,
+    countEnteringPitch,
+    resolveChallenger,
+    absContextLines,
+    absContextSummary,
+    renderAbsContext,
   };
 })();
 
