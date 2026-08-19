@@ -19,12 +19,19 @@ const context = {
   MLB: {},
   window: {},
   document: { addEventListener() {} },
+  setTimeout: () => 0,
+  clearTimeout: () => {},
+  setInterval: () => 0,
+  clearInterval: () => {},
   module: { exports: {} },
 };
 vm.createContext(context);
 vm.runInContext(source, context, { filename: 'assets/js/reviews-feed.js' });
 
-const { buildEventKey, mergeFeedEvents, sortFeedEntries, gameTeamsLabel } = context.module.exports;
+const {
+  buildEventKey, mergeFeedEvents, sortFeedEntries, gameTeamsLabel,
+  isUsableName, officialTeamName, gameSideTeam,
+} = context.module.exports;
 
 /* ------------------------------------------------------- 1. Stable keys */
 
@@ -139,5 +146,33 @@ assert.equal(gameTeamsLabel(noNames, directory), 'Detroit Tigers @ Pittsburgh Pi
 const abbrevOnly = { 116: { id: 116, name: null, abbreviation: 'DET' } };
 assert.equal(gameTeamsLabel(noNames, abbrevOnly), 'DET @ HOM');
 assert.equal(gameTeamsLabel(noNames, {}), 'AWY @ HOM');
+
+// Literal "undefined" / "null" strings must never print.
+assert.equal(isUsableName('undefined'), false);
+assert.equal(isUsableName('null'), false);
+assert.equal(isUsableName(''), false);
+assert.equal(isUsableName(undefined), false);
+assert.equal(isUsableName('Detroit Tigers'), true);
+const poisoned = {
+  teams: {
+    away: { team: { id: 116, name: 'undefined' } },
+    home: { team: { id: 134, name: 'null' } },
+  },
+};
+assert.equal(gameTeamsLabel(poisoned, directory), 'Detroit Tigers @ Pittsburgh Pirates');
+assert.ok(!gameTeamsLabel(poisoned, directory).includes('undefined'));
+assert.ok(!gameTeamsLabel(poisoned, {}).includes('undefined'));
+assert.equal(gameTeamsLabel(poisoned, {}), 'AWY @ HOM');
+
+// Flattened side object (no nested .team) still resolves a name.
+const flat = {
+  teams: {
+    away: { id: 116, name: 'Detroit Tigers' },
+    home: { id: 134, locationName: 'Pittsburgh', teamName: 'Pirates' },
+  },
+};
+assert.equal(gameSideTeam(flat, 'away').name, 'Detroit Tigers');
+assert.equal(gameTeamsLabel(flat, {}), 'Detroit Tigers @ Pittsburgh Pirates');
+assert.equal(officialTeamName({ id: 116 }, directory, 'AWY'), 'Detroit Tigers');
 
 console.log('Replay feed tests passed successfully!');

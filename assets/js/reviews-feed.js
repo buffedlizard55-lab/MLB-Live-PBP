@@ -110,37 +110,89 @@ function sortFeedEntries(entries) {
 }
 
 /**
+ * True only for a real, printable club name. Rejects null/empty and the
+ * literal strings "undefined" / "null" so a missing field can never leak
+ * into the matchup headline as "undefined @ undefined".
+ */
+function isUsableName(value) {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  const lower = trimmed.toLowerCase();
+  return lower !== 'undefined' && lower !== 'null';
+}
+
+/**
+ * Schedule side object → the nested team (or the side itself if a hydration
+ * flattened the fields). Handles both the verified live shape
+ * `{ team: { id, name, link } }` and richer `hydrate=team` objects.
+ */
+function gameSideTeam(game, which) {
+  const side = game && game.teams && game.teams[which];
+  if (!side) return null;
+  if (side.team && (side.team.id != null || side.team.name || side.team.abbreviation)) {
+    return side.team;
+  }
+  if (side.id != null || side.name || side.abbreviation) return side;
+  return null;
+}
+
+/**
+ * Official club name for one side. Order of preference (never guessed):
+ *   1. schedule `team.name` (verified live: "Detroit Tigers")
+ *   2. locationName + teamName ("Detroit" + "Tigers")
+ *   3. /teams directory name, then its official abbreviation
+ *   4. schedule abbreviation / shortName if a hydration supplied one
+ *   5. explicit AWY/HOM placeholder
+ */
+function officialTeamName(team, teamsById, fallback) {
+  const dir = teamsById && team && team.id != null ? teamsById[team.id] : null;
+  const locationTeam = team && isUsableName(team.locationName) && isUsableName(team.teamName)
+    ? `${team.locationName.trim()} ${team.teamName.trim()}`
+    : null;
+  const candidates = [
+    team && team.name,
+    locationTeam,
+    team && team.teamName,
+    dir && dir.name,
+    dir && dir.abbreviation,
+    team && team.abbreviation,
+    team && team.shortName,
+    team && team.clubName,
+  ];
+  for (let i = 0; i < candidates.length; i += 1) {
+    if (isUsableName(candidates[i])) return candidates[i].trim();
+  }
+  return fallback;
+}
+
+/**
  * Official matchup label for one schedule game, e.g.
  * "Detroit Tigers @ Pittsburgh Pirates".
  *
- * Verified live (2026-08-19): schedule `teams.*.team` = { id, name, link } —
- * `name` IS the official full club name, so it is used directly; there is no
- * `abbreviation` on schedule teams, and one is never fabricated. The
- * /teams directory (`MLB.getTeams()`) is only a fallback when a schedule
- * entry is missing its name. A wholly missing team degrades to an explicit
- * 'AWY'/'HOM' placeholder — the string "undefined" can never appear.
+ * The string "undefined" can never appear: every candidate is run through
+ * isUsableName(), and a wholly missing team degrades to AWY/HOM.
  */
 function gameTeamsLabel(game, teamsById) {
-  const side = (which, fallback) => {
-    const t = game && game.teams && game.teams[which] && game.teams[which].team;
-    if (!t) return fallback;
-    const dir = teamsById && t.id != null ? teamsById[t.id] : null;
-    return t.name || (dir && dir.name) || (dir && dir.abbreviation) || fallback;
-  };
-  return `${side('away', 'AWY')} @ ${side('home', 'HOM')}`;
+  return `${officialTeamName(gameSideTeam(game, 'away'), teamsById, 'AWY')} @ ${officialTeamName(gameSideTeam(game, 'home'), teamsById, 'HOM')}`;
 }
 
 /* ------------------------------------------------------------ page logic */
 
 (() => {
-  const LIVE_POLL_MS = 20000;
-  const IDLE_POLL_MS = 60000;
+  // 5s is the practical floor for an all-games scanner: each cycle hits
+  // playByPlay once per live game. Faster than that just re-downloads the
+  // same pitch. Idle (no live games) backs off to 20s.
+  const LIVE_POLL_MS = 5000;
+  const IDLE_POLL_MS = 20000;
 
   let dateStr = todayStr();
   let games = [];
   let teamsById = {};              // teamId -> official {name, abbreviation, ...}
   let filter = 'all';
   let pollTimer = null;
+  let countdownTimer = null;
+  let nextRefreshAt = 0;
   let requestInFlight = false;
   let settledGames = new Set();     // Final games: fetched once, immutable
   const feedState = { seen: new Map(), order: [] };
@@ -211,10 +263,7 @@ function gameTeamsLabel(game, teamsById) {
       }
 
       render();
-      statusLine.textContent =
-        `${games.length} game${games.length === 1 ? '' : 's'} · ` +
-        `${feedState.order.length} review event${feedState.order.length === 1 ? '' : 's'} · ` +
-        `updated ${new Date().toLocaleTimeString()}`;
+      renderStatusLine();
       scheduleNext();
     } catch (err) {
       console.error(err);
@@ -247,13 +296,14 @@ function gameTeamsLabel(game, teamsById) {
     // when it is unavailable it stays null and the chip is hidden — never a
     // fabricated abbreviation.
     const pseudoTeam = (side) => {
-      const t = game.teams && game.teams[side] && game.teams[side].team;
+      const t = gameSideTeam(game, side);
       if (!t || t.id == null) return null;
       const dir = teamsById[t.id];
+      const name = officialTeamName(t, teamsById, null);
       return {
         id: t.id,
-        name: t.name || (dir && dir.name) || null,
-        abbreviation: (dir && dir.abbreviation) || null,
+        name,
+        abbreviation: (dir && dir.abbreviation) || (isUsableName(t.abbreviation) ? t.abbreviation : null),
       };
     };
 
@@ -269,6 +319,12 @@ function gameTeamsLabel(game, teamsById) {
       ? window.MLBReviews.extractReviews(pseudoFeed)
       : { reviews: [], activeReview: null };
     const result = mergeFeedEvents(feedState, gamePk, reviewData.reviews);
+    // Stamp the official matchup on every entry for this game so a later
+    // render does not depend on re-finding the schedule object.
+    const matchupLabel = gameTeamsLabel(game, teamsById);
+    feedState.seen.forEach((entry) => {
+      if (entry.gamePk === gamePk) entry.matchupLabel = matchupLabel;
+    });
     if (result.added.length || result.updated.length || result.ended.length) {
       renderFeedUpdates(result);
     }
@@ -334,7 +390,7 @@ function gameTeamsLabel(game, teamsById) {
       const item = el('a', 'feed-active-link', '',
         { href: `game.html?gamePk=${gamePk}` });
       item.appendChild(el('span', 'feed-active-game',
-        gameTeamsLabel(g, teamsById)));
+        matchupFor(null, g)));
       item.appendChild(el('span', 'feed-active-type', label));
       if (entries.length && entries[0].review.reason) {
         item.appendChild(el('span', 'feed-active-reason', entries[0].review.reason));
@@ -388,6 +444,14 @@ function gameTeamsLabel(game, teamsById) {
     return entry.review.typeKey === filter;
   }
 
+  /** Official matchup for a row/strip item. Prefers the stamped label. */
+  function matchupFor(entry, game) {
+    const stamped = entry && entry.matchupLabel;
+    if (isUsableName(stamped) && !/undefined/i.test(stamped)) return stamped;
+    if (game) return gameTeamsLabel(game, teamsById);
+    return entry && entry.gamePk ? `Game ${entry.gamePk}` : 'AWY @ HOM';
+  }
+
   /** One chatroom message for one review event. */
   function feedRow(entry) {
     const r = entry.review;
@@ -406,18 +470,16 @@ function gameTeamsLabel(game, teamsById) {
     const body = el('div', 'feed-body');
 
     const head = el('div', 'feed-head');
-    if (game) {
-      const matchup = gameTeamsLabel(game, teamsById); // official full names
-      const link = el('a', 'feed-game', '',
-        { href: `game.html?gamePk=${entry.gamePk}`, title: `Open game — ${matchup}` });
-      link.appendChild(el('span', 'feed-game-txt', matchup));
-      if (game.linescore && game.linescore.teams) {
-        const ls = game.linescore;
-        link.appendChild(el('span', 'feed-game-score',
-          `${ls.teams.away && ls.teams.away.runs != null ? ls.teams.away.runs : '–'}–${ls.teams.home && ls.teams.home.runs != null ? ls.teams.home.runs : '–'}`));
-      }
-      head.appendChild(link);
+    const matchup = matchupFor(entry, game);
+    const link = el('a', 'feed-game', '',
+      { href: `game.html?gamePk=${entry.gamePk}`, title: `Open game — ${matchup}` });
+    link.appendChild(el('span', 'feed-game-txt', matchup));
+    if (game && game.linescore && game.linescore.teams) {
+      const ls = game.linescore;
+      link.appendChild(el('span', 'feed-game-score',
+        `${ls.teams.away && ls.teams.away.runs != null ? ls.teams.away.runs : '–'}–${ls.teams.home && ls.teams.home.runs != null ? ls.teams.home.runs : '–'}`));
     }
+    head.appendChild(link);
     head.appendChild(el('span', `chip-review-type chip-${r.typeKey}`, r.reviewType));
     // Challenging team: official abbreviation (from the /teams directory —
     // schedule objects have none), official full name on hover. Hidden rather
@@ -506,13 +568,49 @@ function gameTeamsLabel(game, teamsById) {
     if (dot) dot.classList.toggle('on', on);
   }
 
+  function currentInterval() {
+    const hasLive = games.some((g) => g.status && g.status.abstractGameState === 'Live');
+    return hasLive ? LIVE_POLL_MS : IDLE_POLL_MS;
+  }
+
+  function renderStatusLine() {
+    const line = $('#status-line');
+    if (!line) return;
+    const interval = currentInterval() / 1000;
+    line.textContent =
+      `${games.length} game${games.length === 1 ? '' : 's'} · ` +
+      `${feedState.order.length} review event${feedState.order.length === 1 ? '' : 's'} · ` +
+      `updated ${new Date().toLocaleTimeString()} · refreshing every ${interval}s`;
+  }
+
+  function startCountdown(interval) {
+    const node = $('#countdown');
+    if (!node) return;
+    clearInterval(countdownTimer);
+    const tick = () => {
+      const left = Math.max(0, Math.round((nextRefreshAt - Date.now()) / 1000));
+      node.textContent = UI.fmtCountdown ? UI.fmtCountdown(left) : `${left}s`;
+    };
+    tick();
+    countdownTimer = setInterval(tick, 250);
+  }
+
+  function stopPolling() {
+    clearTimeout(pollTimer);
+    clearInterval(countdownTimer);
+    const node = $('#countdown');
+    if (node) node.textContent = '';
+  }
+
   function scheduleNext(overrideMs) {
     clearTimeout(pollTimer);
-    const hasLive = games.some((g) => g.status && g.status.abstractGameState === 'Live');
+    const interval = overrideMs || currentInterval();
+    nextRefreshAt = Date.now() + interval;
     pollTimer = setTimeout(() => {
       if (!document.hidden) load();
       else scheduleNext();
-    }, overrideMs || (hasLive ? LIVE_POLL_MS : IDLE_POLL_MS));
+    }, interval);
+    startCountdown(interval);
   }
 
   function syncUrl() {
@@ -525,6 +623,7 @@ function gameTeamsLabel(game, teamsById) {
 
   window.ReplayFeed = {
     setFilter(f) { filter = f; renderFeed(); },
+    refresh() { load(); },
     prevDay() { shiftDate(-1); syncUrl(); updateDateLabel(); load(); },
     nextDay() { shiftDate(1); syncUrl(); updateDateLabel(); load(); },
     today() { dateStr = todayStr(); syncUrl(); updateDateLabel(); resetFeed(); load(); },
@@ -539,14 +638,20 @@ function gameTeamsLabel(game, teamsById) {
     const d = params.get('date');
     if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) dateStr = d;
     updateDateLabel();
+    const refreshBtn = $('#refresh-btn');
+    if (refreshBtn) refreshBtn.addEventListener('click', () => load());
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) load();
+      else stopPolling();
     });
     load();
   });
 
   /* Node test export (pure helpers only). */
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { buildEventKey, mergeFeedEvents, sortFeedEntries, gameTeamsLabel };
+    module.exports = {
+      buildEventKey, mergeFeedEvents, sortFeedEntries, gameTeamsLabel,
+      isUsableName, officialTeamName, gameSideTeam,
+    };
   }
 })();

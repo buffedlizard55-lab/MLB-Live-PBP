@@ -4,8 +4,8 @@
 'use strict';
 
 (() => {
-  const LIVE_POLL_MS = 10000;
-  const IDLE_POLL_MS = 60000;
+  const LIVE_POLL_MS = 5000;
+  const IDLE_POLL_MS = 30000;
 
   let dateStr = todayStr();
   let games = [];
@@ -162,7 +162,15 @@
       const inn = ls ? MLB.inningLabel(ls, g.status) : '';
       const detailed = (g.status && g.status.detailedState) || 'In Review';
       const item = UI.el('a', 'review-ticker-link', '', { href: `game.html?gamePk=${g.gamePk}` });
-      item.appendChild(UI.el('span', 'ticker-game', `${away ? (away.abbreviation || away.name) : 'AWY'} vs ${home ? (home.abbreviation || home.name) : 'HOM'}`));
+      const sideName = (t, fallback) => {
+        if (!t) return fallback;
+        const name = t.name || t.teamName;
+        const abbr = t.abbreviation;
+        if (typeof name === 'string' && name && name !== 'undefined') return name;
+        if (typeof abbr === 'string' && abbr && abbr !== 'undefined') return abbr;
+        return fallback;
+      };
+      item.appendChild(UI.el('span', 'ticker-game', `${sideName(away, 'AWY')} vs ${sideName(home, 'HOM')}`));
       if (inn) item.appendChild(UI.el('span', 'ticker-inn', inn));
       item.appendChild(UI.el('span', 'ticker-type', detailed));
       item.appendChild(UI.el('span', 'ticker-cta', 'View →'));

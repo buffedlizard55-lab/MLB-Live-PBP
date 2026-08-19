@@ -7,10 +7,11 @@
 'use strict';
 
 (() => {
-  // Five seconds keeps the count and pitch events responsive without hammering the feed.
-  const LIVE_POLL_MS = 5000;
-  const PREVIEW_POLL_MS = 120000;
-  const FINAL_POLL_MS = 300000;
+  // 3s is the useful floor for a single game: a pitch takes longer than that,
+  // and the StatsAPI itself does not update faster. Preview/final games back off.
+  const LIVE_POLL_MS = 3000;
+  const PREVIEW_POLL_MS = 60000;
+  const FINAL_POLL_MS = 180000;
 
   let gamePk = null;
   let feed = null;

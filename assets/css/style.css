@@ -1413,12 +1413,17 @@ a:hover { text-decoration: underline; }
  * All-Games Replay Feed (reviews.html)
  * ==========================================================================*/
 
-/* Header live pill */
+/* Header live pill + refresh */
+.feed-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
 .live-pill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  margin-left: auto;
   font-size: 11px;
   font-weight: 800;
   letter-spacing: 1px;
@@ -1650,4 +1655,5 @@ a:hover { text-decoration: underline; }
 @media (max-width: 560px) {
   .feed-row { flex-direction: column; gap: 6px; }
   .feed-time { flex-direction: row; align-items: center; gap: 8px; min-width: 0; }
+  .feed-controls { margin-left: 0; width: 100%; }
 }

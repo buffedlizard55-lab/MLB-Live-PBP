@@ -53,6 +53,7 @@ function makeNode(tag) {
       return child;
     },
     remove() {},
+    addEventListener() {},
     get firstChild() { return this.children[0] || null; },
     querySelector(sel) { return findIn(node, sel); },
   };
@@ -86,7 +87,8 @@ function findIn(root, sel) {
 
 const registry = {};
 const ids = ['#status-line', '#feed-stats', '#active-strip', '#feed-tabs',
-  '#feed-list', '#date-picker', '#date-label', '#live-dot', '#banner', '#date-nav'];
+  '#feed-list', '#date-picker', '#date-label', '#live-dot', '#banner', '#date-nav',
+  '#countdown', '#refresh-btn'];
 ids.forEach((id) => { registry[id] = makeNode('div'); });
 
 let domReadyCb = null;
@@ -195,6 +197,8 @@ const context = {
   document: documentStub,
   setTimeout: () => 0,
   clearTimeout: () => {},
+  setInterval: () => 0,
+  clearInterval: () => {},
   module: { exports: {} },
 };
 vm.createContext(context);
@@ -257,5 +261,6 @@ assert.equal(leaked.length, 0, `no rendered string may contain "undefined": ${JS
 
 // 6. Status line summarizes the poll.
 assert.match(registry['#status-line'].textContent, /1 game · 1 review event · updated /);
+assert.match(registry['#status-line'].textContent, /refreshing every 5s/);
 
 console.log('Replay-feed render test passed successfully!');
