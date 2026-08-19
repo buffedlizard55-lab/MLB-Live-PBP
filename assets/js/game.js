@@ -41,8 +41,9 @@
     $('#refresh-btn').addEventListener('click', () => load(true));
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
+        // load() already calls scheduleNext() on success/failure.
+        // There is no startPolling() in this file (verified).
         load(true);
-        startPolling();
       } else {
         stopPolling();
       }
