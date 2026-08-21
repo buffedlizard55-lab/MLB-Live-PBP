@@ -1174,8 +1174,8 @@ a:hover { text-decoration: underline; }
   font-variant-numeric: tabular-nums;
 }
 
-/* Verified replay score-impact callout. Numeric arrows are shown only when
-   the official current-play payload supplies complete scores + credited runs. */
+/* Verified replay score tracker. Numeric alternate scenarios appear only when
+   official current-play data supplies a complete score and tied scoring runs. */
 .score-impact {
   display: flex;
   flex-direction: column;
@@ -1200,6 +1200,36 @@ a:hover { text-decoration: underline; }
   font-weight: 750;
   line-height: 1.35;
 }
+.score-impact-rows {
+  display: grid;
+  gap: 5px;
+  margin-top: 3px;
+}
+.score-impact-row {
+  display: grid;
+  grid-template-columns: minmax(92px, 0.34fr) minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding-top: 5px;
+  border-top: 1px solid rgba(255, 255, 255, 0.09);
+}
+.score-impact-row:first-child { border-top: 0; padding-top: 0; }
+.score-impact-row-label {
+  color: #b9c7da;
+  font-size: 10.5px;
+  font-weight: 900;
+  letter-spacing: 0.45px;
+  text-transform: uppercase;
+}
+.score-impact-row-value {
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 750;
+  line-height: 1.35;
+}
+.score-impact-row-scenario .score-impact-row-value { color: #ffd8a8; }
+.score-impact-row-pending .score-impact-row-value { color: #ffd43b; }
+.score-impact-row-unavailable .score-impact-row-value { color: var(--muted); font-weight: 600; }
 .score-impact-note {
   color: #b9c7da;
   font-size: 11.5px;

@@ -165,6 +165,12 @@ assert.ok(extracted.activeReview, 'should identify the in-progress review on cur
 assert.equal(extracted.activeReview.reviewType, 'Manager Challenge');
 assert.equal(extracted.activeReview.inProgress, true);
 assert.equal(extracted.activeReview.teamAbbrev, 'BOS');
+assert.equal(extracted.activeReview.scoreImpact.activeReviewObserved, true);
+assert.equal(extracted.activeReview.scoreImpact.scoreAtReviewStart, null);
+const missingActiveScoreDisplay = MLBReviews.scoreImpactPresentation(extracted.activeReview);
+assert.equal(missingActiveScoreDisplay.rows[0].value, 'Unavailable in the observed active payload');
+assert.match(missingActiveScoreDisplay.rows[1].value, /no complete score was available/);
+assert.equal(missingActiveScoreDisplay.rows[2].value, 'Pending — review in progress');
 
 assert.equal(extracted.summary.total, 4);
 assert.equal(extracted.summary.overturned, 2); // Judge tag overturned, ABS pitch overturned
@@ -422,13 +428,20 @@ assert.equal(activeHome.scoreImpact.context, 'home_plate');
 assert.equal(activeHome.scoreImpact.scoringSide, 'away');
 assert.equal(activeHome.scoreImpact.runsAtRisk, 1);
 assert.equal(activeHome.scoreImpact.currentScore.away, 6);
+assert.equal(activeHome.scoreImpact.scoreAtReviewStart.away, 6);
 assert.equal(activeHome.scoreImpact.possibleScoreIfRemoved.away, 5);
-assert.equal(activeHome.scoreImpact.possibleScoreIfRemoved.home, 5);
+assert.equal(activeHome.scoreImpact.possibleScoreAfterReview.away, 5);
+assert.equal(activeHome.scoreImpact.possibleScoreAfterReview.home, 5);
+assert.equal(activeHome.scoreImpact.officialScoreAfterReview, null,
+  'actual score remains pending while review is active');
 assert.deepEqual(Array.from(activeHome.scoreImpact.creditedRunnerNames), ['Anthony Volpe']);
 const activeHomeDisplay = MLBReviews.scoreImpactPresentation(activeHome);
 assert.equal(activeHomeDisplay.title, '1 RUN AT RISK');
-assert.match(activeHomeDisplay.detail, /Call-on-field score: NYY 6 – BOS 5/);
-assert.match(activeHomeDisplay.detail, /credited run is removed: NYY 5 – BOS 5/);
+assert.equal(activeHomeDisplay.rows[0].label, 'Before review');
+assert.equal(activeHomeDisplay.rows[0].value, 'NYY 6 – BOS 5');
+assert.match(activeHomeDisplay.rows[1].value, /Call stands: NYY 6 – BOS 5/);
+assert.match(activeHomeDisplay.rows[1].value, /safe-at-home call becomes an out: NYY 5 – BOS 5/);
+assert.equal(activeHomeDisplay.rows[2].value, 'Pending — review in progress');
 assert.match(activeHomeDisplay.note, /not a prediction/);
 assert.doesNotMatch(activeHomeDisplay.detail + activeHomeDisplay.note, /will be overturned/i);
 const renderedHomeImpact = MLBReviews.renderScoreImpact(activeHome, 'feed');
@@ -439,6 +452,9 @@ const renderedImpactText = (node) => [
 assert.match(renderedHomeImpact.cls, /score-impact-at-risk/);
 assert.match(renderedHomeImpact.cls, /feed-score-impact/);
 assert.match(renderedImpactText(renderedHomeImpact), /1 RUN AT RISK/);
+assert.match(renderedImpactText(renderedHomeImpact), /Before review/);
+assert.match(renderedImpactText(renderedHomeImpact), /Possible after/);
+assert.match(renderedImpactText(renderedHomeImpact), /Actual after/);
 assert.match(renderedImpactText(renderedHomeImpact), /NYY 6 – BOS 5/);
 
 // Active three-run home-run boundary review. Every numeric field is supplied
@@ -481,10 +497,12 @@ assert.equal(activeBoundary.scoreImpact.runsAtRisk, 3);
 assert.equal(activeBoundary.scoreImpact.possibleScoreIfRemoved.away, 0);
 const boundaryDisplay = MLBReviews.scoreImpactPresentation(activeBoundary);
 assert.equal(boundaryDisplay.title, '3 RUNS AT RISK');
-assert.match(boundaryDisplay.detail, /NYY 3 – BOS 0/);
-assert.match(boundaryDisplay.detail, /NYY 0 – BOS 0/);
-assert.match(boundaryDisplay.note, /may also place runners/,
-  'HR-to-double runner placement is not predicted');
+assert.equal(boundaryDisplay.rows[0].value, 'NYY 3 – BOS 0');
+assert.match(boundaryDisplay.rows[1].value, /Call stands: NYY 3 – BOS 0/);
+assert.match(boundaryDisplay.rows[1].value, /NYY 0 – BOS 0/);
+assert.match(boundaryDisplay.note, /not a prediction/);
+assert.match(boundaryDisplay.note, /may place runners/,
+  'HR-to-double runner placement is explicitly left undetermined');
 
 // Observed NH foul shape: no scoring event means no invented run total. The
 // UI reports that score impact is pending instead of claiming a run removal.
@@ -501,7 +519,80 @@ const activeFoul = MLBReviews.extractReviews(activeFoulFeed).activeReview;
 assert.equal(activeFoul.scoreImpact.runsAtRisk, 0);
 const foulDisplay = MLBReviews.scoreImpactPresentation(activeFoul);
 assert.equal(foulDisplay.title, 'BOUNDARY CALL — SCORE IMPACT PENDING');
-assert.match(foulDisplay.note, /no run-removal total is shown/i);
+assert.equal(foulDisplay.rows[0].value, 'NYY 3 – BAL 3');
+assert.match(foulDisplay.rows[1].value, /Alternate score undetermined/);
+assert.equal(foulDisplay.rows[2].value, 'Pending — review in progress');
+assert.match(foulDisplay.note, /no alternate score is invented/i);
+
+// A completed plate appearance's result score may be later than an event-level
+// pitch review. Do not label that end-of-PA score as Actual after the review.
+const nonterminalPitchFeed = {
+  gameData: {
+    status: { detailedState: 'Final', abstractGameState: 'Final' },
+    teams: activeHomeFeed.gameData.teams,
+  },
+  liveData: {
+    plays: {
+      currentPlay: null,
+      allPlays: [{
+        about: { atBatIndex: 60, inning: 8, halfInning: 'bottom', isComplete: true },
+        result: {
+          description: 'Batter homers later in the plate appearance.',
+          event: 'Home Run', eventType: 'home_run', awayScore: 0, homeScore: 1,
+        },
+        matchup: {},
+        runners: [],
+        playEvents: [
+          {
+            index: 1, isPitch: true, details: { description: 'Ball', hasReview: true },
+            reviewDetails: { isOverturned: false, inProgress: false, reviewType: 'MJ' },
+          },
+          { index: 2, isPitch: true, details: { description: 'In play, run(s)' } },
+        ],
+      }],
+    },
+  },
+};
+const nonterminalPitchReview = MLBReviews.extractReviews(nonterminalPitchFeed).reviews[0];
+assert.equal(nonterminalPitchReview.scoreImpact.officialScoreAfterReview, null,
+  'end-of-PA score is not assigned to a preceding pitch review');
+const nonterminalPitchDisplay = MLBReviews.scoreImpactPresentation(nonterminalPitchReview);
+assert.equal(nonterminalPitchDisplay.rows[2].value, 'Unavailable in official play data');
+assert.match(nonterminalPitchDisplay.note, /no snapshots are reconstructed/);
+
+// A page opened after resolution knows the official final play score, but it
+// must not reverse-engineer the temporary score shown while review was active.
+const finalOnlyDisplay = MLBReviews.scoreImpactPresentation({
+  inProgress: false,
+  scoreImpact: {
+    context: 'boundary', runsCredited: 0, runsAtRisk: 0,
+    scoreAtReviewStart: null,
+    possibleScoreAfterReview: null,
+    officialScoreAfterReview: { away: 3, home: 3 },
+    currentScore: { away: 3, home: 3 },
+    teamLabels: { away: 'NYY', home: 'BAL' },
+  },
+});
+assert.equal(finalOnlyDisplay.rows[0].value, 'Not observed — final payload only');
+assert.match(finalOnlyDisplay.rows[1].value, /active review was not observed/);
+assert.equal(finalOnlyDisplay.rows[2].value, 'NYY 3 – BAL 3');
+assert.match(finalOnlyDisplay.note, /no temporary before\/possible score is inferred/);
+
+const resolvedTrackedDisplay = MLBReviews.scoreImpactPresentation({
+  inProgress: false,
+  scoreImpact: {
+    context: 'home_plate', runsCredited: 0, runsAtRisk: 0, runsAtRiskAtStart: 1,
+    scoreAtReviewStart: { away: 6, home: 5 },
+    possibleScoreAfterReview: { away: 5, home: 5 },
+    officialScoreAfterReview: { away: 5, home: 5 },
+    actualRunsRemoved: 1,
+    teamLabels: { away: 'NYY', home: 'BOS' },
+  },
+});
+assert.equal(resolvedTrackedDisplay.title, '1 RUN REMOVED BY REVIEW');
+assert.equal(resolvedTrackedDisplay.rows[0].value, 'NYY 6 – BOS 5');
+assert.match(resolvedTrackedDisplay.rows[1].value, /NYY 5 – BOS 5/);
+assert.equal(resolvedTrackedDisplay.rows[2].value, 'NYY 5 – BOS 5');
 
 // A run on an earlier action in the same PA is not attached to a later
 // event-level review: details.playIndex must match event.index.

@@ -44,6 +44,14 @@ function validScorePair(score) {
     typeof score.home === 'number' && Number.isFinite(score.home);
 }
 
+function trackedRunsAtRisk(impact) {
+  if (!impact) return 0;
+  const value = Number.isFinite(impact.runsAtRiskAtStart)
+    ? impact.runsAtRiskAtStart
+    : Number(impact.runsAtRisk);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
 /**
  * Compare the score shown while a review was active with the official score
  * attached to the same play after resolution. This is the only place we call a
@@ -53,65 +61,124 @@ function validScorePair(score) {
  */
 function reconcileScoreImpact(previousReview, nextReview) {
   if (!previousReview || !nextReview) return nextReview;
+  const previousImpact = previousReview.scoreImpact;
+  const freshImpact = nextReview.scoreImpact;
+  if (!previousImpact || !freshImpact) return nextReview;
 
-  // Once an observed active→resolved score transition is recorded, retain it
-  // on later polls of the same immutable resolved play. The parser cannot
-  // recreate the temporary score from a final payload alone.
-  if (!previousReview.inProgress && !nextReview.inProgress) {
-    const observed = previousReview.scoreImpact;
-    const fresh = nextReview.scoreImpact;
-    const observedResult = observed && observed.scoreAfterReview;
-    const freshResult = fresh && fresh.currentScore;
-    const hasObservation = observed && (
-      observed.actualRunsRemoved > 0 || observed.actualRunsAdded > 0 || observed.runsRetained > 0);
-    if (hasObservation && validScorePair(observedResult) && validScorePair(freshResult) &&
-        observedResult.away === freshResult.away && observedResult.home === freshResult.home) {
-      return {
-        ...nextReview,
-        scoreImpact: {
-          ...fresh,
-          scoreBeforeReview: observed.scoreBeforeReview,
-          scoreAfterReview: observed.scoreAfterReview,
-          actualRunsRemoved: observed.actualRunsRemoved,
-          actualRunsAdded: observed.actualRunsAdded,
-          runsRetained: observed.runsRetained,
-        },
-      };
+  const previousStart = previousImpact.scoreAtReviewStart ||
+    previousImpact.scoreBeforeReview ||
+    (previousReview.inProgress ? previousImpact.currentScore : null);
+  const previousPossible = previousImpact.possibleScoreAfterReview ||
+    previousImpact.possibleScoreIfRemoved;
+
+  // While a review remains active, preserve the first official score observed.
+  // A later poll may add runner details; it may not rewrite "Before review".
+  if (previousReview.inProgress && nextReview.inProgress) {
+    const start = validScorePair(previousStart)
+      ? previousStart
+      : (freshImpact.scoreAtReviewStart || freshImpact.currentScore);
+    let possible = validScorePair(previousPossible) ? previousPossible : null;
+    let atRiskAtStart = trackedRunsAtRisk(previousImpact);
+
+    // Newly populated runner details may add a scenario, but only while the
+    // score it was computed from still matches the preserved first snapshot.
+    const freshStart = freshImpact.scoreAtReviewStart || freshImpact.currentScore;
+    const freshPossible = freshImpact.possibleScoreAfterReview ||
+      freshImpact.possibleScoreIfRemoved;
+    if (!possible && validScorePair(start) && validScorePair(freshStart) &&
+        start.away === freshStart.away && start.home === freshStart.home &&
+        validScorePair(freshPossible)) {
+      possible = freshPossible;
+      atRiskAtStart = trackedRunsAtRisk(freshImpact);
     }
-    return nextReview;
+
+    return {
+      ...nextReview,
+      scoreImpact: {
+        ...freshImpact,
+        scoreAtReviewStart: validScorePair(start) ? start : null,
+        possibleScoreAfterReview: possible,
+        possibleScoreIfRemoved: possible,
+        runsAtRiskAtStart: atRiskAtStart,
+      },
+    };
+  }
+
+  // Once resolved tracker data exists, retain it on later polls of the same
+  // immutable play. A final payload alone cannot recreate the active score.
+  if (!previousReview.inProgress && !nextReview.inProgress) {
+    const wasObservedActive = previousImpact.activeReviewObserved === true ||
+      validScorePair(previousStart);
+    if (!wasObservedActive) return nextReview;
+
+    const previousActual = previousImpact.officialScoreAfterReview ||
+      previousImpact.scoreAfterReview;
+    const freshActual = freshImpact.officialScoreAfterReview || freshImpact.currentScore;
+    const actual = validScorePair(freshActual)
+      ? freshActual
+      : (validScorePair(previousActual) ? previousActual : null);
+    const before = validScorePair(previousStart) ? previousStart : null;
+    const side = previousImpact.scoringSide || freshImpact.scoringSide;
+    const atRisk = trackedRunsAtRisk(previousImpact);
+    const reconciled = {
+      ...freshImpact,
+      context: freshImpact.context || previousImpact.context || null,
+      scoringSide: side || null,
+      teamLabels: freshImpact.teamLabels || previousImpact.teamLabels,
+      activeReviewObserved: true,
+      scoreAtReviewStart: before,
+      possibleScoreAfterReview: before && validScorePair(previousPossible) ? previousPossible : null,
+      possibleScoreIfRemoved: before && validScorePair(previousPossible) ? previousPossible : null,
+      runsAtRiskAtStart: atRisk,
+      officialScoreAfterReview: actual,
+      scoreBeforeReview: before,
+      scoreAfterReview: actual,
+    };
+    if (before && actual && ['away', 'home'].includes(side)) {
+      const other = side === 'away' ? 'home' : 'away';
+      if (before[other] === actual[other]) {
+        const delta = actual[side] - before[side];
+        if (delta < 0 && -delta <= atRisk) reconciled.actualRunsRemoved = -delta;
+        else if (delta > 0) reconciled.actualRunsAdded = delta;
+        else if (delta === 0 && atRisk > 0) reconciled.runsRetained = atRisk;
+      }
+    }
+    return { ...nextReview, scoreImpact: reconciled };
   }
 
   if (!previousReview.inProgress || nextReview.inProgress) return nextReview;
-  const beforeImpact = previousReview.scoreImpact;
-  const afterImpact = nextReview.scoreImpact;
-  const before = beforeImpact && beforeImpact.currentScore;
-  const after = afterImpact && afterImpact.currentScore;
-  const side = beforeImpact && beforeImpact.scoringSide;
-  if (!validScorePair(before) || !validScorePair(after) || !['away', 'home'].includes(side)) {
-    return nextReview;
-  }
 
-  const other = side === 'away' ? 'home' : 'away';
-  // If the opponent's score also moved, these two snapshots are not safe to
-  // attribute solely to this reviewed play.
-  if (before[other] !== after[other]) return nextReview;
-
-  const delta = after[side] - before[side];
-  const atRisk = Number(beforeImpact.runsAtRisk) || 0;
+  // Active → resolved: preserve all three snapshots even when a score change
+  // cannot safely be attributed to this review.
+  const before = validScorePair(previousStart) ? previousStart : null;
+  const after = freshImpact.officialScoreAfterReview || freshImpact.currentScore;
+  const side = previousImpact.scoringSide;
   const reconciled = {
-    ...(afterImpact || {}),
-    context: (afterImpact && afterImpact.context) || beforeImpact.context || null,
-    scoringSide: side,
-    teamLabels: (afterImpact && afterImpact.teamLabels) || beforeImpact.teamLabels,
-    currentScore: after,
+    ...freshImpact,
+    context: freshImpact.context || previousImpact.context || null,
+    scoringSide: side || freshImpact.scoringSide || null,
+    teamLabels: freshImpact.teamLabels || previousImpact.teamLabels,
+    activeReviewObserved: true,
+    scoreAtReviewStart: before,
+    possibleScoreAfterReview: before && validScorePair(previousPossible) ? previousPossible : null,
+    possibleScoreIfRemoved: before && validScorePair(previousPossible) ? previousPossible : null,
+    runsAtRiskAtStart: trackedRunsAtRisk(previousImpact),
+    officialScoreAfterReview: validScorePair(after) ? after : null,
     scoreBeforeReview: before,
-    scoreAfterReview: after,
+    scoreAfterReview: validScorePair(after) ? after : null,
   };
 
-  if (delta < 0 && -delta <= atRisk) reconciled.actualRunsRemoved = -delta;
-  else if (delta > 0) reconciled.actualRunsAdded = delta;
-  else if (delta === 0 && atRisk > 0) reconciled.runsRetained = atRisk;
-  else return nextReview;
+  if (before && validScorePair(after) && ['away', 'home'].includes(side)) {
+    const other = side === 'away' ? 'home' : 'away';
+    // Attribute a run change only if the opponent score did not move.
+    if (before[other] === after[other]) {
+      const delta = after[side] - before[side];
+      const atRisk = trackedRunsAtRisk(previousImpact);
+      if (delta < 0 && -delta <= atRisk) reconciled.actualRunsRemoved = -delta;
+      else if (delta > 0) reconciled.actualRunsAdded = delta;
+      else if (delta === 0 && atRisk > 0) reconciled.runsRetained = atRisk;
+    }
+  }
 
   return { ...nextReview, scoreImpact: reconciled };
 }
@@ -150,7 +217,29 @@ function mergeFeedEvents(state, gamePk, reviews) {
   (reviews || []).forEach((review) => {
     const key = buildEventKey(gamePk, review);
     currentKeys.add(key);
-    const prev = seen.get(key);
+    let prev = seen.get(key);
+    if (!prev && !review.inProgress && Number.isFinite(review.atBatIndex)) {
+      // A status-only active review uses `live-active-review`; once the play
+      // resolves, the parser can expose its normal play/event id. Re-key only
+      // an observed active entry from the exact same game, at-bat, and review
+      // type (or a generic status type) so unrelated reviews are never joined.
+      const alias = [...seen.entries()].find(([candidateKey, candidate]) => {
+        const prior = candidate && candidate.review;
+        if (!prior || candidate.gamePk !== gamePk || !prior.inProgress ||
+            prior.atBatIndex !== review.atBatIndex || currentKeys.has(candidateKey)) return false;
+        const priorType = prior.typeKey || 'review';
+        const nextType = review.typeKey || 'review';
+        return priorType === nextType || priorType === 'review' || nextType === 'review';
+      });
+      if (alias) {
+        const [aliasKey, aliasEntry] = alias;
+        seen.delete(aliasKey);
+        seen.set(key, aliasEntry);
+        const idx = order.indexOf(aliasKey);
+        if (idx >= 0) order[idx] = key;
+        prev = aliasEntry;
+      }
+    }
     if (!prev) {
       const entry = { gamePk, review, firstSeen: now, lastSeen: now };
       seen.set(key, entry);

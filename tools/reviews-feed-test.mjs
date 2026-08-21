@@ -90,6 +90,10 @@ const riskImpact = {
   scoringSide: 'away',
   runsCredited: 1,
   runsAtRisk: 1,
+  runsAtRiskAtStart: 1,
+  scoreAtReviewStart: { away: 6, home: 5 },
+  possibleScoreAfterReview: { away: 5, home: 5 },
+  officialScoreAfterReview: null,
   currentScore: { away: 6, home: 5 },
   possibleScoreIfRemoved: { away: 5, home: 5 },
   teamLabels: { away: 'NYY', home: 'BOS' },
@@ -100,12 +104,66 @@ const activeRisk = {
   reason: 'tag play at home',
   scoreImpact: riskImpact,
 };
+const activeTrackerState = { seen: new Map(), order: [] };
+mergeFeedEvents(activeTrackerState, 98, [activeRisk]);
+const repeatedActive = mergeFeedEvents(activeTrackerState, 98, [activeRisk]);
+assert.equal(repeatedActive.updated.length, 0, 'unchanged active tracker poll is a no-op');
+
+const activeRiskLaterPoll = reconcileScoreImpact(activeRisk, {
+  ...activeRisk,
+  scoreImpact: {
+    ...riskImpact,
+    scoreAtReviewStart: { away: 7, home: 5 },
+    currentScore: { away: 7, home: 5 },
+    possibleScoreAfterReview: { away: 6, home: 5 },
+    possibleScoreIfRemoved: { away: 6, home: 5 },
+  },
+});
+assert.equal(activeRiskLaterPoll.scoreImpact.scoreAtReviewStart.away, 6,
+  'later active polls cannot rewrite the first observed score');
+assert.equal(activeRiskLaterPoll.scoreImpact.possibleScoreAfterReview.away, 5,
+  'the possible score remains paired with the first active snapshot');
+
+const activeWithoutScenario = {
+  ...activeRisk,
+  scoreImpact: {
+    ...riskImpact,
+    runsCredited: 0,
+    runsAtRisk: 0,
+    runsAtRiskAtStart: 0,
+    possibleScoreAfterReview: null,
+    possibleScoreIfRemoved: null,
+  },
+};
+const mismatchedLaterScenario = reconcileScoreImpact(activeWithoutScenario, {
+  ...activeRisk,
+  scoreImpact: {
+    ...riskImpact,
+    scoreAtReviewStart: { away: 7, home: 5 },
+    currentScore: { away: 7, home: 5 },
+    possibleScoreAfterReview: { away: 6, home: 5 },
+    possibleScoreIfRemoved: { away: 6, home: 5 },
+  },
+});
+assert.equal(mismatchedLaterScenario.scoreImpact.possibleScoreAfterReview, null,
+  'a later scenario computed from a different score is not paired with the first snapshot');
+assert.equal(mismatchedLaterScenario.scoreImpact.runsAtRiskAtStart, 0);
+const enrichedSameScoreScenario = reconcileScoreImpact(activeWithoutScenario, activeRisk);
+assert.equal(enrichedSameScoreScenario.scoreImpact.possibleScoreAfterReview.away, 5,
+  'new runner details can add a scenario when its score still matches the first snapshot');
+assert.equal(enrichedSameScoreScenario.scoreImpact.runsAtRiskAtStart, 1);
+
 const finalRemoved = {
   ...mk('play-51-main', 'manager', 'overturned', false),
   reason: 'tag play at home',
   scoreImpact: {
     context: 'home_plate', scoringSide: 'away', runsCredited: 0, runsAtRisk: 0,
+    runsAtRiskAtStart: 0,
+    scoreAtReviewStart: null,
+    possibleScoreAfterReview: null,
+    officialScoreAfterReview: { away: 5, home: 5 },
     currentScore: { away: 5, home: 5 },
+    possibleScoreIfRemoved: null,
     teamLabels: { away: 'NYY', home: 'BOS' },
   },
 };
@@ -117,16 +175,79 @@ assert.equal(resolvedScore.updated[0].review.scoreImpact.actualRunsRemoved, 1,
   '6-5 active score -> 5-5 resolved score records one observed run removal');
 assert.equal(resolvedScore.updated[0].review.scoreImpact.scoreBeforeReview.away, 6);
 assert.equal(resolvedScore.updated[0].review.scoreImpact.scoreAfterReview.away, 5);
+assert.equal(resolvedScore.updated[0].review.scoreImpact.scoreAtReviewStart.away, 6,
+  'before-review snapshot is the call-on-field score first observed');
+assert.equal(resolvedScore.updated[0].review.scoreImpact.possibleScoreAfterReview.away, 5,
+  'conditional score survives resolution');
+assert.equal(resolvedScore.updated[0].review.scoreImpact.runsAtRiskAtStart, 1,
+  'the scenario retains how many credited runs were originally at risk');
+assert.equal(resolvedScore.updated[0].review.scoreImpact.officialScoreAfterReview.away, 5,
+  'actual-after snapshot comes from the resolved play');
 const repeatedFinal = mergeFeedEvents(scoreState, 99, [finalRemoved]);
 assert.equal(repeatedFinal.updated.length, 0, 'unchanged final poll is a no-op');
 assert.equal(scoreState.seen.get('99:play-51-main').review.scoreImpact.actualRunsRemoved, 1,
   'observed removal persists after later final-only payloads');
 
+const finalOnlyState = { seen: new Map(), order: [] };
+mergeFeedEvents(finalOnlyState, 100, [finalRemoved]);
+mergeFeedEvents(finalOnlyState, 100, [finalRemoved]);
+assert.equal(finalOnlyState.seen.get('100:play-51-main').review.scoreImpact.scoreAtReviewStart, null,
+  'repeated final-only polls never back-fill Before review from the final score');
+assert.equal(finalOnlyState.seen.get('100:play-51-main').review.scoreImpact.officialScoreAfterReview.away, 5);
+
+const missingStartState = { seen: new Map(), order: [] };
+const activeWithoutScore = {
+  ...activeRisk,
+  id: 'play-52-main',
+  scoreImpact: {
+    ...activeWithoutScenario.scoreImpact,
+    activeReviewObserved: true,
+    scoreAtReviewStart: null,
+    currentScore: null,
+  },
+};
+const finalAfterMissingStart = {
+  ...finalRemoved,
+  id: 'play-52-main',
+  scoreImpact: {
+    ...finalRemoved.scoreImpact,
+    activeReviewObserved: false,
+    officialScoreAfterReview: { away: 5, home: 5 },
+    currentScore: { away: 5, home: 5 },
+  },
+};
+mergeFeedEvents(missingStartState, 102, [activeWithoutScore]);
+mergeFeedEvents(missingStartState, 102, [finalAfterMissingStart]);
+const repeatedMissingStartFinal = mergeFeedEvents(missingStartState, 102, [finalAfterMissingStart]);
+const missingStartImpact = missingStartState.seen.get('102:play-52-main').review.scoreImpact;
+assert.equal(repeatedMissingStartFinal.updated.length, 0);
+assert.equal(missingStartImpact.activeReviewObserved, true,
+  'later final polls remember that an active payload was seen even when its score was incomplete');
+assert.equal(missingStartImpact.scoreAtReviewStart, null);
+assert.equal(missingStartImpact.officialScoreAfterReview.away, 5);
+
+const aliasState = { seen: new Map(), order: [] };
+const syntheticActiveRisk = { ...activeRisk, id: 'live-active-review', atBatIndex: 51 };
+const resolvedAliasRisk = { ...finalRemoved, atBatIndex: 51 };
+mergeFeedEvents(aliasState, 101, [syntheticActiveRisk]);
+const aliasedResolution = mergeFeedEvents(aliasState, 101, [resolvedAliasRisk]);
+assert.equal(aliasedResolution.added.length, 0,
+  'a resolved play id replaces its matching status-only active id instead of duplicating it');
+assert.equal(aliasedResolution.updated.length, 1);
+assert.equal(aliasedResolution.ended.length, 0);
+assert.equal(aliasState.seen.has('101:live-active-review'), false);
+assert.equal(aliasState.seen.get('101:play-51-main').review.scoreImpact.scoreAtReviewStart.away, 6);
+assert.equal(aliasState.seen.get('101:play-51-main').review.scoreImpact.officialScoreAfterReview.away, 5);
+
 const finalRetained = {
   ...finalRemoved,
   outcome: 'stands',
   outcomeLabel: 'Call Stands',
-  scoreImpact: { ...finalRemoved.scoreImpact, currentScore: { away: 6, home: 5 } },
+  scoreImpact: {
+    ...finalRemoved.scoreImpact,
+    officialScoreAfterReview: { away: 6, home: 5 },
+    currentScore: { away: 6, home: 5 },
+  },
 };
 const retained = reconcileScoreImpact(activeRisk, finalRetained);
 assert.equal(retained.scoreImpact.runsRetained, 1,
@@ -152,7 +273,11 @@ assert.equal(finalBoundaryAdded.scoreImpact.actualRunsAdded, 1,
 
 const opponentAlsoMoved = reconcileScoreImpact(activeRisk, {
   ...finalRemoved,
-  scoreImpact: { ...finalRemoved.scoreImpact, currentScore: { away: 5, home: 6 } },
+  scoreImpact: {
+    ...finalRemoved.scoreImpact,
+    officialScoreAfterReview: { away: 5, home: 6 },
+    currentScore: { away: 5, home: 6 },
+  },
 });
 assert.equal(opponentAlsoMoved.scoreImpact.actualRunsRemoved, undefined,
   'do not attribute a score transition when the other team score also changed');
