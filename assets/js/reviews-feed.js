@@ -409,6 +409,17 @@ function gameTeamsLabel(game, teamsById) {
   return `${officialTeamName(gameSideTeam(game, 'away'), teamsById, 'AWY')} @ ${officialTeamName(gameSideTeam(game, 'home'), teamsById, 'HOM')}`;
 }
 
+/**
+ * Whether a review should trigger the 3-second buzz alert.
+ * Requirement: challenges, reviews, boundary calls, but NOT ABS.
+ * ABS is typeKey 'abs'. Everything else (manager, crew_chief, boundary,
+ * review, rules, umpire) qualifies. Pure function — no DOM.
+ */
+function shouldAlertForReview(review) {
+  if (!review || typeof review.typeKey !== 'string') return false;
+  return review.typeKey !== 'abs';
+}
+
 /* ------------------------------------------------------------ page logic */
 
 (() => {
@@ -438,6 +449,20 @@ function gameTeamsLabel(game, teamsById) {
   let settledGames = new Set();     // Final games: fetched once, immutable
   const feedState = { seen: new Map(), order: [] };
 
+  // --- Audio alert state (3s buzz for challenges/reviews/boundary, not ABS) ---
+  let isFirstLoad = true;
+  let pendingAlertableCount = 0;
+  let audioEnabled = false;
+  let audioContext = null;
+  let lastAlertAt = 0;
+
+  try {
+    const stored = typeof localStorage !== 'undefined' ? localStorage.getItem('replayFeedSoundEnabled') : null;
+    audioEnabled = stored === '1' || stored === 'true';
+  } catch (_) {
+    audioEnabled = false;
+  }
+
   function todayStr() {
     const d = new Date();
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -454,11 +479,133 @@ function gameTeamsLabel(game, teamsById) {
     feedState.seen.clear();
     feedState.order.length = 0;
     settledGames = new Set();
+    isFirstLoad = true;
+    pendingAlertableCount = 0;
   }
 
   function $ (sel) { return document.querySelector(sel); }
 
   function el(tag, cls, text, attrs) { return UI.el(tag, cls, text, attrs); }
+
+  /* -------------------------------------------------------- audio alert */
+
+  function ensureAudioContext() {
+    if (audioContext) return audioContext;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      audioContext = new AC();
+      return audioContext;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * Play a 3-second buzz alert for challenges/reviews/boundary calls.
+   * Uses Web Audio API (no external file) so it works on static hosting.
+   * Two oscillators (square + sawtooth) create a harsh buzzer tone.
+   */
+  function playAlertSound() {
+    if (!audioEnabled) return;
+    const nowMs = Date.now();
+    // Cooldown 2.5s to avoid overlapping buzzes when multiple games report at once
+    if (nowMs - lastAlertAt < 2500) return;
+    lastAlertAt = nowMs;
+
+    try {
+      const ctx = ensureAudioContext();
+      if (!ctx) return;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const t0 = ctx.currentTime;
+
+      const gainNode = ctx.createGain();
+      gainNode.gain.setValueAtTime(0, t0);
+      gainNode.gain.linearRampToValueAtTime(0.32, t0 + 0.04);
+      gainNode.gain.setValueAtTime(0.32, t0 + 2.75);
+      gainNode.gain.linearRampToValueAtTime(0, t0 + 3.0);
+      gainNode.connect(ctx.destination);
+
+      // Primary buzzer: square wave ~860Hz with slight wobble
+      const osc1 = ctx.createOscillator();
+      osc1.type = 'square';
+      osc1.frequency.setValueAtTime(860, t0);
+      osc1.frequency.linearRampToValueAtTime(780, t0 + 0.12);
+      osc1.frequency.linearRampToValueAtTime(860, t0 + 0.24);
+      osc1.frequency.linearRampToValueAtTime(820, t0 + 0.5);
+      osc1.frequency.setValueAtTime(860, t0 + 1.0);
+      osc1.connect(gainNode);
+
+      // Secondary harshness: sawtooth at 430Hz
+      const osc2 = ctx.createOscillator();
+      osc2.type = 'sawtooth';
+      osc2.frequency.setValueAtTime(430, t0);
+      osc2.connect(gainNode);
+
+      // Optional: very short beep overlay for attention
+      const osc3 = ctx.createOscillator();
+      const gain3 = ctx.createGain();
+      osc3.type = 'sine';
+      osc3.frequency.setValueAtTime(1200, t0);
+      gain3.gain.setValueAtTime(0, t0);
+      gain3.gain.linearRampToValueAtTime(0.18, t0 + 0.02);
+      gain3.gain.linearRampToValueAtTime(0, t0 + 0.35);
+      osc3.connect(gain3);
+      gain3.connect(ctx.destination);
+
+      osc1.start(t0);
+      osc2.start(t0);
+      osc3.start(t0);
+      osc1.stop(t0 + 3.0);
+      osc2.stop(t0 + 3.0);
+      osc3.stop(t0 + 0.36);
+
+      // Cleanup nodes after playback
+      setTimeout(() => {
+        try { gainNode.disconnect(); } catch (_) {}
+        try { gain3.disconnect(); } catch (_) {}
+      }, 3500);
+    } catch (err) {
+      console.warn('alert sound failed', err);
+    }
+  }
+
+  function updateSoundToggleUI() {
+    const btn = $('#sound-toggle-btn');
+    if (!btn) return;
+    if (audioEnabled) {
+      btn.textContent = '🔔 Sound On';
+      btn.classList.add('btn-sound-on');
+      btn.classList.remove('btn-ghost');
+      btn.title = 'Alert sound ON — buzz for challenges/reviews/boundary calls (not ABS). Click to mute.';
+    } else {
+      btn.textContent = '🔇 Sound Off';
+      btn.classList.remove('btn-sound-on');
+      btn.classList.add('btn-ghost');
+      btn.title = 'Alert sound OFF — click to enable 3s buzz for challenges/reviews/boundary calls';
+    }
+  }
+
+  function setSoundEnabled(enabled) {
+    audioEnabled = !!enabled;
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem('replayFeedSoundEnabled', audioEnabled ? '1' : '0');
+      }
+    } catch (_) {}
+    updateSoundToggleUI();
+    if (audioEnabled) {
+      const ctx = ensureAudioContext();
+      if (ctx && ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      // Play a short preview buzz so user knows it works (still 3s per spec,
+      // but we trigger it directly on user gesture, which satisfies autoplay policy)
+      playAlertSound();
+    }
+  }
 
   /* ------------------------------------------------------------- polling */
 
@@ -469,6 +616,7 @@ function gameTeamsLabel(game, teamsById) {
     lastCycleStartedAt = Date.now();
     const statusLine = $('#status-line');
     setLivePulse(true);
+    pendingAlertableCount = 0;
 
     try {
       const scheduleGames = await MLB.getSchedule(requestDate);
@@ -506,6 +654,13 @@ function gameTeamsLabel(game, teamsById) {
         await ingestGame(g);
       });
       if (requestDate !== dateStr) return;
+
+      // If this poll discovered new non-ABS events and it's not the very first
+      // load (initial page population), play the 3-second buzz.
+      if (!isFirstLoad && pendingAlertableCount > 0 && audioEnabled) {
+        playAlertSound();
+      }
+      isFirstLoad = false;
 
       render();
       renderStatusLine();
@@ -566,6 +721,20 @@ function gameTeamsLabel(game, teamsById) {
       ? window.MLBReviews.extractReviews(pseudoFeed)
       : { reviews: [], activeReview: null };
     const result = mergeFeedEvents(feedState, gamePk, reviewData.reviews);
+    // Count new alertable events for the 3s buzz (challenges/reviews/boundary, not ABS)
+    if (result.added && result.added.length) {
+      const alertable = result.added.filter((e) => {
+        try {
+          // Use the pure helper defined outside the IIFE
+          return typeof shouldAlertForReview === 'function'
+            ? shouldAlertForReview(e.review)
+            : e.review && e.review.typeKey !== 'abs';
+        } catch (_) {
+          return false;
+        }
+      }).length;
+      if (alertable > 0) pendingAlertableCount += alertable;
+    }
     // Stamp the official matchup on every entry for this game so a later
     // render does not depend on re-finding the schedule object.
     const matchupLabel = gameTeamsLabel(game, teamsById);
@@ -934,6 +1103,10 @@ function gameTeamsLabel(game, teamsById) {
       const d = $('#date-picker').value;
       if (d) { dateStr = d; syncUrl(); updateDateLabel(); resetFeed(); load(); }
     },
+    toggleSound() { setSoundEnabled(!audioEnabled); },
+    setSoundEnabled(enabled) { setSoundEnabled(enabled); },
+    getSoundEnabled() { return audioEnabled; },
+    playAlertSound() { playAlertSound(); },
   };
 
   document.addEventListener('DOMContentLoaded', () => {
@@ -941,8 +1114,16 @@ function gameTeamsLabel(game, teamsById) {
     const d = params.get('date');
     if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) dateStr = d;
     updateDateLabel();
+    updateSoundToggleUI();
     const refreshBtn = $('#refresh-btn');
     if (refreshBtn) refreshBtn.addEventListener('click', () => load());
+    const soundBtn = $('#sound-toggle-btn');
+    if (soundBtn) {
+      soundBtn.addEventListener('click', () => {
+        // User gesture required for AudioContext resume
+        setSoundEnabled(!audioEnabled);
+      });
+    }
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) load();
       else stopPolling();
@@ -957,6 +1138,7 @@ function gameTeamsLabel(game, teamsById) {
       sortFeedEntries, gameTeamsLabel,
       isUsableName, officialTeamName, gameSideTeam,
       pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
+      shouldAlertForReview,
     };
   }
 })();

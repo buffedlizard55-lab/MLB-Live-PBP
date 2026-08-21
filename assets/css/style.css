@@ -1550,6 +1550,18 @@ a:hover { text-decoration: underline; }
   text-decoration: none;
 }
 
+/* Sound toggle on replay feed */
+.btn-sound-on {
+  background: linear-gradient(135deg, #2ea043 0%, #2f81f7 100%);
+  border: 1px solid rgba(125, 211, 160, 0.6);
+  color: #fff;
+  font-weight: 800;
+  box-shadow: 0 0 12px rgba(46, 160, 67, 0.35);
+}
+.btn-sound-on:hover {
+  filter: brightness(1.12);
+}
+
 /* Ticker footer link to the full feed */
 .ticker-feed-link {
   display: inline-flex;
