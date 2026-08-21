@@ -24,10 +24,24 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
     challenges, crew chief reviews, umpire reviews, ABS pitch challenges and
     boundary-call reviews (potential home runs / fair-foul at the wall) appear at the
     top of the feed as they happen, with game link, inning, challenging team, reason,
-    outcome, batter/pitcher context, and — for ABS — the pitch count before the
-    challenge, who challenged (batter / catcher / pitcher, from official play text
-    or the challenging team's batting/fielding side), and the count after the call
-    is overturned or stands. Includes an "Under Review" live strip, per-type
+    outcome, batter/pitcher context, and a three-row **review score tracker**:
+    **Before review** (the call-on-field score when the active review is first
+    observed), **Possible after** (call stands plus any conditional run-removal
+    scenario supported by the reviewed scoring movements), and **Actual after**
+    (the official score after the resolved reviewed play/action, when exposed).
+    For example: `NYY 6 – BOS 5`, possible
+    `NYY 5 – BOS 5` if the reviewed safe-at-home run is removed, then the actual
+    official score after the ruling. The possible score is **not a prediction**:
+    on a home-run/boundary review MLB may instead place runners. A boundary review
+    with no currently credited run says “score impact pending” and does not invent
+    an alternate score. If the page opens only after resolution, it shows an
+    attributable official Actual-after score when available and honestly marks
+    Before/Possible as not observed. A later end-of-plate-appearance score is not
+    assigned to an earlier pitch review. For ABS,
+    the feed also shows the pitch count before the challenge, who challenged (batter /
+    catcher / pitcher, from official play text or the challenging team's batting/
+    fielding side), and the count after the call is overturned or stands. Includes
+    an "Under Review" live strip, per-type
     filters (All / ABS / Challenges / Reviews / Boundary Calls / Under Review),
     and summary stats for the whole day.
   - **Scoreboard Live Ticker & Alert Badges** — surfaces any game currently in review or challenge,

@@ -1174,6 +1174,87 @@ a:hover { text-decoration: underline; }
   font-variant-numeric: tabular-nums;
 }
 
+/* Verified replay score tracker. Numeric alternate scenarios appear only when
+   official current-play data supplies a complete score and tied scoring runs. */
+.score-impact {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 8px 0;
+  padding: 9px 11px;
+  border: 1px solid rgba(255, 135, 135, 0.5);
+  border-left: 4px solid #ff6b6b;
+  border-radius: 7px;
+  background: rgba(224, 49, 49, 0.13);
+  font-variant-numeric: tabular-nums;
+}
+.score-impact-title {
+  color: #ffb3b3;
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.65px;
+}
+.score-impact-detail {
+  color: #fff;
+  font-size: 13px;
+  font-weight: 750;
+  line-height: 1.35;
+}
+.score-impact-rows {
+  display: grid;
+  gap: 5px;
+  margin-top: 3px;
+}
+.score-impact-row {
+  display: grid;
+  grid-template-columns: minmax(92px, 0.34fr) minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding-top: 5px;
+  border-top: 1px solid rgba(255, 255, 255, 0.09);
+}
+.score-impact-row:first-child { border-top: 0; padding-top: 0; }
+.score-impact-row-label {
+  color: #b9c7da;
+  font-size: 10.5px;
+  font-weight: 900;
+  letter-spacing: 0.45px;
+  text-transform: uppercase;
+}
+.score-impact-row-value {
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 750;
+  line-height: 1.35;
+}
+.score-impact-row-scenario .score-impact-row-value { color: #ffd8a8; }
+.score-impact-row-pending .score-impact-row-value { color: #ffd43b; }
+.score-impact-row-unavailable .score-impact-row-value { color: var(--muted); font-weight: 600; }
+.score-impact-note {
+  color: #b9c7da;
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+.score-impact-pending,
+.score-impact-final {
+  border-color: rgba(210, 153, 34, 0.5);
+  border-left-color: var(--yellow);
+  background: rgba(210, 153, 34, 0.11);
+}
+.score-impact-pending .score-impact-title,
+.score-impact-final .score-impact-title { color: #ffd43b; }
+.score-impact-removed { border-left-color: #ff6b6b; }
+.score-impact-added,
+.score-impact-retained {
+  border-color: rgba(46, 160, 67, 0.5);
+  border-left-color: var(--green);
+  background: rgba(46, 160, 67, 0.12);
+}
+.score-impact-added .score-impact-title,
+.score-impact-retained .score-impact-title { color: #8ff0ac; }
+.review-alert-score-impact,
+.live-review-score-impact { margin-bottom: 2px; }
+
 /* Live Panel Under Review Card */
 .live-active-review-card {
   grid-column: 1 / -1;
@@ -1536,6 +1617,15 @@ a:hover { text-decoration: underline; }
 .feed-active-game { font-weight: 800; }
 .feed-active-type { color: #ff8787; font-size: 11px; font-weight: 800; text-transform: uppercase; }
 .feed-active-reason { color: var(--muted); }
+.feed-active-impact {
+  color: #fff;
+  background: rgba(224, 49, 49, 0.72);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 10.5px;
+  font-weight: 900;
+  letter-spacing: 0.35px;
+}
 
 /* Feed list (chatroom) */
 .feed-list {

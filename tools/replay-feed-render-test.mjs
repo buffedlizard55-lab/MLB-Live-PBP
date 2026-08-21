@@ -6,8 +6,8 @@
  * Loads the REAL page modules (assets/js/reviews-feed.js + reviews.js) into a
  * VM with a recording DOM stub and drives the actual boot path
  * (DOMContentLoaded -> load() -> getSchedule/getTeams/getPlayByPlay ->
- * ingestGame -> render*). The API fixtures below are VERBATIM captures from
- * statsapi.mlb.com on 2026-08-19 (see docs/verification-report.md):
+ * ingestGame -> render*). The captured fixture portions below are VERBATIM
+ * from statsapi.mlb.com on 2026-08-19 (see docs/verification-report.md):
  *
  *   - schedule entry for gamePk 823342 (Detroit Tigers @ Pittsburgh Pirates),
  *     whose team objects carry ONLY { id, name, link } — no `abbreviation`
@@ -15,9 +15,13 @@
  *   - the ABS pitch challenge (reviewType "MJ") at atBatIndex 15 of that
  *     game's playByPlay;
  *   - official /api/v1/teams directory entries for clubs 116 and 134.
+ * A clearly marked deterministic active home-plate-review fixture is appended
+ * to test the transient Before / Possible / Actual score tracker; no claim is
+ * made that the synthetic review itself was captured live.
  *
- * Asserts: every rendered text/attr contains official data only — the string
- * "undefined" can never appear — and the official full team names are shown.
+ * Asserts: captured team/review fields remain official — the string
+ * "undefined" can never appear — and the marked deterministic Replay Feed row
+ * renders all three score states without inventing Actual.
  *
  * Run: node tools/replay-feed-render-test.mjs
  * ==========================================================================*/
@@ -114,7 +118,7 @@ const UIStub = {
   clear: (n) => { n.children.length = 0; return n; },
 };
 
-/* -------------------------------------------- verbatim API fixtures (2026-08-19) */
+/* ---------------- captured API fixtures + marked deterministic tracker records */
 
 // GET /api/v1/schedule?sportId=1&date=2026-08-19&hydrate=… — game 823342 entry,
 // captured verbatim. NOTE: teams.*.team has NO `abbreviation` field.
@@ -148,18 +152,40 @@ const SCHEDULE_GAMES = [{
 }];
 
 // GET /api/v1/game/823342/playByPlay — the ABS pitch-challenge at-bat captured
-// live at atBatIndex 15 (reviewDetails.reviewType "MJ", challengeTeamId 116),
-// plus the game's live currentPlay shape ({result:{},about:{},playEvents:[]}).
+// live at atBatIndex 15 (reviewDetails.reviewType "MJ", challengeTeamId 116).
+// The atBatIndex 16 and 17/currentPlay records are deterministic tracker data,
+// separate from the verbatim capture: 2-1 before the play, 3-1 after a safe-at-
+// home call, with one scoring movement tied to the reviewed event.
 const PBP = {
-  allPlays: [{
-    about: { atBatIndex: 15, startTime: '2026-08-19T17:05:00Z', endTime: '2026-08-19T17:07:00Z', inning: 2, halfInning: 'bottom', isComplete: true, hasReview: false },
-    result: { description: 'Jared Triolo grounds out, third baseman Hao-Yu Lee to first baseman Spencer Torkelson.', event: 'Groundout' },
+  allPlays: [
+    {
+      about: { atBatIndex: 15, startTime: '2026-08-19T17:05:00Z', endTime: '2026-08-19T17:07:00Z', inning: 2, halfInning: 'bottom', isComplete: true, hasReview: false },
+      result: { description: 'Jared Triolo grounds out, third baseman Hao-Yu Lee to first baseman Spencer Torkelson.', event: 'Groundout' },
+      matchup: { batter: { id: 668804, fullName: 'Bryan Reynolds' }, pitcher: { id: 695549, fullName: 'Jackson Jobe' } },
+      playEvents: [
+        { isPitch: true, startTime: '2026-08-19T17:06:00Z', details: { description: 'Ball', hasReview: true }, reviewDetails: { isOverturned: false, inProgress: false, reviewType: 'MJ', challengeTeamId: 116 } },
+      ],
+    },
+    {
+      about: { atBatIndex: 16, inning: 6, halfInning: 'top', isComplete: true },
+      result: { description: 'Previous play.', awayScore: 2, homeScore: 1 },
+      runners: [], playEvents: [],
+    },
+  ],
+  currentPlay: {
+    about: { atBatIndex: 17, startTime: '2026-08-19T18:30:00Z', inning: 6, halfInning: 'top', isComplete: false },
+    result: {
+      event: 'Single', eventType: 'single', awayScore: 3, homeScore: 1,
+      description: 'Runner is safe at home. Play under review.',
+    },
     matchup: { batter: { id: 668804, fullName: 'Bryan Reynolds' }, pitcher: { id: 695549, fullName: 'Jackson Jobe' } },
-    playEvents: [
-      { isPitch: true, startTime: '2026-08-19T17:06:00Z', details: { description: 'Ball', hasReview: true }, reviewDetails: { isOverturned: false, inProgress: false, reviewType: 'MJ', challengeTeamId: 116 } },
-    ],
-  }],
-  currentPlay: { result: {}, about: {}, playEvents: [] },
+    reviewDetails: { inProgress: true, reviewType: 'MA', challengeTeamId: 134 },
+    runners: [{
+      movement: { start: '3B', end: 'score', isOut: false },
+      details: { event: 'Single', eventType: 'single', isScoringEvent: true, playIndex: 2, runner: { id: 1, fullName: 'Test Runner' } },
+    }],
+    playEvents: [{ index: 2, isPitch: true, details: { description: 'In play, run(s)' } }],
+  },
 };
 
 // GET /api/v1/teams?sportId=1&season=2026 — the two entries this game needs,
@@ -223,13 +249,21 @@ function collectStrings(node, out) {
   return out;
 }
 
-// 1. The feed rendered exactly one review row from the real payloads.
+// 1. The feed rendered the captured ABS review plus the deterministic active
+// score-impact review.
 const feedList = registry['#feed-list'];
 const rows = feedList.children.filter((c) => c.cls.includes('feed-row'));
-assert.equal(rows.length, 1, `expected 1 feed row, got ${rows.length}`);
-const rowTexts = [];
-collectStrings(rows[0], rowTexts);
-const rowBlob = rowTexts.join(' | ');
+assert.equal(rows.length, 2, `expected 2 feed rows, got ${rows.length}`);
+const rowRecords = rows.map((row) => {
+  const strings = [];
+  collectStrings(row, strings);
+  return { row, blob: strings.join(' | ') };
+});
+const absRecord = rowRecords.find((record) => record.blob.includes('ABS Challenge'));
+const impactRecord = rowRecords.find((record) => record.blob.includes('1 RUN AT RISK'));
+assert.ok(absRecord, 'captured ABS row rendered');
+assert.ok(impactRecord, 'active score-impact row rendered');
+const rowBlob = absRecord.blob;
 
 // 2. Official team names are shown — never "undefined", never a guess.
 assert.ok(rowBlob.includes('Detroit Tigers @ Pittsburgh Pirates'),
@@ -238,7 +272,7 @@ assert.ok(!rowBlob.includes('undefined'),
   `feed row leaked "undefined": ${rowBlob}`);
 
 // 3. Challenging-team chip = official abbreviation, official full name on hover.
-const teamChip = findIn(rows[0], '.feed-team');
+const teamChip = findIn(absRecord.row, '.feed-team');
 assert.ok(teamChip, 'challenge team chip rendered');
 assert.equal(teamChip.text, 'DET');
 assert.equal(teamChip.title, 'Detroit Tigers');
@@ -255,11 +289,21 @@ assert.ok(rowBlob.includes('Count before challenge: 0-0'), `ABS before-count, go
 assert.ok(rowBlob.includes('Catcher or pitcher challenged'), `ABS challenger role, got: ${rowBlob}`);
 assert.ok(!/After call/.test(rowBlob), `no invented after-count when event.count is missing: ${rowBlob}`);
 assert.ok(rowBlob.includes('▼ Bot 2nd'), `inning label from the play's about, got: ${rowBlob}`);
-const scoreChip = findIn(rows[0], '.feed-game-score');
+const scoreChip = findIn(absRecord.row, '.feed-game-score');
 assert.ok(scoreChip && scoreChip.text === '3–1',
   `score chip from the schedule linescore, got: ${scoreChip && scoreChip.text}`);
 
-// 4b. The Boundary Calls filter tab renders with the setFilter wiring the
+// 4b. The real feed-row path renders the three distinct score snapshots.
+assert.match(impactRecord.blob, /Before review \| DET 3 – PIT 1/);
+assert.match(impactRecord.blob, /Possible after \| Call stands: DET 3 – PIT 1/);
+assert.match(impactRecord.blob, /safe-at-home call becomes an out: DET 2 – PIT 1/);
+assert.match(impactRecord.blob, /Actual after \| Pending — review in progress/);
+const activeStripStrings = [];
+collectStrings(registry['#active-strip'], activeStripStrings);
+assert.ok(activeStripStrings.includes('1 RUN AT RISK'),
+  `active strip includes score risk, got: ${JSON.stringify(activeStripStrings)}`);
+
+// 4c. The Boundary Calls filter tab renders with the setFilter wiring the
 // other tabs use (observed typeKey 'boundary' — see tools/review-test.mjs §3c).
 const tabsNode = registry['#feed-tabs'];
 const tabStrings = [];
@@ -268,7 +312,9 @@ assert.ok(tabStrings.some((s) => /^Boundary Calls \(0\)$/.test(s)),
   `Boundary Calls tab with count renders, got: ${JSON.stringify(tabStrings)}`);
 assert.ok(tabStrings.some((s) => s === "ReplayFeed.setFilter('boundary')"),
   'Boundary Calls tab wires ReplayFeed.setFilter(\'boundary\')');
-assert.ok(tabStrings.some((s) => /^ABS \(1\)$/.test(s)), 'existing tabs unchanged');
+assert.ok(tabStrings.some((s) => /^ABS \(1\)$/.test(s)), 'captured ABS tab count');
+assert.ok(tabStrings.some((s) => /^Challenges \(1\)$/.test(s)), 'active manager-review tab count');
+assert.ok(tabStrings.some((s) => /^● Under Review \(1\)$/.test(s)), 'active review tab count');
 
 // 5. Whole-page sweep: stats bar, tabs, active strip, status line included.
 const everything = [];
@@ -277,7 +323,7 @@ const leaked = everything.filter((s) => String(s).includes('undefined'));
 assert.equal(leaked.length, 0, `no rendered string may contain "undefined": ${JSON.stringify(leaked)}`);
 
 // 6. Status line summarizes the poll.
-assert.match(registry['#status-line'].textContent, /1 game · 1 review event · updated /);
-assert.match(registry['#status-line'].textContent, /refreshing every 2s/);
+assert.match(registry['#status-line'].textContent, /1 game · 2 review events · updated /);
+assert.match(registry['#status-line'].textContent, /refreshing every 1s/);
 
 console.log('Replay-feed render test passed successfully!');

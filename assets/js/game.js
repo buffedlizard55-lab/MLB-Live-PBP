@@ -388,6 +388,10 @@
         `PLAY UNDER REVIEW — ${activeReview.reviewType.toUpperCase()}${activeReview.teamAbbrev ? ` (${activeReview.teamAbbrev})` : ''}`));
       textWrap.appendChild(UI.el('div', 'live-review-reason', activeReview.reason));
       textWrap.appendChild(UI.el('div', 'live-review-desc', activeReview.description));
+      const scoreImpact = window.MLBReviews && window.MLBReviews.renderScoreImpact
+        ? window.MLBReviews.renderScoreImpact(activeReview, 'live-review')
+        : null;
+      if (scoreImpact) textWrap.appendChild(scoreImpact);
       const absLine = window.MLBReviews && window.MLBReviews.absContextSummary
         ? window.MLBReviews.absContextSummary(activeReview)
         : null;

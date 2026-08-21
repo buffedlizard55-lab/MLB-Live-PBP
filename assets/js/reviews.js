@@ -300,6 +300,380 @@ const MLBReviews = (() => {
   }
 
   /**
+   * Strictly read an away/home score pair. `result` objects expose
+   * awayScore/homeScore; linescores expose teams.away/home.runs. A partial or
+   * non-numeric pair is rejected so the UI never fills a missing score.
+   */
+  function readScorePair(source) {
+    if (!source || typeof source !== 'object') return null;
+    const away = source.teams && source.teams.away
+      ? source.teams.away.runs
+      : (source.awayScore != null ? source.awayScore : source.away);
+    const home = source.teams && source.teams.home
+      ? source.teams.home.runs
+      : (source.homeScore != null ? source.homeScore : source.home);
+    if (typeof away !== 'number' || typeof home !== 'number') return null;
+    if (!Number.isFinite(away) || !Number.isFinite(home) || away < 0 || home < 0) return null;
+    return { away, home };
+  }
+
+  /** Last official result score before this at-bat, when the PBP supplies it. */
+  function scoreBeforePlay(allPlays, play) {
+    const target = play && play.about && play.about.atBatIndex;
+    if (typeof target !== 'number' || !Number.isFinite(target)) return null;
+    let prior = null;
+    (allPlays || []).forEach((candidate) => {
+      const idx = candidate && candidate.about && candidate.about.atBatIndex;
+      if (typeof idx !== 'number' || idx >= target) return;
+      const score = readScorePair(candidate.result);
+      if (score) prior = score;
+    });
+    return prior;
+  }
+
+  /**
+   * Scoring movements tied to the reviewed event.
+   *
+   * A play's runners array can contain movements from earlier pitches/actions
+   * in the same plate appearance. For event-level reviews, details.playIndex
+   * must therefore match the reviewed event.index. If either index is absent,
+   * we only use all scoring movements for an explicit boundary-reviewed home
+   * run. Play-level reviews match runner records to the final result's event /
+   * eventType and playIndex before using its scoring movements.
+   */
+  function reviewedScoringRunners(play, event, typeKey) {
+    const runners = (play && play.runners) || [];
+    const scoring = runners.filter((runner) =>
+      runner && runner.details && runner.details.isScoringEvent === true);
+
+    if (!event) {
+      // Play-level reviewDetails applies to the result play. Match runner
+      // records to result.eventType/event and then use their playIndex; this
+      // excludes an earlier steal/wild-pitch run from the same at-bat.
+      const result = (play && play.result) || {};
+      const resultIndexes = runners
+        .filter((runner) => {
+          const details = runner && runner.details;
+          return details && (
+            (result.eventType && details.eventType === result.eventType) ||
+            (result.event && details.event === result.event));
+        })
+        .map((runner) => runner.details.playIndex)
+        .filter((idx) => typeof idx === 'number' && Number.isFinite(idx));
+      if (resultIndexes.length) {
+        return scoring.filter((runner) => resultIndexes.includes(runner.details.playIndex));
+      }
+      return [];
+    }
+
+    if (typeof event.index === 'number' && Number.isFinite(event.index)) {
+      return scoring.filter((runner) =>
+        runner.details && runner.details.playIndex === event.index);
+    }
+
+    const eventType = play && play.result && play.result.eventType;
+    if (typeKey === 'boundary' && eventType === 'home_run') return scoring;
+    return [];
+  }
+
+  function scoreTeamLabels(teamNames, teamIdBySide) {
+    const label = (side, fallback) => {
+      const id = teamIdBySide && teamIdBySide[side];
+      const team = id != null && teamNames ? teamNames[id] : null;
+      return (team && (team.abbrev || team.name)) || fallback;
+    };
+    return { away: label('away', 'Away'), home: label('home', 'Home') };
+  }
+
+  /**
+   * Derive only what the official play payload can support about score impact.
+   * This does NOT predict the replay ruling. During an active review it reports
+   * runs already credited by the call on the field and computes the conditional
+   * score if all of those credited runs were removed. Boundary replay may place
+   * runners instead, so that conditional score is explicitly a scenario, not a
+   * forecast or guaranteed result.
+   */
+  function deriveScoreImpact({
+    play, event, typeKey, outcome, previousScore, fallbackScore,
+    teamNames, teamIdBySide,
+  }) {
+    const about = (play && play.about) || {};
+    const result = (play && play.result) || {};
+    const inProgress = outcome && outcome.key === 'in_progress';
+    const half = String(about.halfInning || '').toLowerCase();
+    const scoringSide = half === 'top' ? 'away' : half === 'bottom' ? 'home' : null;
+    const events = ((play && play.playEvents) || []);
+    const eventPosition = event ? events.indexOf(event) : -1;
+    const isTerminalEvent = eventPosition >= 0 && eventPosition === events.length - 1;
+    // A completed plate appearance's result score is not necessarily the score
+    // immediately after an earlier pitch review. Use it only for play-level or
+    // terminal-event reviews; an active review may use the score observed now.
+    const resultAppliesToReview = !event || inProgress || isTerminalEvent;
+    const currentScore = (resultAppliesToReview ? readScorePair(result) : null) ||
+      (inProgress ? readScorePair(fallbackScore) : null);
+    const beforeScore = readScorePair(previousScore);
+    const scoringRunners = reviewedScoringRunners(play, event, typeKey);
+
+    const text = [
+      result.event,
+      result.eventType,
+      result.description,
+      event && event.details && event.details.description,
+    ].filter(Boolean).join(' ');
+    const isBoundary = typeKey === 'boundary';
+    const isHomeRun = /\bhome run\b|\bhomers?\b|\bover the wall\b/i.test(text) ||
+      result.eventType === 'home_run';
+    const isHomePlate = /\b(?:safe|out|play|tag(?:ged)?)\s+at\s+home\b|\bhome plate\b/i.test(text) ||
+      scoringRunners.some((runner) => runner.movement && runner.movement.outBase === '4B');
+    const context = isBoundary ? 'boundary'
+      : isHomeRun ? 'home_run'
+      : isHomePlate ? 'home_plate'
+      : scoringRunners.length ? 'scoring_play'
+      : null;
+
+    // A numeric warning requires explicit scoring-runner records tied to the
+    // reviewed event. A score delta across a whole at-bat is not enough: it can
+    // include an earlier steal home, wild pitch, or other unrelated action.
+    const runsCredited = scoringRunners.length;
+
+    let possibleScoreIfRemoved = null;
+    if (outcome && outcome.key === 'in_progress' && scoringSide &&
+        runsCredited > 0 && currentScore && currentScore[scoringSide] >= runsCredited) {
+      possibleScoreIfRemoved = { ...currentScore };
+      possibleScoreIfRemoved[scoringSide] -= runsCredited;
+    }
+
+    const runnerNames = [];
+    scoringRunners.forEach((runner) => {
+      const name = runner.details && runner.details.runner && runner.details.runner.fullName;
+      if (name && !runnerNames.includes(name)) runnerNames.push(name);
+    });
+
+    return {
+      context,
+      activeReviewObserved: !!inProgress,
+      scoringSide,
+      runsCredited,
+      runsAtRisk: inProgress ? runsCredited : 0,
+      runsAtRiskAtStart: inProgress ? runsCredited : 0,
+      creditedRunnerNames: runnerNames,
+      // Three distinct score snapshots. `currentScore` and
+      // `possibleScoreIfRemoved` remain as internal/backward-compatible aliases.
+      scoreAtReviewStart: inProgress ? currentScore : null,
+      possibleScoreAfterReview: possibleScoreIfRemoved,
+      officialScoreAfterReview: inProgress ? null : currentScore,
+      currentScore,
+      scoreBeforePlay: beforeScore,
+      possibleScoreIfRemoved,
+      teamLabels: scoreTeamLabels(teamNames, teamIdBySide),
+    };
+  }
+
+  function formatScorePair(score, labels) {
+    const pair = readScorePair(score);
+    if (!pair) return null;
+    const names = labels || { away: 'Away', home: 'Home' };
+    return `${names.away || 'Away'} ${pair.away} – ${names.home || 'Home'} ${pair.home}`;
+  }
+
+  /**
+   * User-facing score tracker. The three rows deliberately separate:
+   *   1. score when the active review was first observed (call on the field),
+   *   2. conditional score outcome(s) supported by the scoring movements, and
+   *   3. official score attached to the play after the review resolves.
+   * A final-only payload cannot recreate row 1 or 2, so those rows say the
+   * active review was not observed. An observed active payload without a
+   * complete score is labeled unavailable instead of being reconstructed.
+   */
+  function scoreImpactPresentation(review) {
+    const impact = review && review.scoreImpact;
+    if (!impact) return null;
+    const labels = impact.teamLabels || { away: 'Away', home: 'Home' };
+    const startPair = impact.scoreAtReviewStart || impact.scoreBeforeReview ||
+      (review.inProgress ? impact.currentScore : null);
+    const possiblePair = impact.possibleScoreAfterReview || impact.possibleScoreIfRemoved;
+    const actualPair = impact.officialScoreAfterReview || impact.scoreAfterReview ||
+      (!review.inProgress ? impact.currentScore : null);
+    const start = formatScorePair(startPair, labels);
+    const possible = formatScorePair(possiblePair, labels);
+    const actual = formatScorePair(actualPair, labels);
+    const activeObserved = impact.activeReviewObserved === true || !!start;
+    const observedRisk = Number.isFinite(impact.runsAtRiskAtStart)
+      ? impact.runsAtRiskAtStart
+      : null;
+    const runs = observedRisk != null
+      ? observedRisk
+      : (impact.runsAtRisk || impact.actualRunsRemoved ||
+        impact.runsRetained || impact.runsCredited || 0);
+
+    let possibleText;
+    if (start && possible) {
+      const alternate = impact.context === 'home_plate' && runs === 1
+        ? 'If the safe-at-home call becomes an out'
+        : runs === 1
+          ? 'If the credited run is removed'
+          : `If all ${runs} credited runs are removed`;
+      possibleText = `Call stands: ${start} · ${alternate}: ${possible}`;
+    } else if (!start) {
+      possibleText = activeObserved
+        ? 'Not available — no complete score was available when the review was observed'
+        : 'Not available — the active review was not observed';
+    } else if (impact.context === 'boundary') {
+      possibleText = `Call stands: ${start} · Alternate score undetermined; replay may place runners`;
+    } else {
+      possibleText = `Call stands: ${start} · No alternate score is supported by the current play data`;
+    }
+
+    const rows = [
+      {
+        label: 'Before review',
+        value: start || (activeObserved
+          ? 'Unavailable in the observed active payload'
+          : 'Not observed — final payload only'),
+        state: start ? 'known' : 'unavailable',
+      },
+      {
+        label: 'Possible after',
+        value: possibleText,
+        state: start ? 'scenario' : 'unavailable',
+      },
+      {
+        label: 'Actual after',
+        value: review.inProgress ? 'Pending — review in progress' : (actual || 'Unavailable in official play data'),
+        state: review.inProgress ? 'pending' : (actual ? 'known' : 'unavailable'),
+      },
+    ];
+
+    if (review.inProgress && runs > 0) {
+      return {
+        status: 'at-risk',
+        title: `${runs} ${runs === 1 ? 'RUN' : 'RUNS'} AT RISK`,
+        detail: `${rows[0].value} · ${rows[1].value}`,
+        note: impact.context === 'boundary'
+          ? '“Before review” is the call-on-field score when the review was first observed. The alternate is not a prediction or guaranteed final score; replay may place runners.'
+          : '“Before review” is the call-on-field score when the review was first observed, not the score before the play. The alternate is not a prediction or guaranteed final score.',
+        rows,
+      };
+    }
+
+    if (review.inProgress && impact.context === 'boundary') {
+      return {
+        status: 'pending',
+        title: 'BOUNDARY CALL — SCORE IMPACT PENDING',
+        detail: start ? `Score when review started: ${start}.` : 'No complete official score is available yet.',
+        note: 'The current play data does not credit a removable run. Replay may change the boundary call or runner placement, so no alternate score is invented.',
+        rows,
+      };
+    }
+
+    if (review.inProgress && start) {
+      return {
+        status: 'pending',
+        title: 'REVIEW SCORE TRACKER',
+        detail: `Score when review started: ${start}.`,
+        note: 'No alternate score is shown unless official scoring movements tie a run to the reviewed event.',
+        rows,
+      };
+    }
+
+    if (review.inProgress) {
+      return {
+        status: 'pending',
+        title: 'REVIEW SCORE TRACKER',
+        detail: 'No complete score was available when this active review was observed.',
+        note: 'Before, possible, and actual values remain unavailable rather than being reconstructed.',
+        rows,
+      };
+    }
+
+    if (impact.actualRunsRemoved > 0) {
+      const n = impact.actualRunsRemoved;
+      return {
+        status: 'removed',
+        title: `${n} ${n === 1 ? 'RUN' : 'RUNS'} REMOVED BY REVIEW`,
+        detail: start && actual ? `${start} → ${actual}.` : `${n} ${n === 1 ? 'run was' : 'runs were'} removed from the official score.`,
+        note: 'The before and actual scores were observed from the same review event across live StatsAPI polls.',
+        rows,
+      };
+    }
+
+    if (impact.actualRunsAdded > 0) {
+      const n = impact.actualRunsAdded;
+      return {
+        status: 'added',
+        title: `${n} ${n === 1 ? 'RUN' : 'RUNS'} ADDED BY REVIEW`,
+        detail: start && actual ? `${start} → ${actual}.` : `${n} ${n === 1 ? 'run was' : 'runs were'} added to the official score.`,
+        note: 'The before and actual scores were observed from the same review event across live StatsAPI polls.',
+        rows,
+      };
+    }
+
+    if (impact.runsRetained > 0) {
+      const n = impact.runsRetained;
+      return {
+        status: 'retained',
+        title: `${n} AT-RISK ${n === 1 ? 'RUN REMAINED' : 'RUNS REMAINED'} IN THE SCORE`,
+        detail: actual ? `Official score after review: ${actual}.` : 'The official score did not decrease on resolution.',
+        note: 'The before and actual scores were observed from the same review event across live StatsAPI polls.',
+        rows,
+      };
+    }
+
+    // Completed review: Actual can come from the resolved play, while a
+    // final-only payload still cannot recreate the temporary call-on-field score.
+    if (actual) {
+      const n = impact.runsCredited || 0;
+      return {
+        status: 'final',
+        title: impact.context === 'boundary' || impact.context === 'home_plate'
+          ? (n > 0
+            ? `FINAL REVIEWED PLAY: ${n} ${n === 1 ? 'RUN' : 'RUNS'} CREDITED`
+            : 'FINAL REVIEWED PLAY: NO RUN CREDITED')
+          : 'REVIEW SCORE COMPLETE',
+        detail: `Official score after review: ${actual}.`,
+        note: start
+          ? 'The review was tracked live from its call-on-field score through the final ruling.'
+          : activeObserved
+            ? 'The active review was observed without a complete start score, so no before/possible score is inferred.'
+            : 'The final score is official. The active review was not observed, so no temporary before/possible score is inferred.',
+        rows,
+      };
+    }
+
+    return {
+      status: 'final',
+      title: 'REVIEW SCORE TRACKER',
+      detail: 'The official score immediately after this review is unavailable.',
+      note: activeObserved
+        ? 'The active review was observed, but the official payloads did not provide complete score snapshots.'
+        : 'The final payload does not expose a score attributable to this review; no snapshots are reconstructed.',
+      rows,
+    };
+  }
+
+  function renderScoreImpact(review, variant) {
+    const display = scoreImpactPresentation(review);
+    if (!display) return null;
+    const variantClass = variant ? `${variant}-score-impact` : '';
+    const wrap = UI.el('div', `score-impact score-impact-${display.status} ${variantClass}`.trim());
+    wrap.appendChild(UI.el('strong', 'score-impact-title', display.title));
+    if (display.rows && display.rows.length) {
+      const scoreRows = UI.el('div', 'score-impact-rows');
+      display.rows.forEach((row) => {
+        const line = UI.el('div', `score-impact-row score-impact-row-${row.state || 'known'}`);
+        line.appendChild(UI.el('span', 'score-impact-row-label', row.label));
+        line.appendChild(UI.el('span', 'score-impact-row-value', row.value));
+        scoreRows.appendChild(line);
+      });
+      wrap.appendChild(scoreRows);
+    } else {
+      wrap.appendChild(UI.el('span', 'score-impact-detail', display.detail));
+    }
+    if (display.note) wrap.appendChild(UI.el('span', 'score-impact-note', display.note));
+    return wrap;
+  }
+
+  /**
    * Determine the outcome of a review.
    */
   function determineOutcome(reviewDetails, text, inProgressState) {
@@ -363,6 +737,7 @@ const MLBReviews = (() => {
     const currentPlay = playsData.currentPlay || null;
     const status = (gameData.status && gameData.status.detailedState) || '';
     const isGameInReviewStatus = /challenge|review/i.test(status);
+    const fallbackScore = readScorePair(liveData.linescore);
 
     const teamNames = {};
     const teamIdBySide = { away: null, home: null };
@@ -401,6 +776,16 @@ const MLBReviews = (() => {
         teamNames,
         teamIdBySide,
       });
+      const scoreImpact = deriveScoreImpact({
+        play,
+        event,
+        typeKey: typeMeta.key,
+        outcome,
+        previousScore: scoreBeforePlay(allPlays, play),
+        fallbackScore,
+        teamNames,
+        teamIdBySide,
+      });
       return {
         id,
         atBatIndex: about.atBatIndex != null ? about.atBatIndex : null,
@@ -427,6 +812,7 @@ const MLBReviews = (() => {
         countAfter: abs.countAfter,
         atBatCount: abs.atBatCount,
         challenger: abs.challenger,
+        scoreImpact,
       };
     }
 
@@ -533,6 +919,16 @@ const MLBReviews = (() => {
         teamNames,
         teamIdBySide,
       });
+      const liveScoreImpact = deriveScoreImpact({
+        play: cp,
+        event: null,
+        typeKey: activeTypeMeta.key,
+        outcome: { key: 'in_progress' },
+        previousScore: scoreBeforePlay(allPlays, cp),
+        fallbackScore,
+        teamNames,
+        teamIdBySide,
+      });
       const activeEntry = {
         id: 'live-active-review',
         atBatIndex: about.atBatIndex != null ? about.atBatIndex : null,
@@ -559,6 +955,7 @@ const MLBReviews = (() => {
         countAfter: liveAbs.countAfter,
         atBatCount: liveAbs.atBatCount,
         challenger: liveAbs.challenger,
+        scoreImpact: liveScoreImpact,
       };
       reviews.unshift(activeEntry);
     }
@@ -659,6 +1056,8 @@ const MLBReviews = (() => {
     const desc = UI.el('span', 'review-alert-desc', activeReview.description);
     content.appendChild(title);
     content.appendChild(desc);
+    const scoreImpact = renderScoreImpact(activeReview, 'review-alert');
+    if (scoreImpact) content.appendChild(scoreImpact);
     const absLine = absContextSummary(activeReview);
     if (absLine) content.appendChild(UI.el('span', 'review-alert-abs', absLine));
 
@@ -698,6 +1097,8 @@ const MLBReviews = (() => {
     // Body: Reason headline + Play description
     const body = UI.el('div', 'review-card-body');
     body.appendChild(UI.el('h4', 'review-reason-title', review.reason));
+    const scoreImpact = renderScoreImpact(review, 'review-card');
+    if (scoreImpact) body.appendChild(scoreImpact);
     const absMeta = renderAbsContext(review);
     if (absMeta) body.appendChild(absMeta);
     body.appendChild(UI.el('p', 'review-desc-text', review.description));
@@ -794,6 +1195,12 @@ const MLBReviews = (() => {
     absContextLines,
     absContextSummary,
     renderAbsContext,
+    readScorePair,
+    scoreBeforePlay,
+    reviewedScoringRunners,
+    deriveScoreImpact,
+    scoreImpactPresentation,
+    renderScoreImpact,
   };
 })();
 
