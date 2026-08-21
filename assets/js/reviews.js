@@ -22,6 +22,15 @@ const MLBReviews = (() => {
    *           overturned: …". (Verified in game 823341.)
    *   "MF"  → Manager challenge on a play. Same shape. (Verified in game 824075:
    *           "Royals challenged (play at 1st), call on the field was …".)
+   *   "NH"  → Boundary-call review (crew-chief-initiated: potential home run /
+   *           fair-foul at the wall). Event-level on the affected pitch, bare
+   *           pitch description ("Foul"), no review text in the play
+   *           description. (Verified in game 824801, 2026-08-19, atBatIndex 57:
+   *           Pete Alonso's drive down the left-field line was ruled foul and
+   *           the call stood after a crew-chief review —
+   *           {"isOverturned":false,"inProgress":false,"reviewType":"NH"} on
+   *           the "Foul" pitch event, which also carries
+   *           details.hasReview:true.)
    *
    * Other M-prefixed codes are treated the same as MA/MF (traditional play
    * reviews); unknown codes fall back to description-text detection and then
@@ -44,6 +53,7 @@ const MLBReviews = (() => {
     if (/^[A-Za-z]{1,4}$/.test(raw)) {
       const code = raw.toUpperCase();
       if (code === 'MJ') return { key: 'abs', label: 'ABS Challenge' };
+      if (code === 'NH') return { key: 'boundary', label: 'Boundary Call' };
       if (code.startsWith('M')) return { key: 'manager', label: 'Manager Challenge' };
       // Unverified codes: label honestly as a generic replay review.
       return { key: 'review', label: 'Replay Review' };
@@ -64,8 +74,11 @@ const MLBReviews = (() => {
 
   /**
    * Extract a concise review reason / topic from play/event descriptions.
+   * `typeKey` (optional) disambiguates bare pitch descriptions: "Foul" means
+   * an ABS ball/strike topic for an "MJ" review, but a boundary-call topic
+   * for an "NH" review (verified shape, game 824801).
    */
-  function extractReason(text) {
+  function extractReason(text, typeKey) {
     if (!text) return 'Play under review';
     const clean = String(text);
 
@@ -76,6 +89,11 @@ const MLBReviews = (() => {
     // "ABS challenge (called strike): ..."
     const parenMatch = clean.match(/(?:challeng\w*|review|replay)\s*\(([^)]+)\)/i);
     if (parenMatch) return parenMatch[1].trim();
+
+    // Boundary-call reviews (NH) carry a bare pitch description ("Foul") with
+    // no review text — the topic is the review category itself, same as the
+    // "Home Run / Boundary Call" text pattern below.
+    if (typeKey === 'boundary') return 'Home Run / Boundary Call';
 
     // Specific baseball review trigger patterns
     if (/home run|boundary|fan interference|over the wall/i.test(clean)) return 'Home Run / Boundary Call';
@@ -398,7 +416,7 @@ const MLBReviews = (() => {
         isOverturned: outcome.isOverturned,
         outcome: outcome.key,
         outcomeLabel: outcome.label,
-        reason: extractReason(desc),
+        reason: extractReason(desc, typeMeta.key),
         description: desc || 'Play reviewed.',
         timestamp,
         isPitch: !!isPitch,
@@ -565,7 +583,7 @@ const MLBReviews = (() => {
       stands: 0,
       inProgress: 0,
       overturnRate: '0.0%',
-      byType: { manager: 0, crew_chief: 0, abs: 0, umpire: 0, rules: 0, review: 0 },
+      byType: { manager: 0, crew_chief: 0, abs: 0, boundary: 0, umpire: 0, rules: 0, review: 0 },
       byTeam: {},
     };
   }

@@ -259,6 +259,17 @@ const scoreChip = findIn(rows[0], '.feed-game-score');
 assert.ok(scoreChip && scoreChip.text === '3–1',
   `score chip from the schedule linescore, got: ${scoreChip && scoreChip.text}`);
 
+// 4b. The Boundary Calls filter tab renders with the setFilter wiring the
+// other tabs use (observed typeKey 'boundary' — see tools/review-test.mjs §3c).
+const tabsNode = registry['#feed-tabs'];
+const tabStrings = [];
+collectStrings(tabsNode, tabStrings);
+assert.ok(tabStrings.some((s) => /^Boundary Calls \(0\)$/.test(s)),
+  `Boundary Calls tab with count renders, got: ${JSON.stringify(tabStrings)}`);
+assert.ok(tabStrings.some((s) => s === "ReplayFeed.setFilter('boundary')"),
+  'Boundary Calls tab wires ReplayFeed.setFilter(\'boundary\')');
+assert.ok(tabStrings.some((s) => /^ABS \(1\)$/.test(s)), 'existing tabs unchanged');
+
 // 5. Whole-page sweep: stats bar, tabs, active strip, status line included.
 const everything = [];
 Object.values(registry).forEach((n) => collectStrings(n, everything));

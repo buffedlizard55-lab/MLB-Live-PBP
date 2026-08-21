@@ -21,20 +21,23 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
   (Automated Ball-Strike system) pitch challenges across both the Scoreboard and Game views:
   - **All-Games "Replay Feed" page** (`reviews.html`) — a live, chat-style feed that pulls
     review events from **every game on the schedule** (not just one game): new manager
-    challenges, crew chief reviews, umpire reviews and ABS pitch challenges appear at the
+    challenges, crew chief reviews, umpire reviews, ABS pitch challenges and
+    boundary-call reviews (potential home runs / fair-foul at the wall) appear at the
     top of the feed as they happen, with game link, inning, challenging team, reason,
     outcome, batter/pitcher context, and — for ABS — the pitch count before the
     challenge, who challenged (batter / catcher / pitcher, from official play text
     or the challenging team's batting/fielding side), and the count after the call
     is overturned or stands. Includes an "Under Review" live strip, per-type
-    filters, and summary stats for the whole day.
+    filters (All / ABS / Challenges / Reviews / Boundary Calls / Under Review),
+    and summary stats for the whole day.
   - **Scoreboard Live Ticker & Alert Badges** — surfaces any game currently in review or challenge,
     with a link straight to the all-games Replay Feed.
   - **Live Game Review Alert Banner** — eye-catching alert at the top of the game and live module when a call is under review.
   - **Dedicated "Challenges & Reviews" Tab** — full breakdown of every review event with summary stats (overturn rate, breakdown by challenge type and team), call reasons, and outcomes (Overturned, Stands, Confirmed).
   - **Play-by-Play Chips** — highlighted review outcome chips directly on affected plays.
   - All review parsing is validated against the real StatsAPI shapes (`reviewDetails`
-    with codes `MJ` = ABS pitch challenge, `MA`/`MF` = manager challenges, plus
+    with codes `MJ` = ABS pitch challenge, `MA`/`MF` = manager challenges, and
+    `NH` = boundary-call review, plus
     `feed.gameData.review` / `feed.gameData.absChallenges` challenge counters) — see
     `docs/verification-report.md` and `tools/review-test.mjs`.
 - **Two-sided hit forecast** — a transparent per-plate-appearance hit probability that

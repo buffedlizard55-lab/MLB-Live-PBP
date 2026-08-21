@@ -2,9 +2,10 @@
  * reviews-feed.js — All-Games Replay Review Feed ("chatroom" style)
  * ----------------------------------------------------------------------------
  * Pulls review/challenge events (Manager Challenges, Crew Chief Reviews,
- * Umpire Reviews, ABS pitch challenges) from EVERY game on the selected date
- * and renders them as a live, chat-style feed. New events appear at the top
- * with a highlight; in-progress reviews pulse until they resolve.
+ * Umpire Reviews, ABS pitch challenges, and boundary-call reviews) from
+ * EVERY game on the selected date and renders them as a live, chat-style
+ * feed. New events appear at the top with a highlight; in-progress reviews
+ * pulse until they resolve.
  *
  * Data flow (all shapes verified against statsapi.mlb.com, 2026-08-19):
  *   1. Schedule (hydrate=review,linescore,decisions) -> teams + status +
@@ -422,6 +423,7 @@ function gameTeamsLabel(game, teamsById) {
     wrap.appendChild(stat('Events', entries.length));
     wrap.appendChild(stat('ABS Challenges', entries.filter((e) => e.review.typeKey === 'abs').length, 'stat-abs'));
     wrap.appendChild(stat('Manager Challenges', entries.filter((e) => e.review.typeKey === 'manager').length, 'stat-manager'));
+    wrap.appendChild(stat('Boundary Calls', entries.filter((e) => e.review.typeKey === 'boundary').length, 'stat-boundary'));
     wrap.appendChild(stat('Overturned', entries.filter((e) => e.review.outcome === 'overturned').length, 'stat-overturned'));
     wrap.appendChild(stat('Stands / Upheld', entries.filter((e) => e.review.outcome === 'stands').length, 'stat-stands'));
     const inProgress = entries.filter((e) => e.review.inProgress);
@@ -477,6 +479,7 @@ function gameTeamsLabel(game, teamsById) {
       abs: entries.filter((e) => e.review.typeKey === 'abs').length,
       manager: entries.filter((e) => e.review.typeKey === 'manager').length,
       crew: entries.filter((e) => e.review.typeKey === 'crew_chief').length,
+      boundary: entries.filter((e) => e.review.typeKey === 'boundary').length,
       live: entries.filter((e) => e.review.inProgress).length,
     };
     const tabs = [
@@ -484,6 +487,7 @@ function gameTeamsLabel(game, teamsById) {
       ['abs', `ABS (${counts.abs})`],
       ['manager', `Challenges (${counts.manager})`],
       ['crew', `Reviews (${counts.crew})`],
+      ['boundary', `Boundary Calls (${counts.boundary})`],
       ['live', `● Under Review (${counts.live})`],
     ];
 
