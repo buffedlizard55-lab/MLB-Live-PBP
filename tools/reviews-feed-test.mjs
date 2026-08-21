@@ -29,7 +29,8 @@ vm.createContext(context);
 vm.runInContext(source, context, { filename: 'assets/js/reviews-feed.js' });
 
 const {
-  buildEventKey, mergeFeedEvents, sortFeedEntries, gameTeamsLabel,
+  buildEventKey, mergeFeedEvents, reconcileScoreImpact, reviewChanged,
+  sortFeedEntries, gameTeamsLabel,
   isUsableName, officialTeamName, gameSideTeam,
   pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
 } = context.module.exports;
@@ -81,6 +82,87 @@ const fourth = mergeFeedEvents(state, gamePk, [
 assert.equal(fourth.added.length, 0);
 assert.equal(fourth.updated.length, 1, 'in-progress -> resolved should mark updated');
 assert.equal(fourth.updated[0].review.inProgress, false);
+
+/* ----------------------- 4b. Observed score change across review resolution */
+
+const riskImpact = {
+  context: 'home_plate',
+  scoringSide: 'away',
+  runsCredited: 1,
+  runsAtRisk: 1,
+  currentScore: { away: 6, home: 5 },
+  possibleScoreIfRemoved: { away: 5, home: 5 },
+  teamLabels: { away: 'NYY', home: 'BOS' },
+};
+const activeRisk = {
+  ...mk('play-51-main', 'manager', 'in_progress', true),
+  outcomeLabel: 'In Progress',
+  reason: 'tag play at home',
+  scoreImpact: riskImpact,
+};
+const finalRemoved = {
+  ...mk('play-51-main', 'manager', 'overturned', false),
+  reason: 'tag play at home',
+  scoreImpact: {
+    context: 'home_plate', scoringSide: 'away', runsCredited: 0, runsAtRisk: 0,
+    currentScore: { away: 5, home: 5 },
+    teamLabels: { away: 'NYY', home: 'BOS' },
+  },
+};
+const scoreState = { seen: new Map(), order: [] };
+mergeFeedEvents(scoreState, 99, [activeRisk]);
+const resolvedScore = mergeFeedEvents(scoreState, 99, [finalRemoved]);
+assert.equal(resolvedScore.updated.length, 1);
+assert.equal(resolvedScore.updated[0].review.scoreImpact.actualRunsRemoved, 1,
+  '6-5 active score -> 5-5 resolved score records one observed run removal');
+assert.equal(resolvedScore.updated[0].review.scoreImpact.scoreBeforeReview.away, 6);
+assert.equal(resolvedScore.updated[0].review.scoreImpact.scoreAfterReview.away, 5);
+const repeatedFinal = mergeFeedEvents(scoreState, 99, [finalRemoved]);
+assert.equal(repeatedFinal.updated.length, 0, 'unchanged final poll is a no-op');
+assert.equal(scoreState.seen.get('99:play-51-main').review.scoreImpact.actualRunsRemoved, 1,
+  'observed removal persists after later final-only payloads');
+
+const finalRetained = {
+  ...finalRemoved,
+  outcome: 'stands',
+  outcomeLabel: 'Call Stands',
+  scoreImpact: { ...finalRemoved.scoreImpact, currentScore: { away: 6, home: 5 } },
+};
+const retained = reconcileScoreImpact(activeRisk, finalRetained);
+assert.equal(retained.scoreImpact.runsRetained, 1,
+  'unchanged official score records that the observed at-risk run remained');
+assert.equal(retained.scoreImpact.actualRunsRemoved, undefined);
+
+const activeBoundaryPending = {
+  ...activeRisk,
+  scoreImpact: {
+    context: 'boundary', scoringSide: 'home', runsCredited: 0, runsAtRisk: 0,
+    currentScore: { away: 3, home: 3 }, teamLabels: { away: 'NYY', home: 'BAL' },
+  },
+};
+const finalBoundaryAdded = reconcileScoreImpact(activeBoundaryPending, {
+  ...finalRemoved,
+  scoreImpact: {
+    context: 'boundary', scoringSide: 'home', runsCredited: 1, runsAtRisk: 0,
+    currentScore: { away: 3, home: 4 }, teamLabels: { away: 'NYY', home: 'BAL' },
+  },
+});
+assert.equal(finalBoundaryAdded.scoreImpact.actualRunsAdded, 1,
+  '3-3 boundary review -> 3-4 resolution records one observed added run');
+
+const opponentAlsoMoved = reconcileScoreImpact(activeRisk, {
+  ...finalRemoved,
+  scoreImpact: { ...finalRemoved.scoreImpact, currentScore: { away: 5, home: 6 } },
+});
+assert.equal(opponentAlsoMoved.scoreImpact.actualRunsRemoved, undefined,
+  'do not attribute a score transition when the other team score also changed');
+
+const sameOutcomeNewImpact = {
+  ...activeRisk,
+  scoreImpact: { ...riskImpact, runsAtRisk: 2 },
+};
+assert.equal(reviewChanged(activeRisk, sameOutcomeNewImpact), true,
+  'new score-impact data updates a row even while outcome remains in progress');
 
 /* ------------------------------------------- 5. Gone key = ended (synthetic) */
 

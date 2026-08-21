@@ -378,6 +378,187 @@ assert.ok(dualBoundaryExtracted.reviews.some((r) => r.typeKey === 'abs'));
 assert.equal(dualBoundaryExtracted.summary.byType.boundary, 1);
 assert.equal(dualBoundaryExtracted.summary.byType.abs, 1);
 
+/* ---------------- 3d. Score impact: official fields, conditional only ----- */
+
+// Active safe-at-home review. The official call-on-field result credits one
+// run (NYY 6, BOS 5), and the runner movement is explicitly a scoring event.
+// The parser may therefore show the conditional 5-5 score if that credited run
+// is removed. It must never say that replay WILL overturn the call.
+const priorFiveFive = {
+  about: { atBatIndex: 50, inning: 8, halfInning: 'top', isComplete: true },
+  result: { description: 'Previous play.', awayScore: 5, homeScore: 5 },
+  runners: [],
+};
+const safeAtHomeReview = {
+  about: { atBatIndex: 51, inning: 8, halfInning: 'top', isComplete: false },
+  result: {
+    event: 'Single', eventType: 'single', awayScore: 6, homeScore: 5,
+    description: 'Anthony Volpe is safe at home. Play under review.',
+  },
+  matchup: { batter: { id: 592450, fullName: 'Aaron Judge' }, pitcher: { id: 656302, fullName: 'Brayan Bello' } },
+  reviewDetails: { inProgress: true, reviewType: 'MA', challengeTeamId: 111 },
+  runners: [{
+    movement: { start: '3B', end: 'score', outBase: null, isOut: false },
+    details: { event: 'Single', eventType: 'single', isScoringEvent: true, playIndex: 5, runner: { id: 660670, fullName: 'Anthony Volpe' } },
+  }],
+  playEvents: [{ index: 5, isPitch: true, details: { description: 'In play, run(s)' } }],
+};
+const activeHomeFeed = {
+  gameData: {
+    status: { detailedState: 'Manager Challenge', abstractGameState: 'Live' },
+    teams: {
+      away: { id: 147, name: 'New York Yankees', abbreviation: 'NYY' },
+      home: { id: 111, name: 'Boston Red Sox', abbreviation: 'BOS' },
+    },
+  },
+  liveData: {
+    linescore: { teams: { away: { runs: 6 }, home: { runs: 5 } } },
+    plays: { allPlays: [priorFiveFive], currentPlay: safeAtHomeReview },
+  },
+};
+const activeHome = MLBReviews.extractReviews(activeHomeFeed).activeReview;
+assert.ok(activeHome, 'safe-at-home review is active');
+assert.equal(activeHome.scoreImpact.context, 'home_plate');
+assert.equal(activeHome.scoreImpact.scoringSide, 'away');
+assert.equal(activeHome.scoreImpact.runsAtRisk, 1);
+assert.equal(activeHome.scoreImpact.currentScore.away, 6);
+assert.equal(activeHome.scoreImpact.possibleScoreIfRemoved.away, 5);
+assert.equal(activeHome.scoreImpact.possibleScoreIfRemoved.home, 5);
+assert.deepEqual(Array.from(activeHome.scoreImpact.creditedRunnerNames), ['Anthony Volpe']);
+const activeHomeDisplay = MLBReviews.scoreImpactPresentation(activeHome);
+assert.equal(activeHomeDisplay.title, '1 RUN AT RISK');
+assert.match(activeHomeDisplay.detail, /Call-on-field score: NYY 6 – BOS 5/);
+assert.match(activeHomeDisplay.detail, /credited run is removed: NYY 5 – BOS 5/);
+assert.match(activeHomeDisplay.note, /not a prediction/);
+assert.doesNotMatch(activeHomeDisplay.detail + activeHomeDisplay.note, /will be overturned/i);
+const renderedHomeImpact = MLBReviews.renderScoreImpact(activeHome, 'feed');
+const renderedImpactText = (node) => [
+  node && node.text,
+  ...((node && node.children) || []).flatMap((child) => renderedImpactText(child)),
+].filter(Boolean).join(' | ');
+assert.match(renderedHomeImpact.cls, /score-impact-at-risk/);
+assert.match(renderedHomeImpact.cls, /feed-score-impact/);
+assert.match(renderedImpactText(renderedHomeImpact), /1 RUN AT RISK/);
+assert.match(renderedImpactText(renderedHomeImpact), /NYY 6 – BOS 5/);
+
+// Active three-run home-run boundary review. Every numeric field is supplied
+// by result.awayScore/homeScore + three runners marked isScoringEvent=true.
+const threeRunBoundary = {
+  about: { atBatIndex: 1, inning: 1, halfInning: 'top', isComplete: false },
+  result: {
+    event: 'Home Run', eventType: 'home_run', awayScore: 3, homeScore: 0,
+    description: 'Aaron Judge homers. Two runners score.',
+  },
+  matchup: { batter: { id: 592450, fullName: 'Aaron Judge' }, pitcher: { id: 656302, fullName: 'Brayan Bello' } },
+  runners: [
+    { movement: { end: 'score', isOut: false }, details: { isScoringEvent: true, playIndex: 4, runner: { id: 1, fullName: 'Runner One' } } },
+    { movement: { end: 'score', isOut: false }, details: { isScoringEvent: true, playIndex: 4, runner: { id: 2, fullName: 'Runner Two' } } },
+    { movement: { end: 'score', isOut: false }, details: { isScoringEvent: true, playIndex: 4, runner: { id: 592450, fullName: 'Aaron Judge' } } },
+  ],
+  playEvents: [{
+    index: 4,
+    isPitch: true,
+    details: { description: 'In play, run(s)', hasReview: true },
+    reviewDetails: { inProgress: true, reviewType: 'NH' },
+  }],
+};
+const threeRunBoundaryFeed = {
+  gameData: {
+    status: { detailedState: 'In Review', abstractGameState: 'Live' },
+    teams: {
+      away: { id: 147, name: 'New York Yankees', abbreviation: 'NYY' },
+      home: { id: 111, name: 'Boston Red Sox', abbreviation: 'BOS' },
+    },
+  },
+  liveData: {
+    linescore: { teams: { away: { runs: 3 }, home: { runs: 0 } } },
+    plays: { allPlays: [{ about: { atBatIndex: 0 }, result: { awayScore: 0, homeScore: 0 } }], currentPlay: threeRunBoundary },
+  },
+};
+const activeBoundary = MLBReviews.extractReviews(threeRunBoundaryFeed).activeReview;
+assert.equal(activeBoundary.typeKey, 'boundary');
+assert.equal(activeBoundary.scoreImpact.runsAtRisk, 3);
+assert.equal(activeBoundary.scoreImpact.possibleScoreIfRemoved.away, 0);
+const boundaryDisplay = MLBReviews.scoreImpactPresentation(activeBoundary);
+assert.equal(boundaryDisplay.title, '3 RUNS AT RISK');
+assert.match(boundaryDisplay.detail, /NYY 3 – BOS 0/);
+assert.match(boundaryDisplay.detail, /NYY 0 – BOS 0/);
+assert.match(boundaryDisplay.note, /may also place runners/,
+  'HR-to-double runner placement is not predicted');
+
+// Observed NH foul shape: no scoring event means no invented run total. The
+// UI reports that score impact is pending instead of claiming a run removal.
+const activeFoulBoundary = JSON.parse(JSON.stringify(boundaryPlay));
+activeFoulBoundary.about.isComplete = false;
+activeFoulBoundary.playEvents[0].reviewDetails = { inProgress: true, reviewType: 'NH' };
+activeFoulBoundary.result.awayScore = 3;
+activeFoulBoundary.result.homeScore = 3;
+const activeFoulFeed = JSON.parse(JSON.stringify(boundaryFeed));
+activeFoulFeed.gameData.status = { detailedState: 'In Review', abstractGameState: 'Live' };
+activeFoulFeed.liveData.linescore = { teams: { away: { runs: 3 }, home: { runs: 3 } } };
+activeFoulFeed.liveData.plays = { allPlays: [], currentPlay: activeFoulBoundary };
+const activeFoul = MLBReviews.extractReviews(activeFoulFeed).activeReview;
+assert.equal(activeFoul.scoreImpact.runsAtRisk, 0);
+const foulDisplay = MLBReviews.scoreImpactPresentation(activeFoul);
+assert.equal(foulDisplay.title, 'BOUNDARY CALL — SCORE IMPACT PENDING');
+assert.match(foulDisplay.note, /no run-removal total is shown/i);
+
+// A run on an earlier action in the same PA is not attached to a later
+// event-level review: details.playIndex must match event.index.
+const unrelatedRunPlay = {
+  about: { atBatIndex: 2, inning: 2, halfInning: 'top', isComplete: false },
+  result: { event: 'Single', eventType: 'single', awayScore: 1, homeScore: 0, description: 'Play under review.' },
+  runners: [{
+    movement: { end: 'score', isOut: false },
+    details: { isScoringEvent: true, playIndex: 1, runner: { id: 9, fullName: 'Earlier Runner' } },
+  }],
+  playEvents: [{
+    index: 5, isPitch: true, details: { description: 'Ball', hasReview: true },
+    reviewDetails: { inProgress: true, reviewType: 'MJ', challengeTeamId: 147 },
+  }],
+};
+const unrelatedImpact = MLBReviews.deriveScoreImpact({
+  play: unrelatedRunPlay,
+  event: unrelatedRunPlay.playEvents[0],
+  typeKey: 'abs',
+  outcome: { key: 'in_progress' },
+  previousScore: { away: 0, home: 0 },
+  fallbackScore: null,
+  teamNames: {},
+  teamIdBySide: {},
+});
+assert.equal(unrelatedImpact.runsAtRisk, 0,
+  'an earlier run in the PA must not be assigned to the reviewed pitch');
+const scoreDeltaOnlyImpact = MLBReviews.deriveScoreImpact({
+  play: {
+    about: { atBatIndex: 3, halfInning: 'top' },
+    result: { event: 'Walk', eventType: 'walk', awayScore: 1, homeScore: 0 },
+    runners: [],
+  },
+  event: null,
+  typeKey: 'manager',
+  outcome: { key: 'in_progress' },
+  previousScore: { away: 0, home: 0 },
+  fallbackScore: null,
+  teamNames: {},
+  teamIdBySide: {},
+});
+assert.equal(scoreDeltaOnlyImpact.runsAtRisk, 0,
+  'a whole-PA score delta without a tied scoring-runner record is not enough');
+const earlierActionPlay = {
+  result: { event: 'Single', eventType: 'single' },
+  runners: [
+    { details: { event: 'Wild Pitch', eventType: 'wild_pitch', isScoringEvent: true, playIndex: 2 } },
+    { details: { event: 'Single', eventType: 'single', isScoringEvent: false, playIndex: 5 } },
+  ],
+};
+assert.equal(MLBReviews.reviewedScoringRunners(earlierActionPlay, null, 'manager').length, 0,
+  'play-level review excludes an earlier wild-pitch run in the same PA');
+assert.equal(MLBReviews.readScorePair({ awayScore: 6, homeScore: 5 }).away, 6);
+assert.equal(MLBReviews.readScorePair({ teams: { away: { runs: 3 }, home: { runs: 0 } } }).home, 0);
+assert.equal(MLBReviews.readScorePair({ awayScore: 6 }), null,
+  'partial score pairs are rejected rather than filled');
+
 /* -------------------------------------------------- 4. Scoreboard Inspection */
 
 const schedGameReview = {

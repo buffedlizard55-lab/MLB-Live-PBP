@@ -24,10 +24,18 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
     challenges, crew chief reviews, umpire reviews, ABS pitch challenges and
     boundary-call reviews (potential home runs / fair-foul at the wall) appear at the
     top of the feed as they happen, with game link, inning, challenging team, reason,
-    outcome, batter/pitcher context, and — for ABS — the pitch count before the
-    challenge, who challenged (batter / catcher / pitcher, from official play text
-    or the challenging team's batting/fielding side), and the count after the call
-    is overturned or stands. Includes an "Under Review" live strip, per-type
+    outcome, batter/pitcher context, and a **score-impact warning** when the call on
+    the field has already credited one or more runs. The warning shows the official
+    call-on-field score and the conditional score if all runs credited on that
+    reviewed event are removed (for example, `NYY 6 – BOS 5 → NYY 5 – BOS 5`). It is
+    explicitly a scenario, **not a prediction**: on a home-run/boundary review MLB
+    may instead place runners. A boundary review with no currently credited run says
+    “score impact pending” and does not invent a removal total. If the page observes
+    the same event resolve, it reports the actual official score change. For ABS,
+    the feed also shows the pitch count before the challenge, who challenged (batter /
+    catcher / pitcher, from official play text or the challenging team's batting/
+    fielding side), and the count after the call is overturned or stands. Includes
+    an "Under Review" live strip, per-type
     filters (All / ABS / Challenges / Reviews / Boundary Calls / Under Review),
     and summary stats for the whole day.
   - **Scoreboard Live Ticker & Alert Badges** — surfaces any game currently in review or challenge,
