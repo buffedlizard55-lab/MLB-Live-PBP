@@ -40,12 +40,22 @@ assert.equal(MLBReviews.normalizeType('Umpire Review', '').key, 'crew_chief');
 /* Real reviewType codes observed on statsapi.mlb.com (2026-08-19):
  *   MJ = ABS pitch challenge (games 823342, 823667, 824075)
  *   MA = manager challenge (game 823341, "Tigers challenged (tag play)…")
- *   MF = manager challenge (game 824075, "Royals challenged (play at 1st)…") */
+ *   MF = manager challenge (game 824075, "Royals challenged (play at 1st)…")
+ *   NH = boundary-call review, crew-chief-initiated potential home run /
+ *        fair-foul at the wall (game 824801, atBatIndex 57: Alonso's foul
+ *        ball down the line, call stands after review) */
 assert.equal(MLBReviews.normalizeType('MJ', 'Ball').key, 'abs');
 assert.equal(MLBReviews.normalizeType('MJ', 'Called Strike').label, 'ABS Challenge');
 assert.equal(MLBReviews.normalizeType('MJ', 'challenged (pitch result), call on the field was overturned').key, 'abs');
 assert.equal(MLBReviews.normalizeType('MA', 'Tigers challenged (tag play), call on the field was overturned').key, 'manager');
 assert.equal(MLBReviews.normalizeType('MF', 'Royals challenged (play at 1st), call on the field was overturned').key, 'manager');
+assert.equal(MLBReviews.normalizeType('NH', 'Foul').key, 'boundary');
+assert.equal(MLBReviews.normalizeType('NH', 'Foul').label, 'Boundary Call');
+// A bare "Foul" description only means a ball/strike topic for an ABS (MJ)
+// review — for a boundary (NH) review it is the boundary-call category.
+assert.equal(MLBReviews.extractReason('Foul'), 'Ball / Strike Call (ABS)');
+assert.equal(MLBReviews.extractReason('Foul', 'boundary'), 'Home Run / Boundary Call');
+assert.equal(MLBReviews.extractReason('Foul', 'abs'), 'Ball / Strike Call (ABS)');
 // Unknown codes must NOT be surfaced raw to users.
 assert.equal(MLBReviews.normalizeType('ZZ', 'Something happened').label, 'Replay Review');
 
@@ -301,6 +311,73 @@ assert.equal(realExtracted.summary.stands, 2);     // MJ-event(15,40) both stood
 assert.equal(realExtracted.summary.byType.abs, 3);
 assert.equal(realExtracted.summary.byType.manager, 2);
 
+/* ------------------- 3c. Boundary-call review (real shape, 2026-08-19) --- */
+
+// Game 824801 (NYY @ BAL), atBatIndex 57, bottom of the 7th, score tied 3-3.
+// Pete Alonso's drive down the left-field line was ruled FOUL; the umpires
+// initiated a crew-chief review and the call STOOD. Captured shape: the
+// review rides on the "Foul" PITCH event (details.hasReview:true,
+// reviewDetails.reviewType "NH", isOverturned:false) while the play's own
+// description carries no review text at all ("Pete Alonso strikes out
+// swinging."). This is the observed boundary-call pattern: a bare pitch
+// description must NOT be labeled as an ABS ball/strike topic here.
+const boundaryPlay = {
+  about: { atBatIndex: 57, inning: 7, halfInning: 'bottom', hasReview: false, isComplete: true },
+  result: { description: 'Pete Alonso strikes out swinging.', event: 'Strikeout' },
+  count: { balls: 1, strikes: 3, outs: 3 },
+  matchup: { batter: { id: 624413, fullName: 'Pete Alonso' }, pitcher: { id: 687396, fullName: 'Brent Headrick' } },
+  playEvents: [
+    {
+      isPitch: true,
+      startTime: '2026-08-20T01:00:27.963Z',
+      details: { call: { code: 'F', description: 'Foul' }, description: 'Foul', hasReview: true },
+      reviewDetails: { isOverturned: false, inProgress: false, reviewType: 'NH' },
+    },
+    { isPitch: true, details: { description: 'Swinging Strike' } },
+  ],
+};
+
+const boundaryFeed = {
+  gameData: {
+    status: { detailedState: 'Final', abstractGameState: 'Final' },
+    teams: {
+      away: { id: 147, name: 'New York Yankees', abbreviation: 'NYY' },
+      home: { id: 110, name: 'Baltimore Orioles', abbreviation: 'BAL' },
+    },
+  },
+  liveData: { plays: { allPlays: [boundaryPlay], currentPlay: null } },
+};
+const boundaryExtracted = MLBReviews.extractReviews(boundaryFeed);
+assert.equal(boundaryExtracted.reviews.length, 1, 'the NH boundary review extracts as one entry');
+const nh = boundaryExtracted.reviews[0];
+assert.equal(nh.typeKey, 'boundary');
+assert.equal(nh.reviewType, 'Boundary Call');
+assert.equal(nh.outcome, 'stands');           // isOverturned:false — call stood
+assert.equal(nh.outcomeLabel, 'Call Stands');
+assert.equal(nh.reason, 'Home Run / Boundary Call', 'bare "Foul" is NOT labeled an ABS ball/strike topic');
+assert.equal(nh.batter.fullName, 'Pete Alonso');
+assert.equal(nh.teamId, null, 'crew-chief-initiated: no challengeTeamId on the observed shape');
+assert.equal(boundaryExtracted.summary.byType.boundary, 1);
+assert.equal(MLBReviews.absContextLines(nh).length, 0, 'boundary reviews render no ABS count context');
+
+// A boundary review and an ABS challenge on the SAME play stay separate
+// entries (map key is atBatIndex:typeKey).
+const dualBoundaryPlay = JSON.parse(JSON.stringify(boundaryPlay));
+dualBoundaryPlay.about.atBatIndex = 58;
+dualBoundaryPlay.playEvents.push({
+  isPitch: true,
+  details: { description: 'Ball', hasReview: true },
+  reviewDetails: { isOverturned: true, inProgress: false, reviewType: 'MJ', challengeTeamId: 110 },
+});
+const dualBoundaryFeed = JSON.parse(JSON.stringify(boundaryFeed));
+dualBoundaryFeed.liveData.plays.allPlays = [dualBoundaryPlay];
+const dualBoundaryExtracted = MLBReviews.extractReviews(dualBoundaryFeed);
+assert.equal(dualBoundaryExtracted.reviews.length, 2, 'NH boundary + MJ ABS on one play = 2 entries');
+assert.ok(dualBoundaryExtracted.reviews.some((r) => r.typeKey === 'boundary'));
+assert.ok(dualBoundaryExtracted.reviews.some((r) => r.typeKey === 'abs'));
+assert.equal(dualBoundaryExtracted.summary.byType.boundary, 1);
+assert.equal(dualBoundaryExtracted.summary.byType.abs, 1);
+
 /* -------------------------------------------------- 4. Scoreboard Inspection */
 
 const schedGameReview = {
@@ -353,7 +430,8 @@ assert.equal(schedExtracted.reviews[0].teamAbbrev, null, 'no fabricated abbrevia
 // extracted entries (synthetic §3 feed + real-shaped §3b feed) for the
 // literal string "undefined" leaking into any rendered field.
 const RENDERED_FIELDS = ['reviewType', 'reason', 'description', 'outcomeLabel', 'teamName', 'inningLabel'];
-const allReviews = [...extracted.reviews, ...realExtracted.reviews, ...schedExtracted.reviews];
+const allReviews = [...extracted.reviews, ...realExtracted.reviews, ...schedExtracted.reviews,
+  ...boundaryExtracted.reviews, ...dualBoundaryExtracted.reviews];
 assert.ok(allReviews.length > 0, 'fixtures produced reviews to sweep');
 for (const r of allReviews) {
   for (const field of RENDERED_FIELDS) {

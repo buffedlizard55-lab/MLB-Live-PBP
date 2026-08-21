@@ -1349,6 +1349,7 @@ a:hover { text-decoration: underline; }
 .chip-manager { background: rgba(47, 129, 247, 0.2); color: #74c0fc; border: 1px solid rgba(47, 129, 247, 0.45); }
 .chip-crew_chief { background: rgba(167, 139, 250, 0.2); color: #c4b5fd; border: 1px solid rgba(167, 139, 250, 0.45); }
 .chip-abs { background: rgba(251, 146, 60, 0.2); color: #fdba74; border: 1px solid rgba(251, 146, 60, 0.45); }
+.chip-boundary { background: rgba(210, 153, 34, 0.2); color: #ffd43b; border: 1px solid rgba(210, 153, 34, 0.5); }
 .chip-rules { background: rgba(139, 160, 186, 0.18); color: var(--muted); border: 1px solid var(--line); }
 .chip-review { background: rgba(224, 49, 49, 0.18); color: #ff8787; border: 1px solid rgba(224, 49, 49, 0.45); }
 
@@ -1559,6 +1560,7 @@ a:hover { text-decoration: underline; }
 .feed-type-abs { border-left: 4px solid #fb923c; }
 .feed-type-manager { border-left: 4px solid #2f81f7; }
 .feed-type-crew_chief { border-left: 4px solid #a78bfa; }
+.feed-type-boundary { border-left: 4px solid #d29922; }
 .feed-outcome-overturned { border-left-color: var(--green); }
 .feed-outcome-stands { border-left-color: var(--yellow); }
 
@@ -1679,6 +1681,7 @@ a:hover { text-decoration: underline; }
 /* Stat accent colors used on the feed page */
 .stat-abs .review-stat-value { color: #fdba74; }
 .stat-manager .review-stat-value { color: #74c0fc; }
+.stat-boundary .review-stat-value { color: #ffd43b; }
 
 /* Mobile: stack time above the body */
 @media (max-width: 560px) {
