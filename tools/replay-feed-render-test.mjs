@@ -303,6 +303,53 @@ collectStrings(registry['#active-strip'], activeStripStrings);
 assert.ok(activeStripStrings.includes('1 RUN AT RISK'),
   `active strip includes score risk, got: ${JSON.stringify(activeStripStrings)}`);
 
+/* 4d. RUN-AT-RISK surfaces. The deterministic active review credits exactly
+ * one scoring movement (playIndex 2) to the reviewed event, so a run already
+ * on the scoreboard could come off — this is the state the user asked to be
+ * alerted about, and it must be visible everywhere at once. */
+
+// The feed row is flagged and badged.
+assert.ok(impactRecord.row.cls.includes('feed-row-run-risk'),
+  `at-risk feed row carries the urgent class, got: ${impactRecord.row.cls}`);
+const riskBadge = findIn(impactRecord.row, '.feed-run-risk-badge');
+assert.ok(riskBadge, 'at-risk feed row renders a run-at-risk badge');
+assert.equal(riskBadge.text, '⚠️ 1 RUN AT RISK');
+// The ABS row credits no run, so it must NOT be flagged.
+assert.ok(!absRecord.row.cls.includes('feed-row-run-risk'),
+  'a row with no credited run is never flagged as at-risk');
+assert.equal(findIn(absRecord.row, '.feed-run-risk-badge'), null);
+
+// The persistent banner sits above the active strip with the observed scores.
+const banner = findIn(registry['#active-strip'], '.run-risk-banner');
+assert.ok(banner, 'run-at-risk banner renders above the feed');
+const bannerBlob = collectStrings(banner, []).join(' | ');
+assert.match(bannerBlob, /1 RUN AT RISK/);
+assert.match(bannerBlob, /An active review could remove a run already on the scoreboard/);
+assert.match(bannerBlob, /Detroit Tigers @ Pittsburgh Pirates/);
+assert.match(bannerBlob, /Manager Challenge/);
+// Scores come straight from the payload (away 3 / home 1, minus the one run).
+assert.match(bannerBlob, /Call stands: DET 3 – PIT 1 · If removed: DET 2 – PIT 1/);
+assert.match(bannerBlob, /DET scored the run/);
+assert.match(bannerBlob, /Credited: Test Runner/);
+assert.match(bannerBlob, /not predicted here/,
+  'the banner states plainly that the ruling is not predicted');
+assert.ok(!bannerBlob.includes('undefined'), `banner leaked "undefined": ${bannerBlob}`);
+
+// The stats bar counts it.
+const statStrings = collectStrings(registry['#feed-stats'], []);
+assert.ok(statStrings.includes('Runs at Risk'), `stats bar shows the Runs at Risk stat, got: ${JSON.stringify(statStrings)}`);
+const runRiskStat = findIn(registry['#feed-stats'], '.stat-run-risk');
+assert.ok(runRiskStat, 'Runs at Risk stat has its urgent class');
+assert.equal(findIn(runRiskStat, '.review-stat-value').text, '1');
+
+// The public API exposes the tracked state for the alerting path.
+assert.equal(context.window.ReplayFeed.getRunsAtRisk(), 1);
+const riskEvents = context.window.ReplayFeed.getRunRiskEvents();
+assert.equal(riskEvents.length, 1);
+assert.equal(riskEvents[0].runs, 1);
+assert.equal(riskEvents[0].gamePk, 823342);
+assert.equal(riskEvents[0].matchup, 'Detroit Tigers @ Pittsburgh Pirates');
+
 // 4c. The Boundary Calls filter tab renders with the setFilter wiring the
 // other tabs use (observed typeKey 'boundary' — see tools/review-test.mjs §3c).
 const tabsNode = registry['#feed-tabs'];
@@ -315,6 +362,19 @@ assert.ok(tabStrings.some((s) => s === "ReplayFeed.setFilter('boundary')"),
 assert.ok(tabStrings.some((s) => /^ABS \(1\)$/.test(s)), 'captured ABS tab count');
 assert.ok(tabStrings.some((s) => /^Challenges \(1\)$/.test(s)), 'active manager-review tab count');
 assert.ok(tabStrings.some((s) => /^● Under Review \(1\)$/.test(s)), 'active review tab count');
+assert.ok(tabStrings.some((s) => /^⚠️ Runs at Risk \(1\)$/.test(s)),
+  `Runs at Risk filter tab renders with its count, got: ${JSON.stringify(tabStrings)}`);
+assert.ok(tabStrings.some((s) => s === "ReplayFeed.setFilter('runrisk')"),
+  "Runs at Risk tab wires ReplayFeed.setFilter('runrisk')");
+
+// 4e. The Runs at Risk filter shows only the at-risk event.
+context.window.ReplayFeed.setFilter('runrisk');
+const riskRows = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
+assert.equal(riskRows.length, 1, 'the runrisk filter shows only the at-risk row');
+assert.match(collectStrings(riskRows[0], []).join(' | '), /1 RUN AT RISK/);
+context.window.ReplayFeed.setFilter('all');
+assert.equal(registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row')).length, 2,
+  'switching back to All restores every row');
 
 // 5. Whole-page sweep: stats bar, tabs, active strip, status line included.
 const everything = [];

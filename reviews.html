@@ -24,7 +24,8 @@
     </div>
     <div id="date-label" class="date-label"></div>
     <div class="feed-controls">
-      <button id="sound-toggle-btn" class="btn btn-ghost" title="Toggle alert sound — a gentle raindrop chime for challenges/reviews/boundary calls (not ABS)">🔇 Sound Off</button>
+      <button id="sound-toggle-btn" class="btn btn-ghost" title="Toggle alert sound — a gentle raindrop chime for challenges/reviews/boundary calls (not ABS), plus an urgent two-tone siren whenever an active review could remove a run already on the scoreboard">🔇 Sound Off</button>
+      <button id="notify-toggle-btn" class="btn btn-ghost" title="Toggle desktop notifications for run-at-risk reviews — a popup the moment an active review could take a run off the scoreboard">⚪ Run Alerts Off</button>
       <button id="refresh-btn" class="btn">Refresh</button>
       <span class="countdown" id="countdown" title="Seconds until the next poll"></span>
       <div class="live-pill" title="Polling the MLB StatsAPI">
@@ -57,6 +58,10 @@
       conditional possibilities, and an attributable official score after resolution when exposed.
       Possibilities use only runs tied to the reviewed event and are not predictions of the ruling
       or runner placement.
+      A review is flagged <strong>Runs at Risk</strong> only when the official payload credits one or
+      more scoring movements to the very event under review, so an overturn could take those runs
+      back off the scoreboard. Unrelated runs from earlier in the same plate appearance (a steal of
+      home, a wild pitch) are excluded, and whether replay actually removes a run is never predicted.
       Not affiliated with MLB or MLB Advanced Media.
     </p>
   </footer>

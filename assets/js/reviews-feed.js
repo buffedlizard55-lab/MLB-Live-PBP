@@ -420,6 +420,83 @@ function shouldAlertForReview(review) {
   return review.typeKey !== 'abs';
 }
 
+/**
+ * Runs currently on the scoreboard that THIS review could take back off.
+ *
+ * Mirrors MLBReviews.runsRemovableByReview() exactly, but is self-contained so
+ * the feed's pure-helper layer (and its Node tests) never depend on reviews.js
+ * being loaded. Both read the very same observed fields:
+ *
+ *   review.inProgress                    — the review has not resolved yet
+ *   scoreImpact.runsCredited             — scoring movements StatsAPI ties to
+ *                                          the reviewed event (see
+ *                                          reviewedScoringRunners())
+ *   scoreImpact.runsAtRisk /
+ *   scoreImpact.runsAtRiskAtStart        — the same count captured on the first
+ *                                          poll that saw the review active
+ *
+ * The largest positive finite candidate wins: reconcileScoreImpact() keeps the
+ * FIRST observed snapshot, so `runsAtRiskAtStart` can still read 0 on a poll
+ * where the runner records have only just appeared, and a run that shows up
+ * late must not be silently dropped from the alert.
+ *
+ * Nothing here is a prediction and nothing is inferred from a score delta: a
+ * run is "at risk" only because the official payload credited it to the play
+ * that is under review. Returns 0 for resolved reviews and malformed input.
+ */
+function runsRemovableFromReview(review) {
+  if (!review) return 0;
+  if (review.inProgress !== true) return 0;
+  const impact = review.scoreImpact;
+  if (!impact || typeof impact !== 'object') return 0;
+  const candidates = [
+    impact.runsAtRiskAtStart,
+    impact.runsAtRisk,
+    impact.runsCredited,
+  ].filter((n) => typeof n === 'number' && Number.isFinite(n) && n > 0);
+  if (!candidates.length) return 0;
+  return Math.max(...candidates);
+}
+
+/**
+ * Whether a review deserves the URGENT alert (a run already on the scoreboard
+ * could be removed). Deliberately independent of shouldAlertForReview():
+ * the soft chime skips routine ABS pitch challenges, but the run-removal
+ * alert is driven purely by whether runs are tied to the reviewed event, so
+ * every review type — manager challenge, crew chief/umpire review, boundary
+ * call, "under review" status entry, ABS — is eligible.
+ */
+function shouldRunRiskAlert(review) {
+  return runsRemovableFromReview(review) > 0;
+}
+
+/**
+ * Diff two polls of the tracked run-risk keys.
+ *
+ * `previousKeys` is the set of event keys that already raised the alert;
+ * `entries` is every feed entry currently known across the whole slate (the
+ * caller runs this once per poll, not once per game, so a re-keyed entry is
+ * reconciled in a single pass). Returns the keys that newly became risky
+ * (`started`), the keys that are no longer risky or no longer exist
+ * (`cleared`), and the full next set. Pure so the "don't re-alert on every
+ * poll" behaviour is directly testable.
+ */
+function diffRunRiskKeys(previousKeys, entries, keyOf) {
+  const prev = previousKeys instanceof Set ? previousKeys : new Set(previousKeys || []);
+  const next = new Set();
+  const started = [];
+  (entries || []).forEach((entry) => {
+    if (!entry) return;
+    const key = keyOf(entry);
+    if (!key) return;
+    if (!shouldRunRiskAlert(entry.review)) return;
+    next.add(key);
+    if (!prev.has(key)) started.push(key);
+  });
+  const cleared = [...prev].filter((key) => !next.has(key));
+  return { started, cleared, next };
+}
+
 /* ------------------------------------------------------------ page logic */
 
 (() => {
@@ -456,11 +533,30 @@ function shouldAlertForReview(review) {
   let audioContext = null;
   let lastAlertAt = 0;
 
+  // --- Run-at-risk alert state (URGENT: a run already on the scoreboard could
+  // be removed by an active review). Tracked separately from the soft chime:
+  // it has its own sound, its own cooldown, and it fires for every review type
+  // including ABS. `alertedRunRiskKeys` holds the event keys that have already
+  // sounded so a still-running review does not re-alert on every 1s poll; a
+  // key is dropped again the moment the review resolves or stops being risky,
+  // so a genuinely new review on the same play can alert again.
+  const alertedRunRiskKeys = new Set();
+  let pendingRunRiskAlerts = [];
+  let lastRunRiskAlertAt = 0;
+  let notifyEnabled = false;
+
   try {
     const stored = typeof localStorage !== 'undefined' ? localStorage.getItem('replayFeedSoundEnabled') : null;
     audioEnabled = stored === '1' || stored === 'true';
   } catch (_) {
     audioEnabled = false;
+  }
+
+  try {
+    const stored = typeof localStorage !== 'undefined' ? localStorage.getItem('replayFeedNotifyEnabled') : null;
+    notifyEnabled = stored === '1' || stored === 'true';
+  } catch (_) {
+    notifyEnabled = false;
   }
 
   function todayStr() {
@@ -481,6 +577,8 @@ function shouldAlertForReview(review) {
     settledGames = new Set();
     isFirstLoad = true;
     pendingAlertableCount = 0;
+    alertedRunRiskKeys.clear();
+    pendingRunRiskAlerts = [];
   }
 
   function $ (sel) { return document.querySelector(sel); }
@@ -616,6 +714,151 @@ function shouldAlertForReview(review) {
     }
   }
 
+  /**
+   * URGENT alert: a run that is already on the scoreboard could be taken off
+   * by an active review. Deliberately NOT the soft raindrop chime — this one
+   * has to cut through, because it is the one event the user asked to hear
+   * about "ASAP".
+   *
+   * Sound design (distinct from the chime in rhythm, pitch and length):
+   *   - A two-tone alternating siren: six fast staccato pulses swapping
+   *     between two pitches a minor third apart, the pattern the ear reads as
+   *     an alarm rather than a notification.
+   *   - Each pulse is a steady-pitch sine with a hard 8ms attack and a short
+   *     exponential release, so the pattern stays crisp instead of smearing.
+   *   - A low sine "thud" underpins the first pulse for weight.
+   *   - Sine oscillators only (same no-buzz rule as the chime) at a higher but
+   *     still bounded peak. ~1.45s total, then silence.
+   */
+  function playRunRiskAlertSound() {
+    if (!audioEnabled) return;
+    const nowMs = Date.now();
+    // Own cooldown, independent of the soft chime's, so a run-risk alert is
+    // never swallowed by an ordinary review chime that just played. Kept just
+    // above the ~1.45s sound length: two different games going at risk one
+    // poll apart should still both be heard.
+    if (nowMs - lastRunRiskAlertAt < 1600) return;
+    lastRunRiskAlertAt = nowMs;
+
+    try {
+      const ctx = ensureAudioContext();
+      if (!ctx) return;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const t0 = ctx.currentTime;
+      const PEAK = 0.3; // louder than the chime's 0.24, still a bounded level.
+      const PULSE = 0.12;   // pulse-to-pulse spacing
+      const PULSES = 6;
+      const END = PULSE * PULSES + 0.55;
+
+      const master = ctx.createGain();
+      master.gain.setValueAtTime(0, t0);
+      master.gain.linearRampToValueAtTime(1, t0 + 0.005);
+      master.gain.setValueAtTime(1, t0 + END - 0.12);
+      master.gain.linearRampToValueAtTime(0, t0 + END);
+      master.connect(ctx.destination);
+
+      // One staccato siren pulse at a fixed pitch.
+      const pulse = (startAt, hz, level, hold) => {
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(hz, startAt);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0, startAt);
+        g.gain.linearRampToValueAtTime(level, startAt + 0.008);
+        g.gain.setValueAtTime(level, startAt + hold);
+        g.gain.exponentialRampToValueAtTime(0.0001, startAt + hold + 0.06);
+        g.gain.setValueAtTime(0, startAt + hold + 0.07);
+        osc.connect(g);
+        osc.start(startAt);
+        osc.stop(startAt + hold + 0.08);
+        return g;
+      };
+
+      // Two-tone alternation: A5 (880) / C6 (1047) — a minor third apart.
+      for (let i = 0; i < PULSES; i += 1) {
+        const hz = i % 2 === 0 ? 880 : 1047;
+        pulse(t0 + i * PULSE, hz, PEAK, 0.055).connect(master);
+      }
+
+      // Low body under the first two pulses so the alert has weight even on
+      // laptop speakers that roll off the siren tones.
+      pulse(t0, 220, PEAK * 0.55, 0.2).connect(master);
+
+      // Closing accent: the two siren tones held together, decaying out, so
+      // the alert has an unmistakable "that was the big one" tail.
+      const tailAt = t0 + PULSE * PULSES + 0.04;
+      const tail = (hz, level) => {
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(hz, tailAt);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0, tailAt);
+        g.gain.linearRampToValueAtTime(level, tailAt + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + END - 0.02);
+        g.gain.setValueAtTime(0, t0 + END - 0.01);
+        osc.connect(g);
+        osc.start(tailAt);
+        osc.stop(t0 + END);
+        return g;
+      };
+      tail(880, PEAK * 0.9).connect(master);
+      tail(1047, PEAK * 0.6).connect(master);
+
+      setTimeout(() => {
+        try { master.disconnect(); } catch (_) {}
+      }, Math.round((END + 0.4) * 1000));
+    } catch (err) {
+      console.warn('run-risk alert sound failed', err);
+    }
+  }
+
+  /**
+   * Desktop notification for a run-at-risk event. Only fires when the user has
+   * explicitly turned notifications on AND the browser has granted permission;
+   * silently does nothing anywhere else (including Node/test contexts, where
+   * `Notification` is undefined). Body text is built from observed payload
+   * fields only — see MLBReviews.runRiskSummary().
+   */
+  function notifyRunRisk(entries) {
+    if (!notifyEnabled || !entries || !entries.length) return;
+    if (typeof Notification === 'undefined') return;
+    if (Notification.permission !== 'granted') return;
+    try {
+      const first = entries[0];
+      const summary = window.MLBReviews && window.MLBReviews.runRiskSummary
+        ? window.MLBReviews.runRiskSummary(first.review)
+        : null;
+      const total = entries.reduce((sum, e) => sum + runsRemovableFromReview(e.review), 0);
+      const title = entries.length === 1
+        ? `⚠️ ${summary ? summary.headline : 'RUN AT RISK'}`
+        : `⚠️ ${total} ${total === 1 ? 'RUN' : 'RUNS'} AT RISK in ${entries.length} games`;
+      const lines = [
+        matchupFor(first, games.find((g) => g.gamePk === first.gamePk) || null),
+        first.review && first.review.reviewType,
+        summary && summary.startScore
+          ? (summary.possibleScore
+            ? `Call stands: ${summary.startScore} · If removed: ${summary.possibleScore}`
+            : `Score when review started: ${summary.startScore}`)
+          : null,
+      ].filter(Boolean);
+      const note = new Notification(title, {
+        body: lines.join('\n'),
+        tag: 'mlb-replay-run-risk',
+        renotify: true,
+      });
+      note.onclick = () => {
+        try {
+          window.focus();
+          window.location.href = `game.html?gamePk=${first.gamePk}`;
+        } catch (_) {}
+      };
+    } catch (err) {
+      console.warn('run-risk notification failed', err);
+    }
+  }
+
   function updateSoundToggleUI() {
     const btn = $('#sound-toggle-btn');
     if (!btn) return;
@@ -623,12 +866,80 @@ function shouldAlertForReview(review) {
       btn.textContent = '🔔 Sound On';
       btn.classList.add('btn-sound-on');
       btn.classList.remove('btn-ghost');
-      btn.title = 'Alert sound ON — gentle raindrop chime for challenges/reviews/boundary calls (not ABS). Click to mute.';
+      btn.title = 'Alert sound ON — gentle raindrop chime for challenges/reviews/boundary calls (not ABS), plus an urgent two-tone siren whenever an active review could take a run OFF the scoreboard (any review type, ABS included). Click to mute.';
     } else {
       btn.textContent = '🔇 Sound Off';
       btn.classList.remove('btn-sound-on');
       btn.classList.add('btn-ghost');
-      btn.title = 'Alert sound OFF — click to enable the gentle raindrop chime for challenges/reviews/boundary calls';
+      btn.title = 'Alert sound OFF — click to enable the gentle raindrop chime for challenges/reviews/boundary calls and the urgent run-at-risk siren';
+    }
+  }
+
+  function updateNotifyToggleUI() {
+    const btn = $('#notify-toggle-btn');
+    if (!btn) return;
+    const granted = typeof Notification !== 'undefined' && Notification.permission === 'granted';
+    const denied = typeof Notification !== 'undefined' && Notification.permission === 'denied';
+    if (typeof Notification === 'undefined') {
+      btn.textContent = '🔕 No Alerts';
+      btn.classList.add('btn-ghost');
+      btn.classList.remove('btn-sound-on');
+      btn.title = 'This browser does not support desktop notifications.';
+      return;
+    }
+    if (notifyEnabled && granted) {
+      btn.textContent = '🔴 Run Alerts On';
+      btn.classList.add('btn-sound-on');
+      btn.classList.remove('btn-ghost');
+      btn.title = 'Desktop notification ON — you get a popup the moment a review could remove a run already on the scoreboard. Click to turn off.';
+    } else {
+      btn.textContent = '⚪ Run Alerts Off';
+      btn.classList.remove('btn-sound-on');
+      btn.classList.add('btn-ghost');
+      btn.title = denied
+        ? 'Desktop notifications are blocked for this site in your browser settings.'
+        : 'Desktop notifications OFF — click to be popped up the moment a review could remove a run from the score.';
+    }
+  }
+
+  function setNotifyEnabled(enabled) {
+    const want = !!enabled;
+    const persist = () => {
+      try {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem('replayFeedNotifyEnabled', notifyEnabled ? '1' : '0');
+        }
+      } catch (_) {}
+      updateNotifyToggleUI();
+    };
+    if (!want || typeof Notification === 'undefined') {
+      notifyEnabled = want && typeof Notification !== 'undefined';
+      persist();
+      return;
+    }
+    if (Notification.permission === 'granted') {
+      notifyEnabled = true;
+      persist();
+      return;
+    }
+    if (Notification.permission === 'denied') {
+      notifyEnabled = false;
+      persist();
+      return;
+    }
+    // Permission prompt must happen on the user gesture that got us here.
+    try {
+      const result = Notification.requestPermission((p) => {
+        notifyEnabled = p === 'granted';
+        persist();
+      });
+      if (result && typeof result.then === 'function') {
+        result.then((p) => { notifyEnabled = p === 'granted'; persist(); })
+          .catch(() => { notifyEnabled = false; persist(); });
+      }
+    } catch (_) {
+      notifyEnabled = false;
+      persist();
     }
   }
 
@@ -662,6 +973,7 @@ function shouldAlertForReview(review) {
     const statusLine = $('#status-line');
     setLivePulse(true);
     pendingAlertableCount = 0;
+    pendingRunRiskAlerts = [];
 
     try {
       const scheduleGames = await MLB.getSchedule(requestDate);
@@ -700,9 +1012,24 @@ function shouldAlertForReview(review) {
       });
       if (requestDate !== dateStr) return;
 
-      // If this poll discovered new non-ABS events and it's not the very first
-      // load (initial page population), play the gentle raindrop chime.
-      if (!isFirstLoad && pendingAlertableCount > 0 && audioEnabled) {
+      // Run-at-risk scan. Done once per poll across the WHOLE slate (not per
+      // game) so a key that moved games/re-keyed is reconciled in one pass,
+      // and so one poll produces at most one urgent alert no matter how many
+      // games report at the same instant.
+      syncRunRiskTracking();
+
+      // Priority order: if any run is newly at risk, that is the alert the
+      // user asked for — it plays instead of (never on top of) the soft chime.
+      // Unlike the soft chime this DOES fire on the very first load: only a
+      // still-active review can put a run at risk, so there is no backlog of
+      // historical events to blast through, and a live run-removal review is
+      // exactly what the user wants to hear about the moment the page opens.
+      if (pendingRunRiskAlerts.length) {
+        if (audioEnabled) playRunRiskAlertSound();
+        notifyRunRisk(pendingRunRiskAlerts);
+      } else if (!isFirstLoad && pendingAlertableCount > 0 && audioEnabled) {
+        // If this poll discovered new non-ABS events and it's not the very
+        // first load (initial page population), play the raindrop chime.
         playAlertSound();
       }
       isFirstLoad = false;
@@ -791,6 +1118,42 @@ function shouldAlertForReview(review) {
     }
   }
 
+  /* -------------------------------------------------- run-at-risk tracking */
+
+  /** Every feed entry whose active review could remove a run, newest first. */
+  function runRiskEntries() {
+    const list = [];
+    feedState.seen.forEach((entry) => {
+      if (runsRemovableFromReview(entry.review) > 0) list.push(entry);
+    });
+    return sortFeedEntries(list);
+  }
+
+  /** Total runs currently at risk across the whole slate. */
+  function runRiskTotal() {
+    return runRiskEntries().reduce((sum, e) => sum + runsRemovableFromReview(e.review), 0);
+  }
+
+  /**
+   * Reconcile `alertedRunRiskKeys` with the current feed state and stage any
+   * newly-risky entries for this poll's alert.
+   *
+   * A key is added when its review first shows runs at risk and removed as
+   * soon as it resolves, stops being risky, or disappears from the feed — so
+   * a long review alerts once, not once per second, while a genuinely new
+   * risky review always alerts.
+   */
+  function syncRunRiskTracking() {
+    const entries = [...feedState.seen.values()];
+    const keyOf = (entry) => buildEventKey(entry.gamePk, entry.review);
+    const diff = diffRunRiskKeys(alertedRunRiskKeys, entries, keyOf);
+    diff.cleared.forEach((key) => alertedRunRiskKeys.delete(key));
+    diff.next.forEach((key) => alertedRunRiskKeys.add(key));
+    if (!diff.started.length) return;
+    const started = new Set(diff.started);
+    pendingRunRiskAlerts = entries.filter((entry) => started.has(keyOf(entry)));
+  }
+
   /* ------------------------------------------------------------ rendering */
 
   function render() {
@@ -820,10 +1183,20 @@ function shouldAlertForReview(review) {
     if (inProgress.length) {
       wrap.appendChild(stat('Under Review', inProgress.length, 'stat-active-pulse'));
     }
+    // Runs that active reviews could take back off the scoreboard right now.
+    // Only shown when there is something to show — a 0 here is noise.
+    const atRisk = runRiskTotal();
+    if (atRisk > 0) {
+      const item = stat('Runs at Risk', atRisk, 'stat-run-risk');
+      item.title = 'Runs already credited on the scoreboard that an active review could remove. ' +
+        'Counted only from scoring movements the official payload ties to the reviewed event.';
+      wrap.appendChild(item);
+    }
   }
 
   function renderActiveStrip() {
     const wrap = UI.clear($('#active-strip'));
+    renderRunRiskBanner(wrap);
     const activeGames = new Map();
 
     feedState.seen.forEach((entry, key) => {
@@ -859,11 +1232,89 @@ function shouldAlertForReview(review) {
       }
       if (entries.length && window.MLBReviews && window.MLBReviews.scoreImpactPresentation) {
         const impact = window.MLBReviews.scoreImpactPresentation(entries[0].review);
-        if (impact) item.appendChild(el('span', 'feed-active-impact', impact.title));
+        if (impact) {
+          const riskCls = runsRemovableFromReview(entries[0].review) > 0
+            ? ' feed-active-impact-risk'
+            : '';
+          item.appendChild(el('span', `feed-active-impact${riskCls}`, impact.title));
+        }
+      }
+      if (entries.some((e) => runsRemovableFromReview(e.review) > 0)) {
+        item.classList.add('feed-active-link-risk');
       }
       bar.appendChild(item);
     });
     wrap.appendChild(bar);
+  }
+
+  /**
+   * Top-of-page banner: every game where an active review could take a run
+   * back off the scoreboard. This is the persistent visual half of the "alert
+   * me ASAP" requirement — the siren fires once, this stays up for as long as
+   * the run is actually at risk and disappears the moment the review resolves.
+   *
+   * Every number and score printed here comes from MLBReviews.runRiskSummary(),
+   * i.e. straight from the observed payload. When the payload does not support
+   * an alternate score, that half of the line is simply omitted rather than
+   * being guessed.
+   */
+  function renderRunRiskBanner(wrap) {
+    const entries = runRiskEntries();
+    if (!entries.length) return;
+    const total = entries.reduce((sum, e) => sum + runsRemovableFromReview(e.review), 0);
+
+    const banner = el('div', 'run-risk-banner');
+    const head = el('div', 'run-risk-banner-head');
+    head.appendChild(el('span', 'run-risk-siren', '⚠️'));
+    head.appendChild(el('strong', 'run-risk-headline',
+      `${total} ${total === 1 ? 'RUN' : 'RUNS'} AT RISK`));
+    head.appendChild(el('span', 'run-risk-sub',
+      entries.length === 1
+        ? 'An active review could remove a run already on the scoreboard'
+        : `Active reviews in ${entries.length} games could remove runs already on the scoreboard`));
+    banner.appendChild(head);
+
+    const list = el('div', 'run-risk-list');
+    entries.forEach((entry) => {
+      const game = games.find((g) => g.gamePk === entry.gamePk) || null;
+      const summary = window.MLBReviews && window.MLBReviews.runRiskSummary
+        ? window.MLBReviews.runRiskSummary(entry.review)
+        : null;
+      const runs = summary ? summary.runs : runsRemovableFromReview(entry.review);
+      const item = el('a', 'run-risk-item', '', {
+        href: `game.html?gamePk=${entry.gamePk}`,
+        title: `Open game — ${matchupFor(entry, game)}`,
+      });
+      item.appendChild(el('span', 'run-risk-count',
+        `${runs} ${runs === 1 ? 'RUN' : 'RUNS'}`));
+      item.appendChild(el('span', 'run-risk-game', matchupFor(entry, game)));
+      if (entry.review.reviewType) {
+        item.appendChild(el('span', 'run-risk-type', entry.review.reviewType));
+      }
+      if (entry.review.inningLabel) {
+        item.appendChild(el('span', 'run-risk-inn', entry.review.inningLabel));
+      }
+      if (summary && summary.teamLabel) {
+        item.appendChild(el('span', 'run-risk-team',
+          `${summary.teamLabel} scored the run${runs === 1 ? '' : 's'}`));
+      }
+      if (summary && summary.startScore) {
+        item.appendChild(el('span', 'run-risk-score',
+          summary.possibleScore
+            ? `Call stands: ${summary.startScore} · If removed: ${summary.possibleScore}`
+            : `Score when review started: ${summary.startScore}`));
+      }
+      if (summary && summary.runnerNames.length) {
+        item.appendChild(el('span', 'run-risk-runners',
+          `Credited: ${summary.runnerNames.join(', ')}`));
+      }
+      list.appendChild(item);
+    });
+    banner.appendChild(list);
+    banner.appendChild(el('div', 'run-risk-note',
+      'Runs are counted only from scoring movements the official play payload ties to the reviewed ' +
+      'event. Whether replay actually removes them is not predicted here.'));
+    wrap.appendChild(banner);
   }
 
   function renderTabs() {
@@ -875,6 +1326,7 @@ function shouldAlertForReview(review) {
       crew: entries.filter((e) => e.review.typeKey === 'crew_chief').length,
       boundary: entries.filter((e) => e.review.typeKey === 'boundary').length,
       live: entries.filter((e) => e.review.inProgress).length,
+      runrisk: entries.filter((e) => runsRemovableFromReview(e.review) > 0).length,
     };
     const tabs = [
       ['all', `All (${counts.all})`],
@@ -883,11 +1335,13 @@ function shouldAlertForReview(review) {
       ['crew', `Reviews (${counts.crew})`],
       ['boundary', `Boundary Calls (${counts.boundary})`],
       ['live', `● Under Review (${counts.live})`],
+      ['runrisk', `⚠️ Runs at Risk (${counts.runrisk})`],
     ];
 
     const wrap = UI.clear($('#feed-tabs'));
     tabs.forEach(([key, label]) => {
-      wrap.appendChild(el('button', `tab ${filter === key ? 'tab-on' : ''}`, label, {
+      const riskCls = key === 'runrisk' && counts.runrisk > 0 ? ' tab-run-risk' : '';
+      wrap.appendChild(el('button', `tab ${filter === key ? 'tab-on' : ''}${riskCls}`, label, {
         onclick: `ReplayFeed.setFilter('${key}')`,
       }));
     });
@@ -909,6 +1363,7 @@ function shouldAlertForReview(review) {
   function matchesFilter(entry) {
     if (filter === 'all') return true;
     if (filter === 'live') return entry.review.inProgress;
+    if (filter === 'runrisk') return runsRemovableFromReview(entry.review) > 0;
     return entry.review.typeKey === filter;
   }
 
@@ -924,7 +1379,8 @@ function shouldAlertForReview(review) {
   function feedRow(entry) {
     const r = entry.review;
     const game = games.find((g) => g.gamePk === entry.gamePk) || null;
-    const row = el('div', `feed-row feed-type-${r.typeKey} ${r.inProgress ? 'feed-row-live' : `feed-outcome-${r.outcome}`}`);
+    const runsAtRisk = runsRemovableFromReview(r);
+    const row = el('div', `feed-row feed-type-${r.typeKey} ${r.inProgress ? 'feed-row-live' : `feed-outcome-${r.outcome}`}${runsAtRisk > 0 ? ' feed-row-run-risk' : ''}`);
     row.dataset.key = buildEventKey(entry.gamePk, r);
 
     /* left: time */
@@ -962,6 +1418,13 @@ function shouldAlertForReview(review) {
     }
     if (r.inningLabel) head.appendChild(el('span', 'feed-inn', r.inningLabel));
     head.appendChild(outcomePill(r));
+    if (runsAtRisk > 0) {
+      const badge = el('span', 'feed-run-risk-badge',
+        `⚠️ ${runsAtRisk} ${runsAtRisk === 1 ? 'RUN' : 'RUNS'} AT RISK`);
+      badge.title = `${runsAtRisk} ${runsAtRisk === 1 ? 'run' : 'runs'} credited on the reviewed play ` +
+        'could come off the scoreboard if this review overturns the call. Not a prediction of the ruling.';
+      head.appendChild(badge);
+    }
     body.appendChild(head);
 
     const title = el('div', 'feed-reason', r.reason);
@@ -1152,6 +1615,20 @@ function shouldAlertForReview(review) {
     setSoundEnabled(enabled) { setSoundEnabled(enabled); },
     getSoundEnabled() { return audioEnabled; },
     playAlertSound() { playAlertSound(); },
+    toggleNotify() { setNotifyEnabled(!notifyEnabled); },
+    setNotifyEnabled(enabled) { setNotifyEnabled(enabled); },
+    getNotifyEnabled() { return notifyEnabled; },
+    playRunRiskAlertSound() { playRunRiskAlertSound(); },
+    getRunsAtRisk() { return runRiskTotal(); },
+    getRunRiskEvents() {
+      return runRiskEntries().map((entry) => ({
+        gamePk: entry.gamePk,
+        key: buildEventKey(entry.gamePk, entry.review),
+        runs: runsRemovableFromReview(entry.review),
+        reviewType: entry.review.reviewType,
+        matchup: matchupFor(entry, games.find((g) => g.gamePk === entry.gamePk) || null),
+      }));
+    },
   };
 
   document.addEventListener('DOMContentLoaded', () => {
@@ -1160,6 +1637,7 @@ function shouldAlertForReview(review) {
     if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) dateStr = d;
     updateDateLabel();
     updateSoundToggleUI();
+    updateNotifyToggleUI();
     const refreshBtn = $('#refresh-btn');
     if (refreshBtn) refreshBtn.addEventListener('click', () => load());
     const soundBtn = $('#sound-toggle-btn');
@@ -1167,6 +1645,13 @@ function shouldAlertForReview(review) {
       soundBtn.addEventListener('click', () => {
         // User gesture required for AudioContext resume
         setSoundEnabled(!audioEnabled);
+      });
+    }
+    const notifyBtn = $('#notify-toggle-btn');
+    if (notifyBtn) {
+      notifyBtn.addEventListener('click', () => {
+        // User gesture required for Notification.requestPermission()
+        setNotifyEnabled(!notifyEnabled);
       });
     }
     document.addEventListener('visibilitychange', () => {
@@ -1184,6 +1669,7 @@ function shouldAlertForReview(review) {
       isUsableName, officialTeamName, gameSideTeam,
       pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
       shouldAlertForReview,
+      runsRemovableFromReview, shouldRunRiskAlert, diffRunRiskKeys,
     };
   }
 })();
