@@ -57,8 +57,9 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
     new review (one alert sound for the whole page — it is literally the same
     audio graph, and shares its 2.5s cooldown), an
     optional **desktop notification**, a persistent **red banner** at the top of
-    the page listing every affected game with the call-stands score and the score
-    if the runs come off, a **⚠️ N RUN(S) AT RISK** badge and glow on the feed row,
+    the page listing every affected game with the call-stands score and — only
+    when the payload actually supports it — the score if the runs come off,
+    a **⚠️ N RUN(S) AT RISK** badge and glow on the feed row,
     a **Runs at Risk** stat, and a dedicated filter tab. It fires once per review
     (not once per poll), clears the moment the review resolves, and applies to
     every review type — manager challenge, crew chief/umpire review, boundary call,
@@ -67,6 +68,9 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
     `details.isScoringEvent:true` whose `details.playIndex` matches the reviewed
     event. A score change elsewhere in the plate appearance (a steal of home, a
     wild pitch) never counts, and the ruling itself is **never predicted**.
+    Note that browsers block audio until you have interacted with the page, so a
+    run-at-risk chime on the very first page load may be silent until you click
+    something; the desktop notification is not affected.
   - **Scoreboard Live Ticker & Alert Badges** — surfaces any game currently in review or challenge,
     with a link straight to the all-games Replay Feed.
   - **Live Game Review Alert Banner** — eye-catching alert at the top of the game and live module when a call is under review.

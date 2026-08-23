@@ -459,12 +459,15 @@ function runsRemovableFromReview(review) {
 }
 
 /**
- * Whether a review deserves the URGENT alert (a run already on the scoreboard
- * could be removed). Deliberately independent of shouldAlertForReview():
- * the soft chime skips routine ABS pitch challenges, but the run-removal
- * alert is driven purely by whether runs are tied to the reviewed event, so
+ * Whether a review qualifies for the run-at-risk alert (a run already on the
+ * scoreboard could be removed). Deliberately independent of
+ * shouldAlertForReview(): that gate skips routine ABS pitch challenges, but
+ * this one is driven purely by whether runs are tied to the reviewed event, so
  * every review type — manager challenge, crew chief/umpire review, boundary
  * call, "under review" status entry, ABS — is eligible.
+ *
+ * Both alerts play the same raindrop chime; what this gate additionally drives
+ * is the banner, row badge, stat, filter tab and desktop notification.
  */
 function shouldRunRiskAlert(review) {
   return runsRemovableFromReview(review) > 0;
@@ -858,18 +861,24 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
       return;
     }
     // Permission prompt must happen on the user gesture that got us here.
+    // Notification.requestPermission() has two generations of API: the legacy
+    // callback form and the modern promise form. Current browsers honour BOTH
+    // when a callback is passed, so settle exactly once rather than writing
+    // localStorage and re-rendering the button twice.
+    let settled = false;
+    const settle = (permission) => {
+      if (settled) return;
+      settled = true;
+      notifyEnabled = permission === 'granted';
+      persist();
+    };
     try {
-      const result = Notification.requestPermission((p) => {
-        notifyEnabled = p === 'granted';
-        persist();
-      });
+      const result = Notification.requestPermission(settle);
       if (result && typeof result.then === 'function') {
-        result.then((p) => { notifyEnabled = p === 'granted'; persist(); })
-          .catch(() => { notifyEnabled = false; persist(); });
+        result.then(settle).catch(() => settle('denied'));
       }
     } catch (_) {
-      notifyEnabled = false;
-      persist();
+      settle('denied');
     }
   }
 
@@ -948,18 +957,18 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
       // report at the same instant.
       syncRunRiskTracking();
 
-      // Priority order: if any run is newly at risk, that is the alert the
-      // user asked for — it plays instead of (never on top of) the soft chime.
-      // Unlike the soft chime this DOES fire on the very first load: only a
-      // still-active review can put a run at risk, so there is no backlog of
-      // historical events to blast through, and a live run-removal review is
-      // exactly what the user wants to hear about the moment the page opens.
+      // Alerting. A newly at-risk run takes priority: it is the one case that
+      // also raises a desktop notification, and it fires on the very first
+      // load too (only a still-ACTIVE review can put a run at risk, so there
+      // is no backlog of historical events to blast through). Both paths play
+      // the same raindrop chime, and the if/else guarantees at most one per
+      // poll so the chime is never triggered twice over itself.
       if (pendingRunRiskAlerts.length) {
-        if (audioEnabled) playRunRiskAlertSound();
+        playRunRiskAlertSound();
         notifyRunRisk(pendingRunRiskAlerts);
-      } else if (!isFirstLoad && pendingAlertableCount > 0 && audioEnabled) {
-        // If this poll discovered new non-ABS events and it's not the very
-        // first load (initial page population), play the raindrop chime.
+      } else if (!isFirstLoad && pendingAlertableCount > 0) {
+        // This poll discovered new non-ABS events and it is not the very first
+        // load (initial page population).
         playAlertSound();
       }
       isFirstLoad = false;
@@ -1119,7 +1128,8 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
     if (atRisk > 0) {
       const item = stat('Runs at Risk', atRisk, 'stat-run-risk');
       item.title = 'Runs already credited on the scoreboard that an active review could remove. ' +
-        'Counted only from scoring movements the official payload ties to the reviewed event.';
+        'Counted only from scoring movements the official payload ties to the reviewed event. ' +
+        'Not a prediction of the ruling.';
       wrap.appendChild(item);
     }
   }
