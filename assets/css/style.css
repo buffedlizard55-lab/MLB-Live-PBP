@@ -1791,3 +1791,163 @@ a:hover { text-decoration: underline; }
   .feed-time { flex-direction: row; align-items: center; gap: 8px; min-width: 0; }
   .feed-controls { margin-left: 0; width: 100%; }
 }
+
+/* ==========================================================================
+ * RUN AT RISK — an active review could take a run back OFF the scoreboard.
+ * The single highest-priority state on the replay feed, so it is the only
+ * thing on the page that is allowed to be this loud: hot red/amber, a slow
+ * breathing glow, and a persistent banner above everything else.
+ * ========================================================================*/
+
+@keyframes run-risk-glow {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(224, 49, 49, 0.55), 0 6px 26px rgba(224, 49, 49, 0.22); }
+  50%      { box-shadow: 0 0 0 2px rgba(255, 138, 76, 0.85), 0 8px 34px rgba(224, 49, 49, 0.45); }
+}
+@keyframes run-risk-flash {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
+
+/* --- Persistent banner (top of the feed page) --- */
+.run-risk-banner {
+  background: linear-gradient(135deg, rgba(224, 49, 49, 0.34) 0%, rgba(210, 153, 34, 0.18) 100%);
+  border: 2px solid rgba(255, 138, 76, 0.9);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin-bottom: 12px;
+  animation: run-risk-glow 1.6s ease-in-out infinite;
+}
+.run-risk-banner-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.run-risk-icon {
+  font-size: 18px;
+  line-height: 1;
+  animation: run-risk-flash 0.9s ease-in-out infinite;
+}
+.run-risk-headline {
+  font-size: 17px;
+  font-weight: 900;
+  letter-spacing: 1px;
+  color: #ffb4a2;
+  text-transform: uppercase;
+}
+.run-risk-sub {
+  font-size: 12px;
+  font-weight: 700;
+  color: #ffd9c7;
+}
+.run-risk-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 9px;
+}
+.run-risk-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  background: rgba(11, 18, 32, 0.55);
+  border: 1px solid rgba(255, 138, 76, 0.45);
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: var(--text);
+  font-size: 12.5px;
+  transition: border-color 0.15s, background 0.15s;
+}
+.run-risk-item:hover {
+  border-color: #ff8a4c;
+  background: rgba(11, 18, 32, 0.8);
+  text-decoration: none;
+}
+.run-risk-count {
+  background: var(--live);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.6px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.run-risk-game { font-weight: 800; }
+.run-risk-type {
+  color: #ffb4a2;
+  font-size: 10.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.run-risk-inn { color: var(--muted); font-size: 11.5px; font-weight: 700; }
+.run-risk-team { color: #ffd43b; font-size: 11.5px; font-weight: 700; }
+.run-risk-score {
+  color: #e9f0fa;
+  font-size: 11.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.run-risk-runners { color: var(--muted); font-size: 11.5px; }
+.run-risk-note {
+  margin-top: 8px;
+  color: #ffd9c7;
+  opacity: 0.85;
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+/* --- Feed row --- */
+.feed-row-run-risk {
+  border-color: rgba(255, 138, 76, 0.9);
+  border-left: 4px solid #ff8a4c;
+  background: linear-gradient(180deg, rgba(224, 49, 49, 0.16) 0%, #0f1a2c 100%);
+  animation: run-risk-glow 1.6s ease-in-out infinite;
+}
+.feed-run-risk-badge {
+  background: var(--live);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 900;
+  letter-spacing: 0.5px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+  animation: run-risk-flash 1.1s ease-in-out infinite;
+}
+
+/* --- Active strip --- */
+.feed-active-link-risk { border-color: #ff8a4c; }
+.feed-active-impact-risk {
+  background: #ff8a4c;
+  color: #26140a;
+  animation: run-risk-flash 1.1s ease-in-out infinite;
+}
+
+/* --- Stats bar + filter tab --- */
+.stat-run-risk .review-stat-label { color: #ffb4a2; }
+.stat-run-risk .review-stat-value {
+  color: #ff8a4c;
+  animation: run-risk-flash 1.1s ease-in-out infinite;
+}
+.tab-run-risk {
+  border-color: rgba(255, 138, 76, 0.8);
+  color: #ffb4a2;
+}
+.tab-run-risk:hover { border-color: #ff8a4c; color: #fff; }
+.tab-run-risk.tab-on { background: rgba(224, 49, 49, 0.35); border-color: #ff8a4c; color: #fff; }
+
+/* Respect a user's reduced-motion preference: keep the colour, drop the
+   animation. The information is in the text and colour, not the movement. */
+@media (prefers-reduced-motion: reduce) {
+  .run-risk-banner,
+  .feed-row-run-risk,
+  .run-risk-icon,
+  .feed-run-risk-badge,
+  .feed-active-impact-risk,
+  .stat-run-risk .review-stat-value {
+    animation: none;
+  }
+}

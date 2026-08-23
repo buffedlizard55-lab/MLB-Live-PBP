@@ -803,4 +803,117 @@ assert.equal(MLBReviews.absContextLines({
   challenger: { label: null },
 }).length, 0, 'no official fields → no ABS lines');
 
+/* ------------------------------------------------------------------------
+ * N. "Could this review REMOVE a run from the score?" predicate
+ *
+ * The replay feed's ASAP alert hangs off these three helpers, so they are
+ * pinned against the same fixtures the score tracker uses above:
+ *   activeHome      — active MA safe-at-home review, 1 credited run
+ *   activeBoundary  — active NH boundary review on a 3-run home run
+ *   activeFoul      — active NH boundary review with NO scoring runner
+ * plus the real captured ABS entries and hand-built malformed input.
+ * ----------------------------------------------------------------------*/
+
+// N.1 An active review with runs credited to the reviewed event → at risk.
+assert.equal(MLBReviews.reviewCouldRemoveRuns(activeHome), true,
+  'an active safe-at-home review with a credited run could remove it');
+assert.equal(MLBReviews.runsRemovableByReview(activeHome), 1);
+assert.equal(MLBReviews.reviewCouldRemoveRuns(activeBoundary), true,
+  'an active boundary review on a 3-run homer could remove those runs');
+assert.equal(MLBReviews.runsRemovableByReview(activeBoundary), 3);
+
+// N.2 An active review with no scoring movement tied to it is NOT at risk.
+// Nothing is inferred from the fact that a review is merely happening.
+assert.equal(MLBReviews.reviewCouldRemoveRuns(activeFoul), false,
+  'an active boundary review with no scoring runner has no run at risk');
+assert.equal(MLBReviews.runsRemovableByReview(activeFoul), 0);
+assert.equal(MLBReviews.runRiskSummary(activeFoul), null);
+
+// N.3 A RESOLVED review can never put a run at risk, no matter what its
+// score-impact record still carries.
+const resolvedWithCredit = {
+  inProgress: false,
+  scoreImpact: { runsCredited: 2, runsAtRisk: 0, runsAtRiskAtStart: 2 },
+};
+assert.equal(MLBReviews.reviewCouldRemoveRuns(resolvedWithCredit), false);
+assert.equal(MLBReviews.runsRemovableByReview(resolvedWithCredit), 0);
+assert.equal(MLBReviews.runRiskSummary(resolvedWithCredit), null);
+
+// N.4 Real captured ABS pitch challenges credit no runner, so they fall out
+// by the DATA, not by a hardcoded type exclusion. (Verify at least one real
+// ABS entry exists so this assertion is not vacuous.)
+const absEntries = realExtracted.reviews.filter((r) => r.typeKey === 'abs');
+assert.ok(absEntries.length >= 1, 'captured payload contains ABS entries');
+absEntries.forEach((r) => {
+  assert.equal(MLBReviews.reviewCouldRemoveRuns(r), false,
+    'a ball/strike ABS challenge credits no run, so nothing is at risk');
+});
+// …but the predicate is NOT type-gated: an ABS-typed review that really did
+// carry a credited run on an active play would still be flagged.
+assert.equal(MLBReviews.reviewCouldRemoveRuns({
+  typeKey: 'abs', inProgress: true,
+  scoreImpact: { runsCredited: 1, runsAtRisk: 1, runsAtRiskAtStart: 1 },
+}), true, 'the predicate reads runs, not review type — ABS is not excluded');
+
+// N.5 The feed keeps the FIRST observed snapshot, so runsAtRiskAtStart can
+// still read 0 on the poll where the runner records first appear. The count
+// must take the largest observed candidate so a late-arriving run is not
+// silently dropped from the alert.
+assert.equal(MLBReviews.runsRemovableByReview({
+  inProgress: true,
+  scoreImpact: { runsAtRiskAtStart: 0, runsAtRisk: 0, runsCredited: 1 },
+}), 1, 'a run visible only in runsCredited still counts while active');
+
+// N.6 Malformed / hostile input never throws and never alerts.
+[null, undefined, {}, { inProgress: true }, { inProgress: true, scoreImpact: null },
+  { inProgress: true, scoreImpact: 'nope' },
+  { inProgress: true, scoreImpact: { runsCredited: NaN } },
+  { inProgress: true, scoreImpact: { runsCredited: -2 } },
+  { inProgress: true, scoreImpact: { runsCredited: '3' } },
+  { inProgress: 'yes', scoreImpact: { runsCredited: 3 } },
+].forEach((bad) => {
+  assert.equal(MLBReviews.reviewCouldRemoveRuns(bad), false, `no alert for ${JSON.stringify(bad)}`);
+  assert.equal(MLBReviews.runsRemovableByReview(bad), 0, `zero runs for ${JSON.stringify(bad)}`);
+  assert.equal(MLBReviews.runRiskSummary(bad), null, `no summary for ${JSON.stringify(bad)}`);
+});
+
+// N.7 runRiskSummary() reports only observed values, and its headline agrees
+// with the score tracker's own 'at-risk' title.
+const homeSummary = MLBReviews.runRiskSummary(activeHome);
+assert.ok(homeSummary, 'active safe-at-home review has a run-risk summary');
+assert.equal(homeSummary.runs, 1);
+assert.equal(homeSummary.side, 'away');
+assert.equal(homeSummary.teamLabel, 'NYY');
+assert.equal(homeSummary.context, 'home_plate');
+assert.equal(homeSummary.startScore, 'NYY 6 – BOS 5');
+assert.equal(homeSummary.possibleScore, 'NYY 5 – BOS 5');
+assert.deepEqual(Array.from(homeSummary.runnerNames), ['Anthony Volpe']);
+assert.equal(homeSummary.headline, '1 RUN AT RISK');
+assert.equal(homeSummary.headline, MLBReviews.scoreImpactPresentation(activeHome).title,
+  'banner headline and score-tracker title must never disagree');
+assert.match(homeSummary.badge, /^⚠️ 1 RUN AT RISK$/);
+
+const boundarySummary = MLBReviews.runRiskSummary(activeBoundary);
+assert.equal(boundarySummary.runs, 3);
+assert.equal(boundarySummary.headline, '3 RUNS AT RISK');
+assert.equal(boundarySummary.headline, MLBReviews.scoreImpactPresentation(activeBoundary).title);
+assert.equal(boundarySummary.startScore, 'NYY 3 – BOS 0');
+assert.equal(boundarySummary.possibleScore, 'NYY 0 – BOS 0');
+
+// N.8 When the payload supports no alternate score, the summary says so by
+// omission (null) instead of inventing one.
+const noAlternate = MLBReviews.runRiskSummary({
+  inProgress: true,
+  scoreImpact: {
+    runsCredited: 1, runsAtRisk: 1, runsAtRiskAtStart: 1,
+    scoringSide: 'home', currentScore: { away: 2, home: 4 },
+    possibleScoreAfterReview: null, possibleScoreIfRemoved: null,
+    teamLabels: { away: 'NYY', home: 'BOS' },
+  },
+});
+assert.equal(noAlternate.startScore, 'NYY 2 – BOS 4');
+assert.equal(noAlternate.possibleScore, null, 'no alternate score is fabricated');
+assert.equal(noAlternate.teamLabel, 'BOS');
+assert.deepEqual(Array.from(noAlternate.runnerNames), [], 'absent runner names stay empty, never guessed');
+
 console.log('MLBReviews tests passed successfully!');

@@ -303,6 +303,66 @@ collectStrings(registry['#active-strip'], activeStripStrings);
 assert.ok(activeStripStrings.includes('1 RUN AT RISK'),
   `active strip includes score risk, got: ${JSON.stringify(activeStripStrings)}`);
 
+/* 4d. RUN-AT-RISK surfaces. The deterministic active review credits exactly
+ * one scoring movement (playIndex 2) to the reviewed event, so a run already
+ * on the scoreboard could come off — this is the state the user asked to be
+ * alerted about, and it must be visible everywhere at once. */
+
+// The feed row is flagged and badged.
+assert.ok(impactRecord.row.cls.includes('feed-row-run-risk'),
+  `at-risk feed row carries the urgent class, got: ${impactRecord.row.cls}`);
+const riskBadge = findIn(impactRecord.row, '.feed-run-risk-badge');
+assert.ok(riskBadge, 'at-risk feed row renders a run-at-risk badge');
+assert.equal(riskBadge.text, '⚠️ 1 RUN AT RISK');
+// The ABS row credits no run, so it must NOT be flagged.
+assert.ok(!absRecord.row.cls.includes('feed-row-run-risk'),
+  'a row with no credited run is never flagged as at-risk');
+assert.equal(findIn(absRecord.row, '.feed-run-risk-badge'), null);
+
+// The persistent banner sits above the active strip with the observed scores.
+const banner = findIn(registry['#active-strip'], '.run-risk-banner');
+assert.ok(banner, 'run-at-risk banner renders above the feed');
+const bannerBlob = collectStrings(banner, []).join(' | ');
+assert.match(bannerBlob, /1 RUN AT RISK/);
+assert.match(bannerBlob, /An active review could remove a run already on the scoreboard/);
+assert.match(bannerBlob, /Detroit Tigers @ Pittsburgh Pirates/);
+assert.match(bannerBlob, /Manager Challenge/);
+// Scores come straight from the payload (away 3 / home 1, minus the one run).
+assert.match(bannerBlob, /Call stands: DET 3 – PIT 1 · If removed: DET 2 – PIT 1/);
+assert.match(bannerBlob, /DET scored the run/);
+assert.match(bannerBlob, /Credited: Test Runner/);
+assert.match(bannerBlob, /not predicted here/,
+  'the banner states plainly that the ruling is not predicted');
+assert.ok(!bannerBlob.includes('undefined'), `banner leaked "undefined": ${bannerBlob}`);
+
+// The stats bar counts it.
+const statStrings = collectStrings(registry['#feed-stats'], []);
+assert.ok(statStrings.includes('Runs at Risk'), `stats bar shows the Runs at Risk stat, got: ${JSON.stringify(statStrings)}`);
+const runRiskStat = findIn(registry['#feed-stats'], '.stat-run-risk');
+assert.ok(runRiskStat, 'Runs at Risk stat has its urgent class');
+assert.equal(findIn(runRiskStat, '.review-stat-value').text, '1');
+
+// 4d-bis. EVERY run-at-risk surface must disclaim that the ruling is not
+// predicted — banner, row badge and stat alike. docs/verification-report.md
+// §11 makes exactly this claim, so it is pinned here rather than trusted.
+const disclaimers = [
+  ['banner note', collectStrings(banner, []).join(' | ')],
+  ['row badge', riskBadge.title || ''],
+  ['stat', runRiskStat.title || ''],
+];
+disclaimers.forEach(([where, text]) => {
+  assert.match(text, /not a prediction|not predicted/i,
+    `${where} must disclaim that the ruling is not predicted, got: ${text}`);
+});
+
+// The public API exposes the tracked state for the alerting path.
+assert.equal(context.window.ReplayFeed.getRunsAtRisk(), 1);
+const riskEvents = context.window.ReplayFeed.getRunRiskEvents();
+assert.equal(riskEvents.length, 1);
+assert.equal(riskEvents[0].runs, 1);
+assert.equal(riskEvents[0].gamePk, 823342);
+assert.equal(riskEvents[0].matchup, 'Detroit Tigers @ Pittsburgh Pirates');
+
 // 4c. The Boundary Calls filter tab renders with the setFilter wiring the
 // other tabs use (observed typeKey 'boundary' — see tools/review-test.mjs §3c).
 const tabsNode = registry['#feed-tabs'];
@@ -315,6 +375,19 @@ assert.ok(tabStrings.some((s) => s === "ReplayFeed.setFilter('boundary')"),
 assert.ok(tabStrings.some((s) => /^ABS \(1\)$/.test(s)), 'captured ABS tab count');
 assert.ok(tabStrings.some((s) => /^Challenges \(1\)$/.test(s)), 'active manager-review tab count');
 assert.ok(tabStrings.some((s) => /^● Under Review \(1\)$/.test(s)), 'active review tab count');
+assert.ok(tabStrings.some((s) => /^⚠️ Runs at Risk \(1\)$/.test(s)),
+  `Runs at Risk filter tab renders with its count, got: ${JSON.stringify(tabStrings)}`);
+assert.ok(tabStrings.some((s) => s === "ReplayFeed.setFilter('runrisk')"),
+  "Runs at Risk tab wires ReplayFeed.setFilter('runrisk')");
+
+// 4e. The Runs at Risk filter shows only the at-risk event.
+context.window.ReplayFeed.setFilter('runrisk');
+const riskRows = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
+assert.equal(riskRows.length, 1, 'the runrisk filter shows only the at-risk row');
+assert.match(collectStrings(riskRows[0], []).join(' | '), /1 RUN AT RISK/);
+context.window.ReplayFeed.setFilter('all');
+assert.equal(registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row')).length, 2,
+  'switching back to All restores every row');
 
 // 5. Whole-page sweep: stats bar, tabs, active strip, status line included.
 const everything = [];
@@ -325,5 +398,53 @@ assert.equal(leaked.length, 0, `no rendered string may contain "undefined": ${JS
 // 6. Status line summarizes the poll.
 assert.match(registry['#status-line'].textContent, /1 game · 2 review events · updated /);
 assert.match(registry['#status-line'].textContent, /refreshing every 1s/);
+
+/* 7. The run-at-risk predicate is DUPLICATED on purpose — MLBReviews.
+ * runsRemovableByReview() in reviews.js and runsRemovableFromReview() in
+ * reviews-feed.js — so the feed's pure-helper layer and its Node tests do not
+ * depend on reviews.js being loaded. This file is the only place both modules
+ * live in one VM, so it is the only place the copies can be pinned together.
+ * If they ever drift, this fails.
+ */
+const MLBReviewsInVm = context.window.MLBReviews;
+const feedExports = context.module.exports;
+assert.ok(MLBReviewsInVm && typeof MLBReviewsInVm.runsRemovableByReview === 'function',
+  'reviews.js exposes runsRemovableByReview');
+assert.ok(feedExports && typeof feedExports.runsRemovableFromReview === 'function',
+  'reviews-feed.js exposes runsRemovableFromReview');
+
+const predicateCases = [
+  // [label, review]
+  ['null', null],
+  ['undefined', undefined],
+  ['empty object', {}],
+  ['active, no scoreImpact', { inProgress: true }],
+  ['active, null scoreImpact', { inProgress: true, scoreImpact: null }],
+  ['active, non-object scoreImpact', { inProgress: true, scoreImpact: 'nope' }],
+  ['active, zero runs', { inProgress: true, scoreImpact: { runsCredited: 0, runsAtRisk: 0, runsAtRiskAtStart: 0 } }],
+  ['active, one run', { inProgress: true, scoreImpact: { runsCredited: 1, runsAtRisk: 1, runsAtRiskAtStart: 1 } }],
+  ['active, three runs', { inProgress: true, scoreImpact: { runsCredited: 3, runsAtRisk: 3, runsAtRiskAtStart: 3 } }],
+  ['active, late-arriving run', { inProgress: true, scoreImpact: { runsAtRiskAtStart: 0, runsAtRisk: 0, runsCredited: 2 } }],
+  ['active, preserved higher snapshot', { inProgress: true, scoreImpact: { runsAtRiskAtStart: 2, runsAtRisk: 0, runsCredited: 0 } }],
+  ['resolved with credit', { inProgress: false, scoreImpact: { runsCredited: 2, runsAtRisk: 0, runsAtRiskAtStart: 2 } }],
+  ['truthy-but-not-true inProgress', { inProgress: 1, scoreImpact: { runsCredited: 2 } }],
+  ['NaN runs', { inProgress: true, scoreImpact: { runsCredited: NaN } }],
+  ['negative runs', { inProgress: true, scoreImpact: { runsCredited: -2 } }],
+  ['string runs', { inProgress: true, scoreImpact: { runsCredited: '3' } }],
+  ['Infinity runs', { inProgress: true, scoreImpact: { runsCredited: Infinity } }],
+  ['abs typeKey with a run', { typeKey: 'abs', inProgress: true, scoreImpact: { runsCredited: 1, runsAtRisk: 1, runsAtRiskAtStart: 1 } }],
+];
+predicateCases.forEach(([label, review]) => {
+  const fromReviews = MLBReviewsInVm.runsRemovableByReview(review);
+  const fromFeed = feedExports.runsRemovableFromReview(review);
+  assert.equal(fromFeed, fromReviews,
+    `runsRemovableFromReview and runsRemovableByReview must agree for "${label}" (feed=${fromFeed}, reviews=${fromReviews})`);
+  assert.equal(feedExports.shouldRunRiskAlert(review), MLBReviewsInVm.reviewCouldRemoveRuns(review),
+    `shouldRunRiskAlert and reviewCouldRemoveRuns must agree for "${label}"`);
+});
+// The table must actually exercise both outcomes, or the loop proves nothing.
+const positives = predicateCases.filter(([, r]) => MLBReviewsInVm.runsRemovableByReview(r) > 0);
+assert.ok(positives.length >= 5, `predicate table covers the at-risk branch (${positives.length} cases)`);
+assert.ok(predicateCases.length - positives.length >= 10, 'predicate table covers the not-at-risk branch');
 
 console.log('Replay-feed render test passed successfully!');

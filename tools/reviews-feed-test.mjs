@@ -108,6 +108,7 @@ const {
   isUsableName, officialTeamName, gameSideTeam,
   pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
   shouldAlertForReview,
+  runsRemovableFromReview, shouldRunRiskAlert, diffRunRiskKeys,
 } = context.module.exports;
 
 /* ------------------------------------------------------- 1. Stable keys */
@@ -577,5 +578,218 @@ assert.ok(audioLog.resumes >= 1, 'a suspended AudioContext is resumed before pla
 ReplayFeed.setSoundEnabled(false);
 assert.equal(ReplayFeed.getSoundEnabled(), false);
 assert.equal(audioLog.oscillators.length, previewCount * 2, 'muting plays nothing');
+
+/* ------------------------- 12. Run-at-risk detection (the ASAP alert)
+ *
+ * A run already on the scoreboard can only be "at risk" when the review is
+ * still active AND the official payload credits runs to the reviewed event.
+ * Nothing here is inferred from a score delta or predicted from a ruling.
+ */
+
+const activeOneRun = {
+  typeKey: 'manager', inProgress: true,
+  scoreImpact: { runsCredited: 1, runsAtRisk: 1, runsAtRiskAtStart: 1 },
+};
+const activeThreeRun = {
+  typeKey: 'boundary', inProgress: true,
+  scoreImpact: { runsCredited: 3, runsAtRisk: 3, runsAtRiskAtStart: 3 },
+};
+
+// 12a. Active + credited runs = at risk, with the observed count.
+assert.equal(runsRemovableFromReview(activeOneRun), 1);
+assert.equal(runsRemovableFromReview(activeThreeRun), 3);
+assert.equal(shouldRunRiskAlert(activeOneRun), true);
+assert.equal(shouldRunRiskAlert(activeThreeRun), true);
+
+// 12b. Every review type is eligible — unlike the new-review chime gate, the
+// run-at-risk gate is driven by the DATA, not by the review's type. ABS included.
+['manager', 'crew_chief', 'boundary', 'review', 'rules', 'abs'].forEach((typeKey) => {
+  assert.equal(shouldRunRiskAlert({ ...activeOneRun, typeKey }), true,
+    `${typeKey} with a credited run at risk must alert`);
+});
+// The soft chime still skips ABS; the two gates are independent.
+assert.equal(shouldAlertForReview({ typeKey: 'abs' }), false);
+assert.equal(shouldRunRiskAlert({ typeKey: 'abs' }), false,
+  'an ABS challenge with no credited run is still not a run-risk event');
+
+// 12c. A resolved review can never put a run at risk.
+assert.equal(shouldRunRiskAlert({ ...activeOneRun, inProgress: false }), false);
+assert.equal(runsRemovableFromReview({ ...activeOneRun, inProgress: false }), 0);
+
+// 12d. An active review with no scoring runner tied to it is not at risk.
+assert.equal(shouldRunRiskAlert({
+  typeKey: 'boundary', inProgress: true,
+  scoreImpact: { runsCredited: 0, runsAtRisk: 0, runsAtRiskAtStart: 0 },
+}), false);
+
+// 12e. reconcileScoreImpact() preserves the FIRST snapshot, so
+// runsAtRiskAtStart can lag at 0 on the poll where runner records land. The
+// largest observed candidate wins so a late run is never dropped.
+assert.equal(runsRemovableFromReview({
+  typeKey: 'manager', inProgress: true,
+  scoreImpact: { runsAtRiskAtStart: 0, runsAtRisk: 0, runsCredited: 2 },
+}), 2);
+
+// 12f. Malformed input never throws and never alerts.
+[null, undefined, {}, { inProgress: true }, { inProgress: true, scoreImpact: null },
+  { inProgress: true, scoreImpact: 7 },
+  { inProgress: true, scoreImpact: { runsCredited: NaN } },
+  { inProgress: true, scoreImpact: { runsCredited: -1 } },
+  { inProgress: true, scoreImpact: { runsCredited: '2' } },
+  { inProgress: 1, scoreImpact: { runsCredited: 2 } },
+].forEach((bad) => {
+  assert.equal(runsRemovableFromReview(bad), 0, `zero runs for ${JSON.stringify(bad)}`);
+  assert.equal(shouldRunRiskAlert(bad), false, `no run-at-risk alert for ${JSON.stringify(bad)}`);
+});
+
+// 12g. It agrees with MLBReviews.runsRemovableByReview() on the tracker
+// fixture used by section 4b above (the two implementations must not drift).
+assert.equal(runsRemovableFromReview(activeRisk), 1);
+assert.equal(shouldRunRiskAlert(activeRisk), true);
+
+/* --------------- 13. Alert de-duplication across polls (diffRunRiskKeys) */
+
+const keyOf = (entry) => buildEventKey(entry.gamePk, entry.review);
+const entryOf = (gamePk, review) => ({ gamePk, review });
+
+// 13a. First sighting of a risky review starts an alert.
+let tracked = new Set();
+const pollOne = diffRunRiskKeys(tracked, [
+  entryOf(1, { ...activeOneRun, id: 'play-5-main' }),
+  entryOf(2, { ...activeOneRun, id: 'play-9-main', inProgress: false }),
+], keyOf);
+assert.deepEqual([...pollOne.started], ['1:play-5-main'], 'only the risky review alerts');
+assert.deepEqual([...pollOne.cleared], []);
+assert.deepEqual([...pollOne.next], ['1:play-5-main']);
+tracked = pollOne.next;
+
+// 13b. The SAME review still active on the next poll must NOT re-alert.
+const pollTwo = diffRunRiskKeys(tracked, [
+  entryOf(1, { ...activeOneRun, id: 'play-5-main' }),
+], keyOf);
+assert.deepEqual([...pollTwo.started], [], 'a still-running review does not re-alert every poll');
+assert.deepEqual([...pollTwo.cleared], []);
+tracked = pollTwo.next;
+
+// 13c. A second game going at-risk alerts on its own, once.
+const pollThree = diffRunRiskKeys(tracked, [
+  entryOf(1, { ...activeOneRun, id: 'play-5-main' }),
+  entryOf(2, { ...activeThreeRun, id: 'play-11-main' }),
+], keyOf);
+assert.deepEqual([...pollThree.started], ['2:play-11-main']);
+assert.deepEqual([...pollThree.next].sort(), ['1:play-5-main', '2:play-11-main']);
+tracked = pollThree.next;
+
+// 13d. Resolution clears the key (so a later, genuinely new review on the
+// same play can alert again) without alerting on the way out.
+const pollFour = diffRunRiskKeys(tracked, [
+  entryOf(1, { ...activeOneRun, id: 'play-5-main', inProgress: false }),
+  entryOf(2, { ...activeThreeRun, id: 'play-11-main' }),
+], keyOf);
+assert.deepEqual([...pollFour.started], []);
+assert.deepEqual([...pollFour.cleared], ['1:play-5-main']);
+assert.deepEqual([...pollFour.next], ['2:play-11-main']);
+tracked = pollFour.next;
+
+// 13e. An entry that vanishes from the feed entirely is cleared too.
+const pollFive = diffRunRiskKeys(tracked, [], keyOf);
+assert.deepEqual([...pollFive.cleared], ['2:play-11-main']);
+assert.equal(pollFive.next.size, 0);
+
+// 13f. After clearing, the same play going back under review alerts again.
+const pollSix = diffRunRiskKeys(pollFive.next, [
+  entryOf(1, { ...activeOneRun, id: 'play-5-main' }),
+], keyOf);
+assert.deepEqual([...pollSix.started], ['1:play-5-main'], 'a re-review re-alerts');
+
+// 13g. Defensive: junk entries are skipped, not crashed on.
+const pollJunk = diffRunRiskKeys(new Set(), [null, undefined, { gamePk: 3 }], keyOf);
+assert.deepEqual([...pollJunk.started], []);
+assert.equal(pollJunk.next.size, 0);
+// An array (not a Set) is accepted as the previous state.
+assert.deepEqual([...diffRunRiskKeys(['1:play-5-main'], [
+  entryOf(1, { ...activeOneRun, id: 'play-5-main' }),
+], keyOf).started], []);
+
+/* ------------- 14. The run-at-risk alert IS the same raindrop chime
+ *
+ * By request the run-at-risk alert uses the ordinary review chime rather than
+ * a separate urgent voice. These assertions pin that: the two entry points
+ * must build an identical audio graph and share one cooldown, so they can
+ * never drift into two different sounds.
+ */
+
+/** Snapshot the voice graph the recording stub just captured. */
+function captureVoices() {
+  return audioLog.oscillators.map((osc) => {
+    const edge = audioLog.edges.find(([src]) => src === osc);
+    assert.ok(edge, 'each oscillator connects into a gain node');
+    return {
+      type: osc.type,
+      // Include the scheduled TIMES, not just the values, so two graphs only
+      // compare equal when the rhythm is identical too.
+      freq: osc._freqEvents.map((e) => `${e.kind}@${e.v}t${e.t}`).join(','),
+      gain: edge[1]._gainEvents.map((e) => `${e.kind}@${e.v}t${e.t}`).join(','),
+      start: osc.startedAt,
+      dur: Number((osc.stoppedAt - osc.startedAt).toFixed(6)),
+    };
+  });
+}
+
+audioLog.oscillators.length = 0;
+audioLog.edges.length = 0;
+clockOffsetMs = 60000;
+audioLog.ctx.state = 'running';
+
+// 14a. Silent while muted, exactly like the chime.
+ReplayFeed.playRunRiskAlertSound();
+assert.equal(audioLog.oscillators.length, 0, 'no run-at-risk alert while the toggle is off');
+
+// 14b. Capture the ordinary chime (the preview fired by enabling sound).
+ReplayFeed.setSoundEnabled(true);
+const chimeVoices = captureVoices();
+assert.equal(chimeVoices.length, 5, 'the chime is the 3-drop + 2-partial motif');
+
+// 14c. Capture the run-at-risk alert and compare it voice for voice.
+audioLog.oscillators.length = 0;
+audioLog.edges.length = 0;
+clockOffsetMs = 120000;
+ReplayFeed.playRunRiskAlertSound();
+const runRiskVoices = captureVoices();
+assert.ok(runRiskVoices.length > 0, 'the run-at-risk alert plays when sound is on');
+assert.deepEqual(runRiskVoices, chimeVoices,
+  'the run-at-risk alert must be the SAME raindrop chime, voice for voice');
+
+// Belt and braces: it still satisfies every property the chime is held to.
+assert.equal(runRiskVoices.length, 5);
+runRiskVoices.forEach((v) => assert.equal(v.type, 'sine', 'sine-only, no buzz'));
+assert.equal(runRiskVoices.filter((v) => v.freq.includes('exp@')).length, 3,
+  'three raindrop pitch-sweeps, same as the chime');
+assert.equal(runRiskVoices.filter((v) => !v.freq.includes('exp@')).length, 2,
+  'two steady chime partials, same as the chime');
+const runRiskPeaks = runRiskVoices.flatMap((v) => v.gain.split(',')
+  .map((e) => Number(e.split('@')[1])).filter((n) => n > 0));
+assert.ok(Math.max(...runRiskPeaks) <= 0.3,
+  `run-at-risk alert stays at the gentle chime level (peak ${Math.max(...runRiskPeaks)})`);
+
+// 14d. ONE shared cooldown — the same sound must never chime on top of itself.
+audioLog.oscillators.length = 0;
+ReplayFeed.playAlertSound();
+assert.equal(audioLog.oscillators.length, 0,
+  'the ordinary chime is blocked by the run-at-risk alert that just played');
+ReplayFeed.playRunRiskAlertSound();
+assert.equal(audioLog.oscillators.length, 0, 'and so is an immediate run-at-risk repeat');
+clockOffsetMs = 130000;
+ReplayFeed.playRunRiskAlertSound();
+assert.equal(audioLog.oscillators.length, 5, 'it plays again after the shared 2.5s cooldown');
+
+// 14e. A suspended context is resumed before the run-at-risk alert plays.
+const resumesBefore = audioLog.resumes;
+audioLog.ctx.state = 'suspended';
+clockOffsetMs = 140000;
+ReplayFeed.playRunRiskAlertSound();
+assert.ok(audioLog.resumes > resumesBefore, 'run-at-risk alert resumes a suspended AudioContext');
+
+ReplayFeed.setSoundEnabled(false);
 
 console.log('Replay feed tests passed successfully!');

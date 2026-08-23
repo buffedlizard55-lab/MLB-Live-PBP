@@ -42,12 +42,35 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
     catcher / pitcher, from official play text or the challenging team's batting/
     fielding side), and the count after the call is overturned or stands. Includes
     an "Under Review" live strip, per-type
-    filters (All / ABS / Challenges / Reviews / Boundary Calls / Under Review),
+    filters (All / ABS / Challenges / Reviews / Boundary Calls / Under Review /
+    ⚠️ Runs at Risk),
     summary stats for the whole day, and an optional **sound alert** — a gentle
     synthesized raindrop chime (three soft drops blooming into a warm two-note
     chime, ~1.2s, pure sine tones with a light echo) when a new challenge, review,
     or boundary call lands. It is off by default, remembers your choice per
-    browser, and never fires for routine ABS pitch challenges.
+    browser, and never fires for routine ABS pitch challenges (the run-at-risk
+    case below is the one exception, and it uses this exact same chime).
+  - **⚠️ Runs at Risk — "could this review take a run OFF the board?"** The feed
+    tracks, per review, whether the call on the field credited runs to the very
+    event now under review, so an overturn could remove them from the score. When
+    it can, you get, immediately: the **same gentle raindrop chime** used for any
+    new review (one alert sound for the whole page — it is literally the same
+    audio graph, and shares its 2.5s cooldown), an
+    optional **desktop notification**, a persistent **red banner** at the top of
+    the page listing every affected game with the call-stands score and — only
+    when the payload actually supports it — the score if the runs come off,
+    a **⚠️ N RUN(S) AT RISK** badge and glow on the feed row,
+    a **Runs at Risk** stat, and a dedicated filter tab. It fires once per review
+    (not once per poll), clears the moment the review resolves, and applies to
+    every review type — manager challenge, crew chief/umpire review, boundary call,
+    "under review", and ABS — because it is decided by the *data*, not the type: a
+    run counts only when the official payload has a `runners[]` record with
+    `details.isScoringEvent:true` whose `details.playIndex` matches the reviewed
+    event. A score change elsewhere in the plate appearance (a steal of home, a
+    wild pitch) never counts, and the ruling itself is **never predicted**.
+    Note that browsers block audio until you have interacted with the page, so a
+    run-at-risk chime on the very first page load may be silent until you click
+    something; the desktop notification is not affected.
   - **Scoreboard Live Ticker & Alert Badges** — surfaces any game currently in review or challenge,
     with a link straight to the all-games Replay Feed.
   - **Live Game Review Alert Banner** — eye-catching alert at the top of the game and live module when a call is under review.
@@ -213,6 +236,16 @@ node tools/hit-model-test.mjs             # two-sided hit forecast model
 node tools/review-test.mjs                # challenge / replay review parser (incl. real API shapes)
 node tools/reviews-feed-test.mjs          # all-games Replay Feed diff helpers
 node tools/replay-feed-render-test.mjs    # end-to-end Replay Feed render (captured live payloads)
+```
+
+To *see and hear* the ⚠️ Runs at Risk surfaces without waiting for a live review,
+serve the repo and open the offline, fixture-driven preview — it stubs the API with
+the exact same deterministic payload the render test uses and makes no network
+request:
+
+```bash
+python3 -m http.server 8000
+# then open http://localhost:8000/tools/run-risk-preview.html
 ```
 
 ## Deploy to GitHub Pages

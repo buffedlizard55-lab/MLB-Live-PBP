@@ -1179,6 +1179,109 @@ const MLBReviews = (() => {
     container.appendChild(list);
   }
 
+  /**
+   * True iff the review is in progress AND the original call on the field
+   * credited one or more runs that are tied to the reviewed event (so an
+   * overturn COULD remove those runs from the score).
+   *
+   * This is the precise predicate the replay feed uses for its ASAP alert:
+   *   - The review must be active (in-progress), not resolved — an already
+   *     overturned/stood review cannot remove another run.
+   *   - A positive run count must be tied to the reviewed event. Those counts
+   *     come from reviewedScoringRunners(), which only accepts scoring
+   *     movements whose playIndex matches the reviewed event (verified
+   *     against statsapi.mlb.com, see reviewedScoringRunners()). A score
+   *     delta across a whole at-bat or across unrelated plays does NOT
+   *     count: earlier steals/wild pitches/etc. cannot be removed here.
+   *   - The type of review is irrelevant — a manager challenge, crew chief
+   *     review, umpire review, boundary call, "under review" status entry or
+   *     an ABS pitch challenge all qualify if (and only if) runs are tied to
+   *     the reviewed event. In practice an ABS ball/strike challenge credits
+   *     no runner, so deriveScoreImpact() reports 0 for it and this returns
+   *     false — by the data, not by a hardcoded type exclusion.
+   *
+   * Pure function — reads only fields on the supplied review object.
+   * Returns false for any falsy/malformed input; never throws.
+   *
+   * See runsRemovableByReview() below for the exact counting rule.
+   */
+  function reviewCouldRemoveRuns(review) {
+    return runsRemovableByReview(review) > 0;
+  }
+
+  /**
+   * Number of runs that COULD be removed by this in-progress review.
+   *
+   * Counting rule (all three inputs are observed, none is predicted):
+   *   - `runsCredited` is the length of reviewedScoringRunners() — the scoring
+   *     movements StatsAPI ties to the reviewed event itself. An unrelated
+   *     steal home or wild pitch earlier in the same plate appearance is
+   *     already excluded there.
+   *   - `runsAtRisk` / `runsAtRiskAtStart` are the same number captured on the
+   *     first poll that saw the review active; reconcileScoreImpact() in the
+   *     replay feed deliberately keeps that first snapshot and may therefore
+   *     still read 0 on a poll where the runner records have since appeared.
+   * The largest of the finite candidates is used so a run that only becomes
+   * visible on a later poll is never silently dropped from the alert.
+   *
+   * Returns 0 for resolved reviews, for reviews with no runs tied to the
+   * reviewed event, and for any malformed input. Never throws, never returns
+   * a negative or non-finite number.
+   */
+  function runsRemovableByReview(review) {
+    if (!review) return 0;
+    if (review.inProgress !== true) return 0;
+    const impact = review.scoreImpact;
+    if (!impact || typeof impact !== 'object') return 0;
+    const candidates = [
+      impact.runsAtRiskAtStart,
+      impact.runsAtRisk,
+      impact.runsCredited,
+    ].filter((n) => typeof n === 'number' && Number.isFinite(n) && n > 0);
+    if (!candidates.length) return 0;
+    return Math.max(...candidates);
+  }
+
+  /**
+   * Structured "a run on the scoreboard could come off" summary for the alert
+   * surfaces (feed banner, active strip, notification body).
+   *
+   * Every field is either copied from the observed payload or formatted from
+   * it. Nothing is predicted: `possibleScore` is the conditional score that
+   * deriveScoreImpact() only fills in when the call-on-field score is known
+   * AND it is large enough to subtract the credited runs from, and it stays
+   * null otherwise rather than being invented. `headline` mirrors the
+   * scoreImpactPresentation() 'at-risk' title so both surfaces agree.
+   *
+   * Returns null when no run is at risk. Pure; never throws.
+   */
+  function runRiskSummary(review) {
+    const runs = runsRemovableByReview(review);
+    if (!runs) return null;
+    const impact = review.scoreImpact;
+    const labels = impact.teamLabels || { away: 'Away', home: 'Home' };
+    const side = impact.scoringSide === 'away' || impact.scoringSide === 'home'
+      ? impact.scoringSide
+      : null;
+    const startPair = impact.scoreAtReviewStart || impact.scoreBeforeReview ||
+      impact.currentScore;
+    const possiblePair = impact.possibleScoreAfterReview || impact.possibleScoreIfRemoved;
+    const runners = Array.isArray(impact.creditedRunnerNames)
+      ? impact.creditedRunnerNames.filter((n) => typeof n === 'string' && n.trim())
+      : [];
+    return {
+      runs,
+      side,
+      teamLabel: side ? (labels[side] || null) : null,
+      context: impact.context || null,
+      runnerNames: runners,
+      startScore: formatScorePair(startPair, labels),
+      possibleScore: formatScorePair(possiblePair, labels),
+      headline: `${runs} ${runs === 1 ? 'RUN' : 'RUNS'} AT RISK`,
+      badge: `⚠️ ${runs} ${runs === 1 ? 'RUN' : 'RUNS'} AT RISK`,
+    };
+  }
+
   return {
     normalizeType,
     extractReason,
@@ -1201,6 +1304,9 @@ const MLBReviews = (() => {
     deriveScoreImpact,
     scoreImpactPresentation,
     renderScoreImpact,
+    reviewCouldRemoveRuns,
+    runsRemovableByReview,
+    runRiskSummary,
   };
 })();
 
