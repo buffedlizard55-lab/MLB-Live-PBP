@@ -601,8 +601,8 @@ assert.equal(runsRemovableFromReview(activeThreeRun), 3);
 assert.equal(shouldRunRiskAlert(activeOneRun), true);
 assert.equal(shouldRunRiskAlert(activeThreeRun), true);
 
-// 12b. Every review type is eligible — unlike the soft chime, the urgent
-// alert is driven by the DATA, not by the review's type. ABS included.
+// 12b. Every review type is eligible — unlike the new-review chime gate, the
+// run-at-risk gate is driven by the DATA, not by the review's type. ABS included.
 ['manager', 'crew_chief', 'boundary', 'review', 'rules', 'abs'].forEach((typeKey) => {
   assert.equal(shouldRunRiskAlert({ ...activeOneRun, typeKey }), true,
     `${typeKey} with a credited run at risk must alert`);
@@ -639,7 +639,7 @@ assert.equal(runsRemovableFromReview({
   { inProgress: 1, scoreImpact: { runsCredited: 2 } },
 ].forEach((bad) => {
   assert.equal(runsRemovableFromReview(bad), 0, `zero runs for ${JSON.stringify(bad)}`);
-  assert.equal(shouldRunRiskAlert(bad), false, `no urgent alert for ${JSON.stringify(bad)}`);
+  assert.equal(shouldRunRiskAlert(bad), false, `no run-at-risk alert for ${JSON.stringify(bad)}`);
 });
 
 // 12g. It agrees with MLBReviews.runsRemovableByReview() on the tracker
@@ -711,11 +711,30 @@ assert.deepEqual([...diffRunRiskKeys(['1:play-5-main'], [
   entryOf(1, { ...activeOneRun, id: 'play-5-main' }),
 ], keyOf).started], []);
 
-/* ----------- 14. The urgent run-at-risk sound is distinct from the chime
+/* ------------- 14. The run-at-risk alert IS the same raindrop chime
  *
- * Requirement: the run-removal alert must be unmistakably different from the
- * soft raindrop chime. Verified structurally against the same recording stub.
+ * By request the run-at-risk alert uses the ordinary review chime rather than
+ * a separate urgent voice. These assertions pin that: the two entry points
+ * must build an identical audio graph and share one cooldown, so they can
+ * never drift into two different sounds.
  */
+
+/** Snapshot the voice graph the recording stub just captured. */
+function captureVoices() {
+  return audioLog.oscillators.map((osc) => {
+    const edge = audioLog.edges.find(([src]) => src === osc);
+    assert.ok(edge, 'each oscillator connects into a gain node');
+    return {
+      type: osc.type,
+      // Include the scheduled TIMES, not just the values, so two graphs only
+      // compare equal when the rhythm is identical too.
+      freq: osc._freqEvents.map((e) => `${e.kind}@${e.v}t${e.t}`).join(','),
+      gain: edge[1]._gainEvents.map((e) => `${e.kind}@${e.v}t${e.t}`).join(','),
+      start: osc.startedAt,
+      dur: Number((osc.stoppedAt - osc.startedAt).toFixed(6)),
+    };
+  });
+}
 
 audioLog.oscillators.length = 0;
 audioLog.edges.length = 0;
@@ -724,72 +743,52 @@ audioLog.ctx.state = 'running';
 
 // 14a. Silent while muted, exactly like the chime.
 ReplayFeed.playRunRiskAlertSound();
-assert.equal(audioLog.oscillators.length, 0, 'no urgent alert while the toggle is off');
+assert.equal(audioLog.oscillators.length, 0, 'no run-at-risk alert while the toggle is off');
 
-// 14b. Enabling plays the SOFT preview only — turning sound on must never
-// fire the alarm.
+// 14b. Capture the ordinary chime (the preview fired by enabling sound).
 ReplayFeed.setSoundEnabled(true);
-const softPreview = audioLog.oscillators.slice();
-assert.equal(softPreview.length, 5, 'the preview is the 3-drop + 2-chime soft motif');
-assert.equal(softPreview.filter((o) => o._freqEvents.some((e) => e.kind === 'exp')).length, 3,
-  'the preview is the raindrop chime, not the siren');
+const chimeVoices = captureVoices();
+assert.equal(chimeVoices.length, 5, 'the chime is the 3-drop + 2-partial motif');
 
-// 14c. Fire the urgent alert and inspect only its voices.
+// 14c. Capture the run-at-risk alert and compare it voice for voice.
 audioLog.oscillators.length = 0;
+audioLog.edges.length = 0;
 clockOffsetMs = 120000;
 ReplayFeed.playRunRiskAlertSound();
-const sirenVoices = audioLog.oscillators.slice();
-assert.ok(sirenVoices.length > 0, 'the urgent alert plays when sound is on');
+const runRiskVoices = captureVoices();
+assert.ok(runRiskVoices.length > 0, 'the run-at-risk alert plays when sound is on');
+assert.deepEqual(runRiskVoices, chimeVoices,
+  'the run-at-risk alert must be the SAME raindrop chime, voice for voice');
 
-// Still sine-only: urgency comes from rhythm and pitch, never from a buzz.
-sirenVoices.forEach((osc) => {
-  assert.equal(osc.type, 'sine', 'urgent alert stays sine-only (no harsh buzz)');
-  assert.ok(Number.isFinite(osc.startedAt) && Number.isFinite(osc.stoppedAt));
-  assert.ok(osc.stoppedAt > osc.startedAt);
-});
+// Belt and braces: it still satisfies every property the chime is held to.
+assert.equal(runRiskVoices.length, 5);
+runRiskVoices.forEach((v) => assert.equal(v.type, 'sine', 'sine-only, no buzz'));
+assert.equal(runRiskVoices.filter((v) => v.freq.includes('exp@')).length, 3,
+  'three raindrop pitch-sweeps, same as the chime');
+assert.equal(runRiskVoices.filter((v) => !v.freq.includes('exp@')).length, 2,
+  'two steady chime partials, same as the chime');
+const runRiskPeaks = runRiskVoices.flatMap((v) => v.gain.split(',')
+  .map((e) => Number(e.split('@')[1])).filter((n) => n > 0));
+assert.ok(Math.max(...runRiskPeaks) <= 0.3,
+  `run-at-risk alert stays at the gentle chime level (peak ${Math.max(...runRiskPeaks)})`);
 
-// Structurally distinct from the chime: NO voice sweeps its pitch (the chime's
-// three raindrops all do), and there are more voices than the chime's five.
-assert.equal(sirenVoices.filter((o) => o._freqEvents.some((e) => e.kind === 'exp')).length, 0,
-  'the urgent alert has no raindrop pitch-sweeps — it is a steady two-tone siren');
-assert.ok(sirenVoices.length > softPreview.length,
-  `urgent alert is a denser motif than the chime (${sirenVoices.length} vs ${softPreview.length} voices)`);
-
-// Six staccato pulses alternating between exactly two pitches, plus a low
-// body tone and the two-note tail — the alarm pattern.
-const sirenHz = sirenVoices.map((o) => o._freqEvents.find((e) => e.kind === 'set').v);
-const pulseHz = sirenHz.filter((hz) => hz === 880 || hz === 1047);
-assert.equal(pulseHz.filter((hz) => hz === 880).length, 4, 'four low siren tones (3 pulses + tail)');
-assert.equal(pulseHz.filter((hz) => hz === 1047).length, 4, 'four high siren tones (3 pulses + tail)');
-assert.ok(sirenHz.includes(220), 'a low body tone underpins the alert');
-
-// Louder than the chime, but still bounded.
-const sirenPeaks = sirenVoices.map((osc) => {
-  const edge = audioLog.edges.find(([src]) => src === osc);
-  assert.ok(edge, 'each urgent voice connects into a gain node');
-  return Math.max(...edge[1]._gainEvents.map((e) => e.v).filter((v) => v > 0));
-});
-assert.equal(Math.max(...sirenPeaks), 0.3, 'urgent peak is 0.3 — above the chime, still bounded');
-assert.ok(Math.max(...sirenPeaks) <= 0.35, 'urgent alert never exceeds a safe level');
-
-// 14d. Its own short cooldown, independent of the chime's 2.5s one.
-audioLog.oscillators.length = 0;
-ReplayFeed.playRunRiskAlertSound();
-assert.equal(audioLog.oscillators.length, 0, 'cooldown blocks an immediate urgent repeat');
-clockOffsetMs = 130000;
-ReplayFeed.playRunRiskAlertSound();
-assert.equal(audioLog.oscillators.length, sirenVoices.length, 'urgent alert plays again after its cooldown');
-// The soft chime is NOT blocked by the urgent alert's cooldown (separate timers).
+// 14d. ONE shared cooldown — the same sound must never chime on top of itself.
 audioLog.oscillators.length = 0;
 ReplayFeed.playAlertSound();
-assert.equal(audioLog.oscillators.length, 5, 'the chime keeps its own independent cooldown');
+assert.equal(audioLog.oscillators.length, 0,
+  'the ordinary chime is blocked by the run-at-risk alert that just played');
+ReplayFeed.playRunRiskAlertSound();
+assert.equal(audioLog.oscillators.length, 0, 'and so is an immediate run-at-risk repeat');
+clockOffsetMs = 130000;
+ReplayFeed.playRunRiskAlertSound();
+assert.equal(audioLog.oscillators.length, 5, 'it plays again after the shared 2.5s cooldown');
 
-// 14e. A suspended context is resumed before the urgent alert plays.
+// 14e. A suspended context is resumed before the run-at-risk alert plays.
 const resumesBefore = audioLog.resumes;
 audioLog.ctx.state = 'suspended';
 clockOffsetMs = 140000;
 ReplayFeed.playRunRiskAlertSound();
-assert.ok(audioLog.resumes > resumesBefore, 'urgent alert resumes a suspended AudioContext');
+assert.ok(audioLog.resumes > resumesBefore, 'run-at-risk alert resumes a suspended AudioContext');
 
 ReplayFeed.setSoundEnabled(false);
 

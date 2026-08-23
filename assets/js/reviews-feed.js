@@ -533,16 +533,17 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
   let audioContext = null;
   let lastAlertAt = 0;
 
-  // --- Run-at-risk alert state (URGENT: a run already on the scoreboard could
-  // be removed by an active review). Tracked separately from the soft chime:
-  // it has its own sound, its own cooldown, and it fires for every review type
-  // including ABS. `alertedRunRiskKeys` holds the event keys that have already
-  // sounded so a still-running review does not re-alert on every 1s poll; a
-  // key is dropped again the moment the review resolves or stops being risky,
-  // so a genuinely new review on the same play can alert again.
+  // --- Run-at-risk state (a run already on the scoreboard could be removed by
+  // an active review). It plays the SAME raindrop chime as an ordinary review
+  // and shares its cooldown, but it is tracked separately because it fires for
+  // every review type (ABS included), fires on first load, and drives the
+  // banner / badge / stat / filter tab and the optional desktop notification.
+  // `alertedRunRiskKeys` holds the event keys that have already alerted so a
+  // still-running review does not re-alert on every 1s poll; a key is dropped
+  // the moment the review resolves or stops being risky, so a genuinely new
+  // review on the same play can alert again.
   const alertedRunRiskKeys = new Set();
   let pendingRunRiskAlerts = [];
-  let lastRunRiskAlertAt = 0;
   let notifyEnabled = false;
 
   try {
@@ -622,7 +623,16 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
     // Cooldown 2.5s to avoid overlapping chimes when multiple games report at once
     if (nowMs - lastAlertAt < 2500) return;
     lastAlertAt = nowMs;
+    playRaindropChime();
+  }
 
+  /**
+   * Build and fire the raindrop-chime graph. No gating of its own — callers
+   * own the enable check and the cooldown. Kept separate so there is exactly
+   * ONE alert sound implementation in the file: the ordinary review chime and
+   * the run-at-risk alert are the same sound, and cannot drift apart.
+   */
+  function playRaindropChime() {
     try {
       const ctx = ensureAudioContext();
       if (!ctx) return;
@@ -715,103 +725,23 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
   }
 
   /**
-   * URGENT alert: a run that is already on the scoreboard could be taken off
-   * by an active review. Deliberately NOT the soft raindrop chime — this one
-   * has to cut through, because it is the one event the user asked to hear
-   * about "ASAP".
+   * Run-at-risk alert: a run that is already on the scoreboard could be taken
+   * off by an active review.
    *
-   * Sound design (distinct from the chime in rhythm, pitch and length):
-   *   - A two-tone alternating siren: six fast staccato pulses swapping
-   *     between two pitches a minor third apart, the pattern the ear reads as
-   *     an alarm rather than a notification.
-   *   - Each pulse is a steady-pitch sine with a hard 8ms attack and a short
-   *     exponential release, so the pattern stays crisp instead of smearing.
-   *   - A low sine "thud" underpins the first pulse for weight.
-   *   - Sine oscillators only (same no-buzz rule as the chime) at a higher but
-   *     still bounded peak. ~1.45s total, then silence.
+   * By request this plays the SAME gentle raindrop chime as an ordinary new
+   * review — one alert sound for the whole page. It is not a separate voice,
+   * it literally calls the same graph builder, so the two can never drift.
+   *
+   * The urgency is carried by everything else instead: the persistent red
+   * run-at-risk banner, the row badge and glow, the "Runs at Risk" stat and
+   * filter tab, and the optional desktop notification.
+   *
+   * Cooldown note: this deliberately shares `lastAlertAt` with playAlertSound()
+   * rather than keeping its own timer. Now that both are the same sound, two
+   * independent cooldowns would just chime twice on top of itself.
    */
   function playRunRiskAlertSound() {
-    if (!audioEnabled) return;
-    const nowMs = Date.now();
-    // Own cooldown, independent of the soft chime's, so a run-risk alert is
-    // never swallowed by an ordinary review chime that just played. Kept just
-    // above the ~1.45s sound length: two different games going at risk one
-    // poll apart should still both be heard.
-    if (nowMs - lastRunRiskAlertAt < 1600) return;
-    lastRunRiskAlertAt = nowMs;
-
-    try {
-      const ctx = ensureAudioContext();
-      if (!ctx) return;
-      if (ctx.state === 'suspended') {
-        ctx.resume().catch(() => {});
-      }
-      const t0 = ctx.currentTime;
-      const PEAK = 0.3; // louder than the chime's 0.24, still a bounded level.
-      const PULSE = 0.12;   // pulse-to-pulse spacing
-      const PULSES = 6;
-      const END = PULSE * PULSES + 0.55;
-
-      const master = ctx.createGain();
-      master.gain.setValueAtTime(0, t0);
-      master.gain.linearRampToValueAtTime(1, t0 + 0.005);
-      master.gain.setValueAtTime(1, t0 + END - 0.12);
-      master.gain.linearRampToValueAtTime(0, t0 + END);
-      master.connect(ctx.destination);
-
-      // One staccato siren pulse at a fixed pitch.
-      const pulse = (startAt, hz, level, hold) => {
-        const osc = ctx.createOscillator();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(hz, startAt);
-        const g = ctx.createGain();
-        g.gain.setValueAtTime(0, startAt);
-        g.gain.linearRampToValueAtTime(level, startAt + 0.008);
-        g.gain.setValueAtTime(level, startAt + hold);
-        g.gain.exponentialRampToValueAtTime(0.0001, startAt + hold + 0.06);
-        g.gain.setValueAtTime(0, startAt + hold + 0.07);
-        osc.connect(g);
-        osc.start(startAt);
-        osc.stop(startAt + hold + 0.08);
-        return g;
-      };
-
-      // Two-tone alternation: A5 (880) / C6 (1047) — a minor third apart.
-      for (let i = 0; i < PULSES; i += 1) {
-        const hz = i % 2 === 0 ? 880 : 1047;
-        pulse(t0 + i * PULSE, hz, PEAK, 0.055).connect(master);
-      }
-
-      // Low body under the first two pulses so the alert has weight even on
-      // laptop speakers that roll off the siren tones.
-      pulse(t0, 220, PEAK * 0.55, 0.2).connect(master);
-
-      // Closing accent: the two siren tones held together, decaying out, so
-      // the alert has an unmistakable "that was the big one" tail.
-      const tailAt = t0 + PULSE * PULSES + 0.04;
-      const tail = (hz, level) => {
-        const osc = ctx.createOscillator();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(hz, tailAt);
-        const g = ctx.createGain();
-        g.gain.setValueAtTime(0, tailAt);
-        g.gain.linearRampToValueAtTime(level, tailAt + 0.02);
-        g.gain.exponentialRampToValueAtTime(0.0001, t0 + END - 0.02);
-        g.gain.setValueAtTime(0, t0 + END - 0.01);
-        osc.connect(g);
-        osc.start(tailAt);
-        osc.stop(t0 + END);
-        return g;
-      };
-      tail(880, PEAK * 0.9).connect(master);
-      tail(1047, PEAK * 0.6).connect(master);
-
-      setTimeout(() => {
-        try { master.disconnect(); } catch (_) {}
-      }, Math.round((END + 0.4) * 1000));
-    } catch (err) {
-      console.warn('run-risk alert sound failed', err);
-    }
+    playAlertSound();
   }
 
   /**
@@ -866,12 +796,12 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
       btn.textContent = '🔔 Sound On';
       btn.classList.add('btn-sound-on');
       btn.classList.remove('btn-ghost');
-      btn.title = 'Alert sound ON — gentle raindrop chime for challenges/reviews/boundary calls (not ABS), plus an urgent two-tone siren whenever an active review could take a run OFF the scoreboard (any review type, ABS included). Click to mute.';
+      btn.title = 'Alert sound ON — gentle raindrop chime for new challenges/reviews/boundary calls (not ABS), and the same chime whenever an active review could take a run OFF the scoreboard (any review type, ABS included). Click to mute.';
     } else {
       btn.textContent = '🔇 Sound Off';
       btn.classList.remove('btn-sound-on');
       btn.classList.add('btn-ghost');
-      btn.title = 'Alert sound OFF — click to enable the gentle raindrop chime for challenges/reviews/boundary calls and the urgent run-at-risk siren';
+      btn.title = 'Alert sound OFF — click to enable the gentle raindrop chime for new challenges/reviews/boundary calls and for run-at-risk reviews';
     }
   }
 
@@ -1014,8 +944,8 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
 
       // Run-at-risk scan. Done once per poll across the WHOLE slate (not per
       // game) so a key that moved games/re-keyed is reconciled in one pass,
-      // and so one poll produces at most one urgent alert no matter how many
-      // games report at the same instant.
+      // and so one poll produces at most one alert no matter how many games
+      // report at the same instant.
       syncRunRiskTracking();
 
       // Priority order: if any run is newly at risk, that is the alert the
@@ -1250,7 +1180,7 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
   /**
    * Top-of-page banner: every game where an active review could take a run
    * back off the scoreboard. This is the persistent visual half of the "alert
-   * me ASAP" requirement — the siren fires once, this stays up for as long as
+   * me ASAP" requirement — the chime fires once, this stays up for as long as
    * the run is actually at risk and disappears the moment the review resolves.
    *
    * Every number and score printed here comes from MLBReviews.runRiskSummary(),
@@ -1265,7 +1195,7 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
 
     const banner = el('div', 'run-risk-banner');
     const head = el('div', 'run-risk-banner-head');
-    head.appendChild(el('span', 'run-risk-siren', '⚠️'));
+    head.appendChild(el('span', 'run-risk-icon', '⚠️'));
     head.appendChild(el('strong', 'run-risk-headline',
       `${total} ${total === 1 ? 'RUN' : 'RUNS'} AT RISK`));
     head.appendChild(el('span', 'run-risk-sub',

@@ -13,7 +13,7 @@
     tools/replay-feed-render-test.mjs uses. No network request is made.
 
     Purpose: see the run-at-risk banner / badge / stat / filter tab and hear
-    the urgent two-tone siren without waiting for a live review. Every number
+    the alert chime without waiting for a live review. Every number
     on screen comes from the fixture payload below — nothing is generated.
 
     Serve the repo root over http and open /tools/run-risk-preview.html
@@ -30,8 +30,7 @@
     <div class="feed-controls">
       <button id="sound-toggle-btn" class="btn btn-ghost">🔇 Sound Off</button>
       <button id="notify-toggle-btn" class="btn btn-ghost">⚪ Run Alerts Off</button>
-      <button class="btn" onclick="ReplayFeed.playRunRiskAlertSound()" title="Hear the urgent run-at-risk siren">▶ Play run-at-risk siren</button>
-      <button class="btn btn-ghost" onclick="ReplayFeed.playAlertSound()" title="Hear the ordinary review chime">▶ Play normal chime</button>
+      <button class="btn" onclick="ReplayFeed.playAlertSound()" title="Hear the raindrop chime — the same sound is used for new reviews and for run-at-risk reviews">▶ Play alert chime</button>
       <button id="refresh-btn" class="btn">Refresh</button>
       <span class="countdown" id="countdown"></span>
       <div class="live-pill"><span id="live-dot" class="live-dot"></span><span>LIVE</span></div>

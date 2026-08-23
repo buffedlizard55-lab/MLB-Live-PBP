@@ -1823,7 +1823,7 @@ a:hover { text-decoration: underline; }
   gap: 10px;
   flex-wrap: wrap;
 }
-.run-risk-siren {
+.run-risk-icon {
   font-size: 18px;
   line-height: 1;
   animation: run-risk-flash 0.9s ease-in-out infinite;
@@ -1944,7 +1944,7 @@ a:hover { text-decoration: underline; }
 @media (prefers-reduced-motion: reduce) {
   .run-risk-banner,
   .feed-row-run-risk,
-  .run-risk-siren,
+  .run-risk-icon,
   .feed-run-risk-badge,
   .feed-active-impact-risk,
   .stat-run-risk .review-stat-value {

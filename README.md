@@ -48,12 +48,14 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
     synthesized raindrop chime (three soft drops blooming into a warm two-note
     chime, ~1.2s, pure sine tones with a light echo) when a new challenge, review,
     or boundary call lands. It is off by default, remembers your choice per
-    browser, and never fires for routine ABS pitch challenges.
+    browser, and never fires for routine ABS pitch challenges (the run-at-risk
+    case below is the one exception, and it uses this exact same chime).
   - **⚠️ Runs at Risk — "could this review take a run OFF the board?"** The feed
     tracks, per review, whether the call on the field credited runs to the very
     event now under review, so an overturn could remove them from the score. When
-    it can, you get, immediately: an **urgent two-tone siren** (distinct from the
-    ordinary chime — six fast alternating pulses, ~1.45s, still sine-only), an
+    it can, you get, immediately: the **same gentle raindrop chime** used for any
+    new review (one alert sound for the whole page — it is literally the same
+    audio graph, and shares its 2.5s cooldown), an
     optional **desktop notification**, a persistent **red banner** at the top of
     the page listing every affected game with the call-stands score and the score
     if the runs come off, a **⚠️ N RUN(S) AT RISK** badge and glow on the feed row,
