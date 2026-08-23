@@ -12,13 +12,87 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const source = readFileSync(new URL('../assets/js/reviews-feed.js', import.meta.url), 'utf8');
+
+/* Controllable clock: identical to the real Date while clockOffsetMs is 0.
+ * The audio-alert test advances it past the 2.5s cooldown deterministically. */
+let clockOffsetMs = 0;
+class FakeDate extends Date {
+  constructor(...args) {
+    if (args.length) super(...args);
+    else super(Date.now() + clockOffsetMs);
+  }
+  static now() { return super.now() + clockOffsetMs; }
+}
+
+/* Recording stub for the Web Audio graph (filled in below, used by the
+ * audio-alert section at the end of this file). */
+const audioLog = { oscillators: [], edges: [], resumes: 0, ctx: null };
+
+function stubAudioParam(events) {
+  return {
+    value: 0,
+    setValueAtTime(v, t) { events.push({ kind: 'set', v, t }); },
+    linearRampToValueAtTime(v, t) { events.push({ kind: 'lin', v, t }); },
+    exponentialRampToValueAtTime(v, t) {
+      // Real browsers throw on a zero target — catch that bug class here.
+      assert.ok(v > 0, 'exponentialRampToValueAtTime target must be > 0 (0 throws in browsers)');
+      events.push({ kind: 'exp', v, t });
+    },
+  };
+}
+
+function stubAudioNode(kind, extra = {}) {
+  const node = {
+    _kind: kind,
+    ...extra,
+    connect(to) { audioLog.edges.push([node, to]); return to; },
+    disconnect() {},
+  };
+  return node;
+}
+
+class StubAudioContext {
+  constructor() {
+    this.state = 'running';
+    this.currentTime = 100;
+    this.destination = stubAudioNode('destination');
+    audioLog.ctx = this;
+  }
+  resume() { audioLog.resumes += 1; return Promise.resolve(); }
+  createGain() {
+    const n = stubAudioNode('gain');
+    n.gain = stubAudioParam((n._gainEvents = []));
+    return n;
+  }
+  createOscillator() {
+    const n = stubAudioNode('oscillator');
+    n.type = null; // must be set explicitly by the code under test
+    n.frequency = stubAudioParam((n._freqEvents = []));
+    n.startedAt = null;
+    n.stoppedAt = null;
+    n.start = (t) => { n.startedAt = t; audioLog.oscillators.push(n); };
+    n.stop = (t) => { n.stoppedAt = t; };
+    return n;
+  }
+  createDelay() {
+    const n = stubAudioNode('delay');
+    n.delayTime = stubAudioParam((n._delayEvents = []));
+    return n;
+  }
+  createBiquadFilter() {
+    const n = stubAudioNode('filter', { type: null });
+    n.frequency = stubAudioParam((n._freqEvents = []));
+    return n;
+  }
+}
+
 const context = {
   console: { warn() {}, error() {}, log() {} },
-  Map, Set, Date, Math, Number, String, Object, Array, URLSearchParams, CSS: { escape: (s) => s },
+  Map, Set, Date: FakeDate, Math, Number, String, Object, Array, URLSearchParams, CSS: { escape: (s) => s },
   UI: { el: () => ({}), clear: () => ({}) },
   MLB: {},
-  window: {},
-  document: { addEventListener() {} },
+  window: { AudioContext: StubAudioContext },
+  document: { addEventListener() {}, querySelector: () => null },
   setTimeout: () => 0,
   clearTimeout: () => {},
   setInterval: () => 0,
@@ -33,6 +107,7 @@ const {
   sortFeedEntries, gameTeamsLabel,
   isUsableName, officialTeamName, gameSideTeam,
   pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
+  shouldAlertForReview,
 } = context.module.exports;
 
 /* ------------------------------------------------------- 1. Stable keys */
@@ -409,5 +484,98 @@ const seen = [];
 await mapPool(['a', 'b', 'c', 'd'], 2, async (item) => { seen.push(item); });
 assert.deepEqual(seen.slice().sort(), ['a', 'b', 'c', 'd'], 'mapPool visits every item');
 await mapPool([], 4, async () => { throw new Error('must not run on empty'); });
+
+/* ----------------------------- 10. Alert gating (which events make sound) */
+
+// ABS pitch challenges are routine and must stay silent…
+assert.equal(shouldAlertForReview({ typeKey: 'abs' }), false);
+// …while every other observed review typeKey alerts.
+assert.equal(shouldAlertForReview({ typeKey: 'manager' }), true);
+assert.equal(shouldAlertForReview({ typeKey: 'crew_chief' }), true);
+assert.equal(shouldAlertForReview({ typeKey: 'boundary' }), true);
+assert.equal(shouldAlertForReview({ typeKey: 'review' }), true);
+assert.equal(shouldAlertForReview({ typeKey: 'rules' }), true);
+// Defensive: junk input never alerts.
+assert.equal(shouldAlertForReview(null), false);
+assert.equal(shouldAlertForReview({}), false);
+assert.equal(shouldAlertForReview({ typeKey: 42 }), false);
+
+/* ---------------------- 11. Audio alert is a gentle raindrop chime
+ *
+ * Drives window.ReplayFeed against a recording AudioContext stub and
+ * verifies the graph the code actually builds:
+ *   - silence while the toggle is off; preview plays once when enabled
+ *   - every oscillator is an explicitly-set sine (no square/sawtooth buzz)
+ *   - three pitch-drop "raindrop" voices + a soft chime tail
+ *   - per-voice levels stay gentle (≤ 0.3) and envelopes end cleanly
+ *   - the 2.5s cooldown blocks an immediate repeat and admits one after it
+ *   - a suspended context is resumed before playing
+ */
+
+const ReplayFeed = context.window.ReplayFeed;
+assert.ok(ReplayFeed, 'window.ReplayFeed API is exported');
+
+// 11a. Disabled by default (no localStorage in this VM): nothing plays.
+assert.equal(ReplayFeed.getSoundEnabled(), false);
+ReplayFeed.playAlertSound();
+assert.equal(audioLog.oscillators.length, 0, 'no sound while the toggle is off');
+
+// 11b. Enabling plays exactly one preview alert (the user-gesture path).
+ReplayFeed.setSoundEnabled(true);
+assert.equal(ReplayFeed.getSoundEnabled(), true);
+const previewCount = audioLog.oscillators.length;
+assert.ok(previewCount > 0, 'enabling the toggle plays a preview');
+
+// 11c. Every oscillator is an explicitly-set pure sine — no buzz timbres.
+audioLog.oscillators.forEach((osc) => {
+  assert.equal(osc.type, 'sine', 'alert must use sine oscillators only (soft timbre)');
+  assert.ok(Number.isFinite(osc.startedAt) && Number.isFinite(osc.stoppedAt), 'oscillator has start/stop');
+  assert.ok(osc.stoppedAt > osc.startedAt, 'oscillator stop is after start');
+});
+
+// 11d. Voice mix: 3 pitch-drop raindrops (exponential high→low sweep) + 2
+//     steady-pitch chime partials = the recognizable gentle motif.
+const drops = audioLog.oscillators.filter((o) => o._freqEvents.some((e) => e.kind === 'exp'));
+const chimes = audioLog.oscillators.filter((o) => !o._freqEvents.some((e) => e.kind === 'exp'));
+assert.equal(drops.length, 3, 'exactly three raindrop voices');
+assert.equal(chimes.length, 2, 'exactly two chime partials');
+drops.forEach((o) => {
+  const from = o._freqEvents.find((e) => e.kind === 'set').v;
+  const to = o._freqEvents.find((e) => e.kind === 'exp').v;
+  assert.ok(from > to && to > 0, `raindrop sweeps high→low (${from}→${to} Hz)`);
+});
+// The drops ascend (rising plip-plop-ploop motif = clearly an alert).
+const dropFroms = drops.map((o) => o._freqEvents.find((e) => e.kind === 'set').v);
+assert.ok(dropFroms[0] < dropFroms[1] && dropFroms[1] < dropFroms[2],
+  `raindrops ascend (${dropFroms.join(' → ')} Hz)`);
+
+// 11e. Gentle levels + clean envelopes on every oscillator's gain node.
+audioLog.oscillators.forEach((osc) => {
+  const edge = audioLog.edges.find(([src]) => src === osc);
+  assert.ok(edge, 'each oscillator connects into a gain node');
+  const voiceGain = edge[1];
+  assert.equal(voiceGain._kind, 'gain');
+  const peaks = voiceGain._gainEvents.map((e) => e.v).filter((v) => v > 0);
+  assert.ok(peaks.length, 'voice gain is automated');
+  assert.ok(Math.max(...peaks) <= 0.3, `voice level is gentle (peak ${Math.max(...peaks)})`);
+  const kinds = voiceGain._gainEvents.map((e) => e.kind).join(',');
+  assert.ok(kinds.includes('lin') && kinds.includes('exp'),
+    'voice envelope has a fast attack and an exponential (natural) decay');
+});
+
+// 11f. The 2.5s cooldown: an immediate repeat is suppressed…
+ReplayFeed.playAlertSound();
+assert.equal(audioLog.oscillators.length, previewCount, 'cooldown blocks an immediate repeat');
+// …and after the cooldown a new alert plays.
+clockOffsetMs = 3000;
+audioLog.ctx.state = 'suspended';
+ReplayFeed.playAlertSound();
+assert.equal(audioLog.oscillators.length, previewCount * 2, 'alert plays again after the cooldown');
+assert.ok(audioLog.resumes >= 1, 'a suspended AudioContext is resumed before playing');
+
+// 11g. Disabling silences it again (and no preview on mute).
+ReplayFeed.setSoundEnabled(false);
+assert.equal(ReplayFeed.getSoundEnabled(), false);
+assert.equal(audioLog.oscillators.length, previewCount * 2, 'muting plays nothing');
 
 console.log('Replay feed tests passed successfully!');

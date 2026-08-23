@@ -43,7 +43,11 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
     fielding side), and the count after the call is overturned or stands. Includes
     an "Under Review" live strip, per-type
     filters (All / ABS / Challenges / Reviews / Boundary Calls / Under Review),
-    and summary stats for the whole day.
+    summary stats for the whole day, and an optional **sound alert** — a gentle
+    synthesized raindrop chime (three soft drops blooming into a warm two-note
+    chime, ~1.2s, pure sine tones with a light echo) when a new challenge, review,
+    or boundary call lands. It is off by default, remembers your choice per
+    browser, and never fires for routine ABS pitch challenges.
   - **Scoreboard Live Ticker & Alert Badges** — surfaces any game currently in review or challenge,
     with a link straight to the all-games Replay Feed.
   - **Live Game Review Alert Banner** — eye-catching alert at the top of the game and live module when a call is under review.

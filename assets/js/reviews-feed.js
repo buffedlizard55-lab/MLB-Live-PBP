@@ -410,7 +410,7 @@ function gameTeamsLabel(game, teamsById) {
 }
 
 /**
- * Whether a review should trigger the 3-second buzz alert.
+ * Whether a review should trigger the audio alert (gentle raindrop chime).
  * Requirement: challenges, reviews, boundary calls, but NOT ABS.
  * ABS is typeKey 'abs'. Everything else (manager, crew_chief, boundary,
  * review, rules, umpire) qualifies. Pure function — no DOM.
@@ -449,7 +449,7 @@ function shouldAlertForReview(review) {
   let settledGames = new Set();     // Final games: fetched once, immutable
   const feedState = { seen: new Map(), order: [] };
 
-  // --- Audio alert state (3s buzz for challenges/reviews/boundary, not ABS) ---
+  // --- Audio alert state (gentle raindrop chime for challenges/reviews/boundary, not ABS) ---
   let isFirstLoad = true;
   let pendingAlertableCount = 0;
   let audioEnabled = false;
@@ -502,14 +502,26 @@ function shouldAlertForReview(review) {
   }
 
   /**
-   * Play a 3-second buzz alert for challenges/reviews/boundary calls.
+   * Play a soft "raindrop chime" alert for challenges/reviews/boundary calls.
    * Uses Web Audio API (no external file) so it works on static hosting.
-   * Two oscillators (square + sawtooth) create a harsh buzzer tone.
+   *
+   * Sound design (gentle but unmistakable — pleasant even when it fires often):
+   *   - Three ascending water-drop "bloops": pure sine oscillators whose pitch
+   *     falls fast (exponential ramp high→low, the classic synthesized-
+   *     raindrop technique) with a quick attack and a natural decay. The
+   *     rising plip-plop-ploop motif is instantly recognizable as "something
+   *     happened" without any urgency or harshness.
+   *   - A warm chime tail: two sine partials a perfect fifth apart bloom out
+   *     of the last drop and ring out softly, so the alert is clearly
+   *     noticeable at low volume.
+   *   - Sine waves only — no square/sawtooth buzz — capped at a modest peak,
+   *     with a light low-passed echo so repeats feel airy, not insistent.
+   *   - ~1.2s total, then silence (the old alert was a 3s buzzer).
    */
   function playAlertSound() {
     if (!audioEnabled) return;
     const nowMs = Date.now();
-    // Cooldown 2.5s to avoid overlapping buzzes when multiple games report at once
+    // Cooldown 2.5s to avoid overlapping chimes when multiple games report at once
     if (nowMs - lastAlertAt < 2500) return;
     lastAlertAt = nowMs;
 
@@ -520,53 +532,85 @@ function shouldAlertForReview(review) {
         ctx.resume().catch(() => {});
       }
       const t0 = ctx.currentTime;
+      const PEAK = 0.24; // soft level; the sine-only timbre keeps it gentle
 
-      const gainNode = ctx.createGain();
-      gainNode.gain.setValueAtTime(0, t0);
-      gainNode.gain.linearRampToValueAtTime(0.32, t0 + 0.04);
-      gainNode.gain.setValueAtTime(0.32, t0 + 2.75);
-      gainNode.gain.linearRampToValueAtTime(0, t0 + 3.0);
-      gainNode.connect(ctx.destination);
+      // Master bus: fades the whole alert out smoothly at the end.
+      const master = ctx.createGain();
+      master.gain.setValueAtTime(0, t0);
+      master.gain.linearRampToValueAtTime(1, t0 + 0.01);
+      master.gain.setValueAtTime(1, t0 + 1.05);
+      master.gain.linearRampToValueAtTime(0, t0 + 1.25);
+      master.connect(ctx.destination);
 
-      // Primary buzzer: square wave ~860Hz with slight wobble
-      const osc1 = ctx.createOscillator();
-      osc1.type = 'square';
-      osc1.frequency.setValueAtTime(860, t0);
-      osc1.frequency.linearRampToValueAtTime(780, t0 + 0.12);
-      osc1.frequency.linearRampToValueAtTime(860, t0 + 0.24);
-      osc1.frequency.linearRampToValueAtTime(820, t0 + 0.5);
-      osc1.frequency.setValueAtTime(860, t0 + 1.0);
-      osc1.connect(gainNode);
+      // Soft echo (spacious "rainy" tail): short delay with light feedback,
+      // low-passed so each repeat is mellower than the last.
+      const echo = ctx.createDelay(1);
+      echo.delayTime.value = 0.17;
+      const echoFilter = ctx.createBiquadFilter();
+      echoFilter.type = 'lowpass';
+      echoFilter.frequency.value = 1800;
+      const echoFeedback = ctx.createGain();
+      echoFeedback.gain.value = 0.25;
+      const echoMix = ctx.createGain();
+      echoMix.gain.value = 0.3;
+      master.connect(echo);
+      echo.connect(echoFilter);
+      echoFilter.connect(echoFeedback);
+      echoFeedback.connect(echo);
+      echoFilter.connect(echoMix);
+      echoMix.connect(ctx.destination);
 
-      // Secondary harshness: sawtooth at 430Hz
-      const osc2 = ctx.createOscillator();
-      osc2.type = 'sawtooth';
-      osc2.frequency.setValueAtTime(430, t0);
-      osc2.connect(gainNode);
+      // One synthesized water drop: a sine that starts high and falls fast,
+      // with a quick attack and exponential decay. Returns its gain node so
+      // the caller sets level + timing.
+      const raindrop = (startAt, fromHz, toHz, level) => {
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(fromHz, startAt);
+        osc.frequency.exponentialRampToValueAtTime(toHz, startAt + 0.09);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0, startAt);
+        g.gain.linearRampToValueAtTime(level, startAt + 0.008);
+        g.gain.exponentialRampToValueAtTime(0.0001, startAt + 0.38);
+        g.gain.setValueAtTime(0, startAt + 0.39);
+        osc.connect(g);
+        osc.start(startAt);
+        osc.stop(startAt + 0.4);
+        return g;
+      };
 
-      // Optional: very short beep overlay for attention
-      const osc3 = ctx.createOscillator();
-      const gain3 = ctx.createGain();
-      osc3.type = 'sine';
-      osc3.frequency.setValueAtTime(1200, t0);
-      gain3.gain.setValueAtTime(0, t0);
-      gain3.gain.linearRampToValueAtTime(0.18, t0 + 0.02);
-      gain3.gain.linearRampToValueAtTime(0, t0 + 0.35);
-      osc3.connect(gain3);
-      gain3.connect(ctx.destination);
+      // Three ascending drops — the recognizable alert motif.
+      raindrop(t0, 900, 340, PEAK).connect(master);
+      raindrop(t0 + 0.16, 1080, 400, PEAK).connect(master);
+      raindrop(t0 + 0.32, 1260, 470, PEAK).connect(master);
 
-      osc1.start(t0);
-      osc2.start(t0);
-      osc3.start(t0);
-      osc1.stop(t0 + 3.0);
-      osc2.stop(t0 + 3.0);
-      osc3.stop(t0 + 0.36);
+      // Warm chime tail (perfect fifth dyad) so the event is obvious without
+      // any harshness. B5 + F#6 ring softly under the last drop's decay.
+      const chime = (freq, level) => {
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0, t0 + 0.42);
+        g.gain.linearRampToValueAtTime(level, t0 + 0.46);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 1.2);
+        g.gain.setValueAtTime(0, t0 + 1.21);
+        osc.connect(g);
+        osc.start(t0 + 0.42);
+        osc.stop(t0 + 1.22);
+        return g;
+      };
+      chime(990, PEAK * 0.85).connect(master);
+      chime(1485, PEAK * 0.45).connect(master);
 
-      // Cleanup nodes after playback
+      // Cleanup nodes after playback (alert ends 1.25s in; echo tail follows)
       setTimeout(() => {
-        try { gainNode.disconnect(); } catch (_) {}
-        try { gain3.disconnect(); } catch (_) {}
-      }, 3500);
+        try { master.disconnect(); } catch (_) {}
+        try { echo.disconnect(); } catch (_) {}
+        try { echoFilter.disconnect(); } catch (_) {}
+        try { echoFeedback.disconnect(); } catch (_) {}
+        try { echoMix.disconnect(); } catch (_) {}
+      }, 1800);
     } catch (err) {
       console.warn('alert sound failed', err);
     }
@@ -579,12 +623,12 @@ function shouldAlertForReview(review) {
       btn.textContent = '🔔 Sound On';
       btn.classList.add('btn-sound-on');
       btn.classList.remove('btn-ghost');
-      btn.title = 'Alert sound ON — buzz for challenges/reviews/boundary calls (not ABS). Click to mute.';
+      btn.title = 'Alert sound ON — gentle raindrop chime for challenges/reviews/boundary calls (not ABS). Click to mute.';
     } else {
       btn.textContent = '🔇 Sound Off';
       btn.classList.remove('btn-sound-on');
       btn.classList.add('btn-ghost');
-      btn.title = 'Alert sound OFF — click to enable 3s buzz for challenges/reviews/boundary calls';
+      btn.title = 'Alert sound OFF — click to enable the gentle raindrop chime for challenges/reviews/boundary calls';
     }
   }
 
@@ -601,8 +645,9 @@ function shouldAlertForReview(review) {
       if (ctx && ctx.state === 'suspended') {
         ctx.resume().catch(() => {});
       }
-      // Play a short preview buzz so user knows it works (still 3s per spec,
-      // but we trigger it directly on user gesture, which satisfies autoplay policy)
+      // Play the chime once as a preview so the user knows what to listen
+      // for (triggered directly on the user gesture, which satisfies
+      // autoplay policy)
       playAlertSound();
     }
   }
@@ -656,7 +701,7 @@ function shouldAlertForReview(review) {
       if (requestDate !== dateStr) return;
 
       // If this poll discovered new non-ABS events and it's not the very first
-      // load (initial page population), play the 3-second buzz.
+      // load (initial page population), play the gentle raindrop chime.
       if (!isFirstLoad && pendingAlertableCount > 0 && audioEnabled) {
         playAlertSound();
       }
@@ -721,7 +766,7 @@ function shouldAlertForReview(review) {
       ? window.MLBReviews.extractReviews(pseudoFeed)
       : { reviews: [], activeReview: null };
     const result = mergeFeedEvents(feedState, gamePk, reviewData.reviews);
-    // Count new alertable events for the 3s buzz (challenges/reviews/boundary, not ABS)
+    // Count new alertable events for the chime (challenges/reviews/boundary, not ABS)
     if (result.added && result.added.length) {
       const alertable = result.added.filter((e) => {
         try {
