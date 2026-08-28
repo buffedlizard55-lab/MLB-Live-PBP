@@ -199,6 +199,37 @@ try {
   check('schedule hydrate=review fetched', false, err.message);
 }
 
+/* challenge counters (replay feed challenges-remaining tracker, 2026-08-28):
+ * MLB.getChallengeCounts() sends exactly this fields-projected feed/live URL.
+ * gameData.review (manager counters) must always be present; absChallenges is
+ * ABS-era only (2026+) so it is reported, not required. */
+console.log('\n== challenge counters (fields-projected feed/live) ==');
+try {
+  if (!games.length) {
+    console.log('  (no games on this date — skipped)');
+  } else {
+    const pk = games[0].gamePk;
+    const counts = await getJSON(`${V11}/game/${pk}/feed/live?fields=gameData,review,absChallenges,` +
+      'hasChallenges,away,home,used,remaining,usedSuccessful,usedFailed');
+    const rev = counts && counts.gameData && counts.gameData.review;
+    check('gameData.review carries away/home.used/remaining numbers',
+      !!rev && !!rev.away && typeof rev.away.used === 'number' && typeof rev.away.remaining === 'number' &&
+      !!rev.home && typeof rev.home.used === 'number' && typeof rev.home.remaining === 'number');
+    const abs = counts && counts.gameData && counts.gameData.absChallenges;
+    if (abs) {
+      check('gameData.absChallenges carries away/home usedSuccessful/usedFailed/remaining numbers',
+        !!abs.away && typeof abs.away.usedSuccessful === 'number' &&
+        typeof abs.away.usedFailed === 'number' && typeof abs.away.remaining === 'number' &&
+        !!abs.home && typeof abs.home.usedSuccessful === 'number' &&
+        typeof abs.home.usedFailed === 'number' && typeof abs.home.remaining === 'number');
+    } else {
+      console.log('  (no gameData.absChallenges on this game — expected for pre-ABS seasons)');
+    }
+  }
+} catch (err) {
+  check('challenge counters fetched', false, err.message);
+}
+
 /* official team names / abbreviations (replay feed regression guard, 2026-08-19):
  * the schedule's team objects carry ONLY { id, name, link } — the replay feed
  * rendered `${team.abbreviation}` from them and showed "undefined @ undefined".

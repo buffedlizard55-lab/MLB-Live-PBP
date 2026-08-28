@@ -500,6 +500,159 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
   return { started, cleared, next };
 }
 
+/* --------------------------------------------- challenges-remaining tracker */
+
+/** A non-negative finite number, else null. Counters are never invented. */
+function readCountNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+/**
+ * Normalize one game's official challenge counters into
+ *   { manager: { away/home: { used, remaining } } | null,
+ *     abs:     { away/home: { usedSuccessful, usedFailed, remaining } } | null }
+ *
+ * Sources (both shapes verified live against statsapi.mlb.com, 2026-08-28):
+ *   managerSource — the `review` object from the schedule's hydrate=review OR
+ *     from feed/live gameData.review; identical shape either way, e.g.
+ *     {"hasChallenges":true,"away":{"used":1,"remaining":0},"home":{"used":2,"remaining":0}}
+ *     (game 824879). These are the MANAGER replay-challenge counters only.
+ *   absSource — feed/live gameData.absChallenges, e.g.
+ *     {"hasChallenges":true,"away":{"usedSuccessful":2,"usedFailed":0,"remaining":2},
+ *      "home":{"usedSuccessful":3,"usedFailed":0,"remaining":2}} (game 824638, live).
+ *     The SCHEDULE endpoint does NOT expose absChallenges (verified 2026-08-28),
+ *     and pre-ABS seasons have no absChallenges at all (verified 2025 game
+ *     776162) — in both cases `abs` stays null; it is never defaulted to 0.
+ *
+ * Missing / malformed numbers stay null. Returns null when neither source
+ * yields a single usable counter.
+ */
+function normalizeChallengeCounts(managerSource, absSource) {
+  const readSide = (src, which, keys) => {
+    const s = src && src[which];
+    if (!s || typeof s !== 'object') return null;
+    const out = {};
+    let any = false;
+    keys.forEach((k) => {
+      const v = readCountNumber(s[k]);
+      out[k] = v;
+      if (v != null) any = true;
+    });
+    return any ? out : null;
+  };
+  const manager = managerSource ? {
+    away: readSide(managerSource, 'away', ['used', 'remaining']),
+    home: readSide(managerSource, 'home', ['used', 'remaining']),
+  } : null;
+  const abs = absSource ? {
+    away: readSide(absSource, 'away', ['usedSuccessful', 'usedFailed', 'remaining']),
+    home: readSide(absSource, 'home', ['usedSuccessful', 'usedFailed', 'remaining']),
+  } : null;
+  const managerOk = manager && (manager.away || manager.home) ? manager : null;
+  const absOk = abs && (abs.away || abs.home) ? abs : null;
+  if (!managerOk && !absOk) return null;
+  return { manager: managerOk, abs: absOk };
+}
+
+/**
+ * Compare two successive counter snapshots of the SAME game and list
+ * irregularities worth flagging for review.
+ *
+ * Deliberately minimal: the only rule encoded is that a `used*` counter can
+ * never DECREASE within one game (a spent challenge cannot be un-spent).
+ * `remaining` is never flagged in either direction, because it can
+ * legitimately rise (the official payload keeps `remaining` on a successful
+ * manager challenge — verified game 822694 away used:1 remaining:1 — and ABS
+ * challenges are retained when successful / regained in extra innings, e.g.
+ * live game 824638 away usedSuccessful:2 remaining:2). No MLB rulebook math
+ * is asserted beyond monotonicity; everything else is displayed as-is.
+ *
+ * Returns an array of human-readable issue strings (empty = no irregularity).
+ */
+function challengeCountIrregularities(prev, next) {
+  const issues = [];
+  if (!prev || !next) return issues;
+  const cmp = (label, a, b, keys) => {
+    if (!a || !b) return;
+    keys.forEach((k) => {
+      if (a[k] != null && b[k] != null && b[k] < a[k]) {
+        issues.push(`${label}.${k} decreased ${a[k]} → ${b[k]}`);
+      }
+    });
+  };
+  ['away', 'home'].forEach((side) => {
+    cmp(`manager.${side}`, prev.manager && prev.manager[side],
+      next.manager && next.manager[side], ['used']);
+    cmp(`abs.${side}`, prev.abs && prev.abs[side],
+      next.abs && next.abs[side], ['usedSuccessful', 'usedFailed']);
+  });
+  return issues;
+}
+
+/** Which side of the game a teamId plays for ('away' | 'home' | null). */
+function teamSideInGame(game, teamId) {
+  if (teamId == null) return null;
+  const away = gameSideTeam(game, 'away');
+  if (away && away.id === teamId) return 'away';
+  const home = gameSideTeam(game, 'home');
+  if (home && home.id === teamId) return 'home';
+  return null;
+}
+
+/**
+ * One team's remaining-challenge line for the challenge type the feed row is
+ * about. Only the two types that actually consume a per-team counter are
+ * rendered ('abs' → absChallenges, 'manager' → review); crew-chief/umpire/
+ * boundary reviews are not charged to a team and return null. Returns null
+ * whenever the official `remaining` counter is absent — a missing counter is
+ * never printed as 0.
+ */
+function teamChallengeLine(counts, side, teamLabel, typeKey, tense) {
+  if (!counts || (side !== 'away' && side !== 'home')) return null;
+  const label = isUsableName(teamLabel) ? teamLabel : (side === 'away' ? 'Away' : 'Home');
+  const suffix = tense ? ` ${tense}` : '';
+  if (typeKey === 'abs') {
+    const c = counts.abs && counts.abs[side];
+    if (!c || c.remaining == null) return null;
+    const used = (c.usedSuccessful != null && c.usedFailed != null)
+      ? ` (${c.usedSuccessful} successful · ${c.usedFailed} failed)`
+      : '';
+    return `${label}: ${c.remaining} ABS challenge${c.remaining === 1 ? '' : 's'} left${suffix}${used}`;
+  }
+  if (typeKey === 'manager') {
+    const c = counts.manager && counts.manager[side];
+    if (!c || c.remaining == null) return null;
+    const used = c.used != null ? ` (${c.used} used)` : '';
+    return `${label}: ${c.remaining} manager challenge${c.remaining === 1 ? '' : 's'} left${suffix}${used}`;
+  }
+  return null;
+}
+
+/**
+ * Compact both-teams summary, e.g.
+ *   "Challenges left: CIN 1 MGR · 2 ABS — CHC 1 MGR · 2 ABS"
+ * Sides/counters that are unavailable are simply omitted (never zero-filled);
+ * returns null when nothing official is available at all.
+ */
+function gameChallengeLine(counts, labels, prefix) {
+  if (!counts) return null;
+  const names = labels || {};
+  const sideBits = (side) => {
+    const bits = [];
+    const m = counts.manager && counts.manager[side];
+    if (m && m.remaining != null) bits.push(`${m.remaining} MGR`);
+    const a = counts.abs && counts.abs[side];
+    if (a && a.remaining != null) bits.push(`${a.remaining} ABS`);
+    if (!bits.length) return null;
+    const name = isUsableName(names[side]) ? names[side] : (side === 'away' ? 'Away' : 'Home');
+    return `${name} ${bits.join(' · ')}`;
+  };
+  const away = sideBits('away');
+  const home = sideBits('home');
+  if (!away && !home) return null;
+  return `${prefix || 'Challenges left'}: ${[away, home].filter(Boolean).join(' — ')}`;
+}
+
 /* ------------------------------------------------------------ page logic */
 
 (() => {
@@ -528,6 +681,11 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
   let requestInFlight = false;
   let settledGames = new Set();     // Final games: fetched once, immutable
   const feedState = { seen: new Map(), order: [] };
+  // gamePk -> { counts: normalizeChallengeCounts(...), issues: [], updatedAt }
+  // Official per-team challenge counters (manager `review` + `absChallenges`)
+  // for every game that has at least one feed event. Counters are read from
+  // the payloads only — never derived by counting feed rows ourselves.
+  const challengeCounts = new Map();
 
   // --- Audio alert state (gentle raindrop chime for challenges/reviews/boundary, not ABS) ---
   let isFirstLoad = true;
@@ -579,6 +737,7 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
     feedState.seen.clear();
     feedState.order.length = 0;
     settledGames = new Set();
+    challengeCounts.clear();
     isFirstLoad = true;
     pendingAlertableCount = 0;
     alertedRunRiskKeys.clear();
@@ -934,6 +1093,14 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
       }
       if (requestDate !== dateStr) return;
 
+      // Manager-challenge counters ride along on every schedule poll
+      // (hydrate=review — shape verified live 2026-08-28: every game carries
+      // review.away/home.used/remaining). ABS counters are NOT in the
+      // schedule; ingestGame fetches them per game that has feed events.
+      games.forEach((g) => {
+        if (g && g.gamePk != null && g.review) updateGameCounts(g.gamePk, g.review, null, false);
+      });
+
       const candidates = games.filter((g) => {
         const state = g.status && g.status.abstractGameState;
         return state === 'Live' || state === 'Final';
@@ -988,6 +1155,44 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
     }
   }
 
+  /**
+   * Merge freshly observed official counters into the per-game tracker.
+   * A poll that carries only one source (schedule → manager only; feed/live →
+   * both) must not erase the other source's last observed values, so the two
+   * halves are retained independently. Any irregularity (a used-counter going
+   * down mid-game) is recorded once and kept visible for review.
+   */
+  function updateGameCounts(gamePk, managerSource, absSource, isFeedLive) {
+    const prev = challengeCounts.get(gamePk) || null;
+    // The schedule's review hydration and feed/live's gameData.review carry
+    // the same counters, but the schedule can lag behind the live feed. Once
+    // feed/live manager counters have been observed for a game, a
+    // schedule-only poll may not overwrite them (or a stale cache would raise
+    // a false "counter decreased" flag).
+    let effectiveManager = managerSource;
+    if (!isFeedLive && prev && prev.managerFromFeedLive) effectiveManager = null;
+    const fresh = normalizeChallengeCounts(effectiveManager, absSource);
+    if (!fresh) return;
+    const merged = {
+      manager: fresh.manager || (prev && prev.counts && prev.counts.manager) || null,
+      abs: fresh.abs || (prev && prev.counts && prev.counts.abs) || null,
+    };
+    const issues = prev ? challengeCountIrregularities(prev.counts, merged) : [];
+    const allIssues = prev && prev.issues ? [...prev.issues] : [];
+    issues.forEach((issue) => { if (!allIssues.includes(issue)) allIssues.push(issue); });
+    if (issues.length) {
+      console.warn(`challenge counters irregularity (game ${gamePk}) — flagged for review:`, issues);
+    }
+    challengeCounts.set(gamePk, {
+      counts: merged,
+      issues: allIssues,
+      updatedAt: Date.now(),
+      managerFromFeedLive: (isFeedLive && !!fresh.manager) ||
+        !!(prev && prev.managerFromFeedLive),
+      absAttempted: isFeedLive || !!(prev && prev.absAttempted),
+    });
+  }
+
   async function ingestGame(game) {
     const gamePk = game.gamePk;
     const state = game.status && game.status.abstractGameState;
@@ -1032,6 +1237,31 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
       ? window.MLBReviews.extractReviews(pseudoFeed)
       : { reviews: [], activeReview: null };
     const result = mergeFeedEvents(feedState, gamePk, reviewData.reviews);
+
+    // Official challenges-remaining counters. The schedule already supplied
+    // the manager `review` half; the ABS half only lives in feed/live's
+    // gameData.absChallenges (verified 2026-08-28: absent from the schedule,
+    // absent entirely in pre-ABS seasons). One tiny fields-projected request
+    // per game, and only for games that actually have feed events — a game
+    // with no challenges/reviews has nothing to annotate. Counters only move
+    // when a challenge/review lands or resolves (both are feed-event changes),
+    // so re-fetch only when this game's events changed or counters were never
+    // captured; the 1–2s live cadence is not doubled for a quiet game.
+    const hasEntries = [...feedState.seen.values()].some((e) => e.gamePk === gamePk);
+    const eventsChanged = result.added.length || result.updated.length || result.ended.length;
+    const tracked = challengeCounts.get(gamePk);
+    const needsCounts = hasEntries &&
+      (eventsChanged || !tracked || !tracked.absAttempted);
+    if (needsCounts && MLB.getChallengeCounts) {
+      try {
+        const countsFeed = await MLB.getChallengeCounts(gamePk);
+        const gd = (countsFeed && countsFeed.gameData) || {};
+        updateGameCounts(gamePk, gd.review || null, gd.absChallenges || null, true);
+      } catch (countErr) {
+        // Keep the last observed counters; never zero-fill on a failed poll.
+        console.warn(`challenge counters unavailable this poll (game ${gamePk})`, countErr);
+      }
+    }
     // Count new alertable events for the chime (challenges/reviews/boundary, not ABS)
     if (result.added && result.added.length) {
       const alertable = result.added.filter((e) => {
@@ -1182,6 +1412,14 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
       if (entries.some((e) => runsRemovableFromReview(e.review) > 0)) {
         item.classList.add('feed-active-link-risk');
       }
+      // Current official challenges-remaining for the game under review.
+      const tracked = challengeCounts.get(gamePk);
+      const countsLine = tracked
+        ? gameChallengeLine(tracked.counts, gameSideLabels(g), 'Challenges left')
+        : null;
+      if (countsLine) {
+        item.appendChild(el('span', 'feed-active-challenges', countsLine));
+      }
       bar.appendChild(item);
     });
     wrap.appendChild(bar);
@@ -1307,6 +1545,23 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
     return entry.review.typeKey === filter;
   }
 
+  /**
+   * Short official labels for both sides of a game: the /teams directory
+   * abbreviation when available, else the official full name from the
+   * schedule, else Away/Home. Nothing is fabricated from a name.
+   */
+  function gameSideLabels(game) {
+    const label = (side) => {
+      const t = gameSideTeam(game, side);
+      if (!t) return null;
+      const dir = t.id != null ? teamsById[t.id] : null;
+      if (dir && isUsableName(dir.abbreviation)) return dir.abbreviation;
+      if (isUsableName(t.abbreviation)) return t.abbreviation;
+      return officialTeamName(t, teamsById, null);
+    };
+    return { away: label('away'), home: label('home') };
+  }
+
   /** Official matchup for a row/strip item. Prefers the stamped label. */
   function matchupFor(entry, game) {
     const stamped = entry && entry.matchupLabel;
@@ -1384,6 +1639,35 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
         const abs = el('div', 'feed-abs-meta');
         absLines.forEach((line) => abs.appendChild(el('span', 'feed-abs-line', line)));
         body.appendChild(abs);
+      }
+    }
+
+    // Challenges-remaining tracker. Rendered only for the two review types
+    // that are charged to a team's official counter (ABS pitch challenges →
+    // gameData.absChallenges; manager challenges → the `review` object), and
+    // only from counters actually observed in the payloads — a missing
+    // counter renders nothing, never 0. The counters are the game's CURRENT
+    // official values (they move as later challenges happen), which is why
+    // the line says "now".
+    const tracked = challengeCounts.get(entry.gamePk);
+    if (tracked && (r.typeKey === 'abs' || r.typeKey === 'manager')) {
+      const side = game ? teamSideInGame(game, r.teamId) : null;
+      const line = teamChallengeLine(tracked.counts, side, teamAbbrev || teamFullName, r.typeKey, 'now');
+      const both = gameChallengeLine(tracked.counts, gameSideLabels(game), 'Challenges left now');
+      const text = line || both;
+      if (text) {
+        const meta = el('div', 'feed-challenges');
+        meta.appendChild(el('span', 'feed-challenges-line', text));
+        if (line && both) meta.title = both;
+        body.appendChild(meta);
+      }
+      if (tracked.issues && tracked.issues.length) {
+        const flag = el('div', 'feed-challenges feed-challenges-flag',
+          `⚠️ Counter irregularity flagged for review: ${tracked.issues.join('; ')}`);
+        flag.title = 'The official used-challenge counter for this game moved backwards between ' +
+          'polls, which should be impossible within one game. The raw observed values are shown ' +
+          'unmodified — nothing is corrected or guessed.';
+        body.appendChild(flag);
       }
     }
 
@@ -1610,6 +1894,8 @@ function diffRunRiskKeys(previousKeys, entries, keyOf) {
       pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
       shouldAlertForReview,
       runsRemovableFromReview, shouldRunRiskAlert, diffRunRiskKeys,
+      normalizeChallengeCounts, challengeCountIrregularities,
+      teamSideInGame, teamChallengeLine, gameChallengeLine,
     };
   }
 })();

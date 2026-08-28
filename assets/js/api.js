@@ -152,6 +152,34 @@ const MLB = (() => {
   }
 
   /**
+   * Official per-team challenge counters for one game, via a `fields`
+   * projection of feed/live so the response is tiny (~200 bytes):
+   *
+   *   gameData.review        -> manager-challenge counters
+   *                             { hasChallenges, away/home: { used, remaining } }
+   *   gameData.absChallenges -> ABS pitch-challenge counters
+   *                             { hasChallenges, away/home:
+   *                               { usedSuccessful, usedFailed, remaining } }
+   *
+   * Both shapes verified live (statsapi.mlb.com, 2026-08-28: games 824638
+   * in-progress, 824879 and 823503 final). The SCHEDULE endpoint's
+   * `hydrate=review` carries only the manager counters — it does NOT expose
+   * absChallenges (verified 2026-08-28), which is why this call exists.
+   * Pre-ABS seasons (e.g. 2025 game 776162) have no `absChallenges` at all;
+   * callers must treat that as "no ABS data", never as zero.
+   */
+  async function getChallengeCounts(gamePk, options = {}) {
+    const fields = 'fields=gameData,review,absChallenges,hasChallenges,away,home,' +
+                   'used,remaining,usedSuccessful,usedFailed';
+    try {
+      return await getJSON(`${V11}/game/${gamePk}/feed/live?${fields}`, options);
+    } catch (err) {
+      if (!isLegacyFeedMiss(err)) throw err;
+      return await getJSON(`${V1}/game/${gamePk}/feed/live?${fields}`, options);
+    }
+  }
+
+  /**
    * Play-by-play only for one game (allPlays + currentPlay + scoringPlays).
    * Much leaner than feed/live (no boxscore/players), and carries the same
    * review data: play-level reviewDetails, event-level details.hasReview and
@@ -263,7 +291,7 @@ const MLB = (() => {
   }
 
   return {
-    getSchedule, getLiveFeed, getPlayByPlay, getTeams,
+    getSchedule, getLiveFeed, getPlayByPlay, getTeams, getChallengeCounts,
     teamLogoUrl, teamLogoFallbackUrl, headshotUrl,
     ordinal, localTime, localDate, localDateTime,
     inningLabel, inningGlyph, sides, scoreOf,

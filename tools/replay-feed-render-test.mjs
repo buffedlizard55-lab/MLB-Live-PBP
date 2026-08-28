@@ -195,10 +195,26 @@ const TEAMS_DIR = {
   134: { id: 134, name: 'Pittsburgh Pirates', teamName: 'Pirates', locationName: 'Pittsburgh', abbreviation: 'PIT' },
 };
 
+// GET /api/v1.1/game/823342/feed/live?fields=gameData,review,absChallenges,…
+// — the game's official challenge counters, captured verbatim on 2026-08-19
+// (see docs/verification-report.md §1–2): the manager `review` object and the
+// ABS tracker after DET's one failed ABS challenge.
+const CHALLENGE_COUNTS = {
+  gameData: {
+    review: { hasChallenges: false, away: { used: 0, remaining: 1 }, home: { used: 0, remaining: 1 } },
+    absChallenges: {
+      hasChallenges: true,
+      away: { usedSuccessful: 0, usedFailed: 1, remaining: 1 },
+      home: { usedSuccessful: 0, usedFailed: 0, remaining: 2 },
+    },
+  },
+};
+
 const MLBStub = {
   getSchedule: async () => SCHEDULE_GAMES,
   getTeams: async () => TEAMS_DIR,
   getPlayByPlay: async () => PBP,
+  getChallengeCounts: async () => CHALLENGE_COUNTS,
   // Mirrors MLB.ordinal in assets/js/api.js exactly.
   ordinal: (n) => {
     const ORD = ['th', 'st', 'nd', 'rd', 'th', 'th', 'th', 'th', 'th', 'th'];
@@ -292,6 +308,26 @@ assert.ok(rowBlob.includes('▼ Bot 2nd'), `inning label from the play's about, 
 const scoreChip = findIn(absRecord.row, '.feed-game-score');
 assert.ok(scoreChip && scoreChip.text === '3–1',
   `score chip from the schedule linescore, got: ${scoreChip && scoreChip.text}`);
+
+// 4a-ter. Challenges-remaining tracker on the ABS row: the challenging team's
+// current official ABS counter (DET challenged; absChallenges.away shows
+// 1 remaining after the failed challenge), plus the both-teams summary as the
+// hover title. Numbers come only from the captured payloads.
+const challengesLine = findIn(absRecord.row, '.feed-challenges-line');
+assert.ok(challengesLine, 'ABS row renders the challenges-remaining line');
+assert.equal(challengesLine.text, 'DET: 1 ABS challenge left now (0 successful · 1 failed)');
+const challengesMeta = findIn(absRecord.row, '.feed-challenges');
+assert.equal(challengesMeta.title, 'Challenges left now: DET 1 MGR · 1 ABS — PIT 1 MGR · 2 ABS');
+assert.equal(findIn(absRecord.row, '.feed-challenges-flag'), null,
+  'no irregularity flag when counters never regress');
+// The deterministic manager-challenge row shows PIT's manager counter.
+const impactChallenges = findIn(impactRecord.row, '.feed-challenges-line');
+assert.ok(impactChallenges, 'manager row renders the challenges-remaining line');
+assert.equal(impactChallenges.text, 'PIT: 1 manager challenge left now (0 used)');
+// The active strip carries the whole-game summary for the game under review.
+const activeChallenges = findIn(registry['#active-strip'], '.feed-active-challenges');
+assert.ok(activeChallenges, 'active strip renders the challenges-left summary');
+assert.equal(activeChallenges.text, 'Challenges left: DET 1 MGR · 1 ABS — PIT 1 MGR · 2 ABS');
 
 // 4b. The real feed-row path renders the three distinct score snapshots.
 assert.match(impactRecord.blob, /Before review \| DET 3 – PIT 1/);
