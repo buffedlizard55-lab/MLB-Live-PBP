@@ -54,7 +54,12 @@
       (<a href="https://statsapi.mlb.com" target="_blank" rel="noopener">statsapi.mlb.com</a>) —
       manager challenges, crew chief/umpire reviews and boundary calls come from the live game feed's
       <code>reviewDetails</code>, ABS pitch challenges from <code>absChallenges</code> /
-      pitch-level review events. The score tracker separates the observed call-on-field score,
+      pitch-level review events. Challenges-remaining counters are the official per-team
+      values read directly from the StatsAPI (<code>review.away/home.used/remaining</code> for
+      manager challenges; <code>gameData.absChallenges.away/home.usedSuccessful/usedFailed/remaining</code>
+      for ABS) — never derived by counting feed events, and never zero-filled when a counter is
+      absent (e.g. pre-ABS seasons). A used-counter that moves backwards between polls is flagged
+      as an irregularity on the affected rows instead of being corrected or hidden. The score tracker separates the observed call-on-field score,
       conditional possibilities, and an attributable official score after resolution when exposed.
       Possibilities use only runs tied to the reviewed event and are not predictions of the ruling
       or runner placement.

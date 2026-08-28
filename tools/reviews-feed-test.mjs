@@ -109,6 +109,8 @@ const {
   pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
   shouldAlertForReview,
   runsRemovableFromReview, shouldRunRiskAlert, diffRunRiskKeys,
+  normalizeChallengeCounts, challengeCountIrregularities,
+  teamSideInGame, teamChallengeLine, gameChallengeLine,
 } = context.module.exports;
 
 /* ------------------------------------------------------- 1. Stable keys */
@@ -791,5 +793,99 @@ ReplayFeed.playRunRiskAlertSound();
 assert.ok(audioLog.resumes > resumesBefore, 'run-at-risk alert resumes a suspended AudioContext');
 
 ReplayFeed.setSoundEnabled(false);
+
+/* --------------------------- 15. Challenges-remaining tracker (pure helpers)
+ * Fixtures are VERBATIM live captures from statsapi.mlb.com on 2026-08-28:
+ *   - game 824638 (CIN @ CHC, In Progress): feed/live gameData carried
+ *       review:        {hasChallenges:false, away:{used:0,remaining:1}, home:{used:0,remaining:1}}
+ *       absChallenges: {hasChallenges:true,  away:{usedSuccessful:2,usedFailed:0,remaining:2},
+ *                                            home:{usedSuccessful:3,usedFailed:0,remaining:2}}
+ *   - game 824879 (LAD @ ATL, Final 2026-08-27): review home used:2 remaining:0,
+ *       absChallenges away usedFailed:1 remaining:1.
+ *   - game 776162 (BAL @ NYY, Final 2025-09-27, pre-ABS season): feed/live
+ *       gameData has review but NO absChallenges object at all.
+ */
+
+// 15a. Both live sources normalize; nothing is invented.
+const live824638 = normalizeChallengeCounts(
+  { hasChallenges: false, away: { used: 0, remaining: 1 }, home: { used: 0, remaining: 1 } },
+  { hasChallenges: true,
+    away: { usedSuccessful: 2, usedFailed: 0, remaining: 2 },
+    home: { usedSuccessful: 3, usedFailed: 0, remaining: 2 } });
+assert.equal(live824638.manager.away.used, 0);
+assert.equal(live824638.manager.home.remaining, 1);
+assert.equal(live824638.abs.away.usedSuccessful, 2);
+assert.equal(live824638.abs.home.remaining, 2);
+
+// 15b. Pre-ABS season (verified 2025 game 776162): abs stays null, never 0.
+const preAbs = normalizeChallengeCounts(
+  { hasChallenges: true, away: { used: 0, remaining: 1 }, home: { used: 1, remaining: 0 } },
+  null);
+assert.equal(preAbs.abs, null, 'missing absChallenges must stay null, not zero-filled');
+assert.equal(preAbs.manager.home.used, 1);
+
+// 15c. Wholly missing/malformed input yields null, and partial numbers stay null.
+assert.equal(normalizeChallengeCounts(null, null), null);
+assert.equal(normalizeChallengeCounts({}, {}), null);
+const malformed = normalizeChallengeCounts(
+  { away: { used: 'one', remaining: -2 }, home: { used: 1 } }, null);
+assert.equal(malformed.manager.away, null, 'non-numeric/negative counters are rejected');
+assert.equal(malformed.manager.home.used, 1);
+assert.equal(malformed.manager.home.remaining, null, 'a missing counter is null, never 0');
+
+// 15d. Irregularity flag: a used counter can never decrease within a game.
+const before = normalizeChallengeCounts(
+  { away: { used: 1, remaining: 0 }, home: { used: 0, remaining: 1 } },
+  { away: { usedSuccessful: 1, usedFailed: 1, remaining: 1 }, home: { usedSuccessful: 0, usedFailed: 0, remaining: 2 } });
+const regressed = normalizeChallengeCounts(
+  { away: { used: 0, remaining: 1 }, home: { used: 0, remaining: 1 } },
+  { away: { usedSuccessful: 0, usedFailed: 1, remaining: 1 }, home: { usedSuccessful: 0, usedFailed: 0, remaining: 2 } });
+const issues = challengeCountIrregularities(before, regressed);
+assert.equal(JSON.stringify(issues),
+  JSON.stringify(['manager.away.used decreased 1 → 0', 'abs.away.usedSuccessful decreased 1 → 0']));
+
+// 15e. remaining may legitimately rise (successful ABS challenges are retained;
+// extra innings can regain one) — never flagged in either direction.
+const regained = normalizeChallengeCounts(
+  { away: { used: 1, remaining: 0 }, home: { used: 0, remaining: 1 } },
+  { away: { usedSuccessful: 1, usedFailed: 1, remaining: 2 }, home: { usedSuccessful: 0, usedFailed: 0, remaining: 2 } });
+assert.equal(challengeCountIrregularities(before, regained).length, 0,
+  'a rising remaining counter is not an irregularity');
+assert.equal(challengeCountIrregularities(null, regained).length, 0);
+assert.equal(challengeCountIrregularities(before, null).length, 0);
+
+// 15f. teamSideInGame reads only the schedule's team ids.
+const cinChc = { teams: {
+  away: { team: { id: 113, name: 'Cincinnati Reds', link: '/api/v1/teams/113' } },
+  home: { team: { id: 112, name: 'Chicago Cubs', link: '/api/v1/teams/112' } },
+} };
+assert.equal(teamSideInGame(cinChc, 113), 'away');
+assert.equal(teamSideInGame(cinChc, 112), 'home');
+assert.equal(teamSideInGame(cinChc, 999), null);
+assert.equal(teamSideInGame(cinChc, null), null);
+
+// 15g. Per-team line: only ABS/manager types, only observed counters.
+assert.equal(teamChallengeLine(live824638, 'away', 'CIN', 'abs', 'now'),
+  'CIN: 2 ABS challenges left now (2 successful · 0 failed)');
+assert.equal(teamChallengeLine(live824638, 'home', 'CHC', 'manager', 'now'),
+  'CHC: 1 manager challenge left now (0 used)');
+assert.equal(teamChallengeLine(live824638, 'away', 'CIN', 'boundary', 'now'), null,
+  'crew-chief/boundary reviews are not charged to a team counter');
+assert.equal(teamChallengeLine(preAbs, 'away', 'BAL', 'abs', 'now'), null,
+  'no ABS counters in a pre-ABS season — nothing rendered, not 0');
+assert.equal(teamChallengeLine(live824638, null, 'CIN', 'abs', 'now'), null);
+
+// 15h. Both-teams summary omits unavailable halves and never zero-fills.
+assert.equal(gameChallengeLine(live824638, { away: 'CIN', home: 'CHC' }, 'Challenges left'),
+  'Challenges left: CIN 1 MGR · 2 ABS — CHC 1 MGR · 2 ABS');
+assert.equal(gameChallengeLine(preAbs, { away: 'BAL', home: 'NYY' }, 'Challenges left'),
+  'Challenges left: BAL 1 MGR — NYY 0 MGR');
+assert.equal(gameChallengeLine(null, { away: 'CIN', home: 'CHC' }), null);
+assert.equal(gameChallengeLine(normalizeChallengeCounts({}, {}), {}), null);
+const blob15 = [
+  teamChallengeLine(live824638, 'away', 'CIN', 'abs', 'now'),
+  gameChallengeLine(live824638, { away: 'CIN', home: 'CHC' }),
+].join(' | ');
+assert.ok(!blob15.includes('undefined'), `challenge lines leaked "undefined": ${blob15}`);
 
 console.log('Replay feed tests passed successfully!');

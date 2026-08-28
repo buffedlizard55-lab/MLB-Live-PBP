@@ -40,7 +40,23 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
     assigned to an earlier pitch review. For ABS,
     the feed also shows the pitch count before the challenge, who challenged (batter /
     catcher / pitcher, from official play text or the challenging team's batting/
-    fielding side), and the count after the call is overturned or stands. Includes
+    fielding side), and the count after the call is overturned or stands.
+    Every ABS-challenge and manager-challenge row also carries a
+    **challenges-remaining tracker**: the challenging team's current official
+    counter (e.g. `CIN: 2 ABS challenges left now (2 successful · 0 failed)` or
+    `PIT: 1 manager challenge left now (0 used)`), with the both-teams summary
+    (`Challenges left: CIN 1 MGR · 2 ABS — CHC 1 MGR · 2 ABS`) on hover and on
+    the Under-Review live strip. The numbers are the **official StatsAPI
+    counters read as-is** — `review.away/home.used/remaining` (manager
+    challenges, from the schedule's `hydrate=review` and feed/live
+    `gameData.review`) and `gameData.absChallenges.away/home.usedSuccessful/
+    usedFailed/remaining` (ABS, feed/live only; verified live 2026-08-28) —
+    never counts derived from feed events, never zero-filled when absent
+    (pre-ABS seasons have no `absChallenges` object at all), and a used-counter
+    that moves backwards between polls is flagged on the row as an
+    irregularity instead of being silently corrected. Crew-chief, umpire and
+    boundary reviews are not charged to a team's counter, so those rows show
+    no counter line by design. Includes
     an "Under Review" live strip, per-type
     filters (All / ABS / Challenges / Reviews / Boundary Calls / Under Review /
     ⚠️ Runs at Risk),
