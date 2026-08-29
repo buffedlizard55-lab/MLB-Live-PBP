@@ -659,16 +659,20 @@ function gameChallengeLine(counts, labels, prefix) {
   // Cadence is the gap between poll STARTS (scan duration is subtracted in
   // waitAfterScan). The StatsAPI is pull-only — a shorter poll only reduces
   // how long a landed review sits unseen. Hidden tabs still pause.
-  //   live games          : 2s
-  //   a review in flight  : 1s  (outcome flips are what the feed is for)
-  //   no live games       : 15s
-  const LIVE_POLL_MS = 2000;
-  const REVIEW_POLL_MS = 1000;
-  const IDLE_POLL_MS = 15000;
-  // playByPlay is one request per live / unsettled-final game. 10 at a time
-  // keeps a 15-game slate to two waves instead of three sequential batches
-  // of 5 (the previous scanner). Same host, same CORS-open endpoint.
-  const FETCH_CONCURRENCY = 10;
+  //   live games          : 1.5s
+  //   a review in flight  : 750ms (outcome flips are what the feed is for;
+  //                          in-review games are fetched first, so the flip
+  //                          lands ~1 request after poll start)
+  //   no live games       : 10s
+  const LIVE_POLL_MS = 1500;
+  const REVIEW_POLL_MS = 750;
+  const IDLE_POLL_MS = 10000;
+  // playByPlay is one request per live / unsettled-final game. 15 at a time
+  // (the slate is ~15-17 games) keeps a full scan to ONE wave: a single
+  // request round-trip instead of two, so every poll — and the review
+  // outcome in particular — lands sooner. Same host (HTTP/2), same
+  // CORS-open endpoint.
+  const FETCH_CONCURRENCY = 15;
 
   let dateStr = todayStr();
   let games = [];
@@ -700,9 +704,9 @@ function gameChallengeLine(counts, labels, prefix) {
   // every review type (ABS included), fires on first load, and drives the
   // banner / badge / stat / filter tab and the optional desktop notification.
   // `alertedRunRiskKeys` holds the event keys that have already alerted so a
-  // still-running review does not re-alert on every 1s poll; a key is dropped
-  // the moment the review resolves or stops being risky, so a genuinely new
-  // review on the same play can alert again.
+  // still-running review does not re-alert on every fast (in-review) poll; a
+  // key is dropped the moment the review resolves or stops being risky, so a
+  // genuinely new review on the same play can alert again.
   const alertedRunRiskKeys = new Set();
   let pendingRunRiskAlerts = [];
   let notifyEnabled = false;
@@ -1252,16 +1256,6 @@ function gameChallengeLine(counts, labels, prefix) {
     const tracked = challengeCounts.get(gamePk);
     const needsCounts = hasEntries &&
       (eventsChanged || !tracked || !tracked.absAttempted);
-    if (needsCounts && MLB.getChallengeCounts) {
-      try {
-        const countsFeed = await MLB.getChallengeCounts(gamePk);
-        const gd = (countsFeed && countsFeed.gameData) || {};
-        updateGameCounts(gamePk, gd.review || null, gd.absChallenges || null, true);
-      } catch (countErr) {
-        // Keep the last observed counters; never zero-fill on a failed poll.
-        console.warn(`challenge counters unavailable this poll (game ${gamePk})`, countErr);
-      }
-    }
     // Count new alertable events for the chime (challenges/reviews/boundary, not ABS)
     if (result.added && result.added.length) {
       const alertable = result.added.filter((e) => {
@@ -1282,8 +1276,25 @@ function gameChallengeLine(counts, labels, prefix) {
     feedState.seen.forEach((entry) => {
       if (entry.gamePk === gamePk) entry.matchupLabel = matchupLabel;
     });
+    // The review row itself is the update the user is waiting for — paint it
+    // NOW, before any side-fetch. The challenges-remaining counters that
+    // accompany a changed event are a non-blocking side-fetch: merging them
+    // earlier would cost one extra request round-trip on exactly the poll
+    // where the outcome flipped. The tracker merges as soon as the response
+    // lands; the next cycle re-renders the row with fresh counters.
     if (result.added.length || result.updated.length || result.ended.length) {
       renderFeedUpdates(result);
+    }
+    if (needsCounts && MLB.getChallengeCounts) {
+      MLB.getChallengeCounts(gamePk)
+        .then((countsFeed) => {
+          const gd = (countsFeed && countsFeed.gameData) || {};
+          updateGameCounts(gamePk, gd.review || null, gd.absChallenges || null, true);
+        })
+        .catch((countErr) => {
+          // Keep the last observed counters; never zero-fill on a failed poll.
+          console.warn(`challenge counters unavailable this poll (game ${gamePk})`, countErr);
+        });
     }
   }
 

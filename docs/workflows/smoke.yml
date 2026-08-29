@@ -25,5 +25,8 @@ jobs:
       - name: Render all-games replay feed against captured API payloads
         run: node tools/replay-feed-render-test.mjs
 
+      - name: Validate in-review lean probe signature
+        run: node tools/review-probe-test.mjs
+
       - name: Run smoke test against live MLB StatsAPI
         run: node tools/smoke-test.mjs
