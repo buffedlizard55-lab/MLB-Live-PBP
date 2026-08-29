@@ -8,10 +8,12 @@
 
 (() => {
   // Cadence is the gap between poll STARTS (scan duration is subtracted).
-  // Live play-by-play: 2s. While a review is in flight: 1s so the outcome
-  // flip is not waiting on the ordinary live interval. Preview/final back off.
-  const LIVE_POLL_MS = 2000;
-  const REVIEW_POLL_MS = 1000;
+  // Live play-by-play: 1s. While a review is in flight: 500ms — the game is
+  // frozen during a review, so each 500ms tick probes the lean playByPlay
+  // endpoint (not the full feed) and only pulls the full feed once when the
+  // review state actually flips. Preview/final back off.
+  const LIVE_POLL_MS = 1000;
+  const REVIEW_POLL_MS = 500;
   const PREVIEW_POLL_MS = 60000;
   const FINAL_POLL_MS = 180000;
 
@@ -22,6 +24,7 @@
   let nextRefreshAt = 0;
   let lastCycleStartedAt = 0;
   let lastToken = null;
+  let lastReviewSig = null;
   let lastActiveReview = false;
   let activeTab = 'plays';
   let requestInFlight = false;
@@ -53,17 +56,86 @@
 
   /* ----------------------------------------------------------------- fetch */
 
+  /**
+   * Compact signature of every review state in a playByPlay payload, plus a
+   * boolean for whether any review is still in progress.
+   *
+   * While a review is in flight the game is frozen — no pitch, count or score
+   * can move — so the ONLY fields that can still change on the server are the
+   * review flags. Comparing this signature lets load() probe the lean
+   * playByPlay endpoint (no boxscore/rosters) at the 500ms cadence and fetch
+   * the full feed exactly once: the moment the review state flips.
+   *
+   * Safety: the probe carries NO gameData.status, so a review that is visible
+   * only in the game status (the synthesized "live-active-review" entry) has no
+   * reviewDetails here at all. `hasInProgress` is therefore the gate — the full
+   * feed is fetched whenever the probe can no longer see an in-progress review
+   * (it just resolved, or it was status-only all along), so a status-only
+   * resolution can never be missed.
+   */
+  function reviewProbeState(plays) {
+    const all = (plays && plays.allPlays) || [];
+    const cur = plays && plays.currentPlay;
+    let hasInProgress = false;
+    const sigFor = (play) => {
+      if (!play) return '';
+      const rd = play.reviewDetails;
+      if (rd && rd.inProgress) hasInProgress = true;
+      const bits = [rd && rd.inProgress, rd && rd.isOverturned, rd && rd.reviewType];
+      (play.playEvents || []).forEach((e) => {
+        if (!e) return;
+        const erd = e.reviewDetails;
+        if (!erd && !(e.details && e.details.hasReview)) return;
+        if (erd && erd.inProgress) hasInProgress = true;
+        bits.push(`${e.index}:${erd && erd.inProgress}:${erd && erd.isOverturned}:${erd && erd.reviewType}`);
+      });
+      return bits.join('|');
+    };
+    const allSig = all.map(sigFor).join(',');
+    const curSig = sigFor(cur);
+    return { sig: `${all.length}:${allSig}#${curSig}`, hasInProgress };
+  }
+
   async function load(showSpinner) {
     if (!gamePk || requestInFlight) return;
     requestInFlight = true;
     lastCycleStartedAt = Date.now();
     if (showSpinner && !feed) $('#loading').classList.add('visible');
     try {
-      const data = await MLB.getLiveFeed(gamePk);
+      let data;
+      if (lastActiveReview) {
+        // Fast path: probe the lean playByPlay endpoint while a review is
+        // in flight. Skip the 1-2MB full feed download — and tick again in
+        // 500ms — ONLY when the probe still sees the review in progress and
+        // nothing review-related changed. Every other case (resolved,
+        // overturned, confirmed, status-only review, or a probe failure)
+        // falls through to the full feed, so no review update can be missed.
+        let probe = null;
+        try {
+          probe = await MLB.getPlayByPlay(gamePk);
+        } catch (probeErr) {
+          // Network trouble: don't chain a (likely-failing) full feed after
+          // it; retry the probe on the next fast tick instead.
+          console.warn('review probe failed, retrying', probeErr);
+          $('#loading').classList.remove('visible');
+          scheduleNext(1000);
+          return;
+        }
+        const probeState = reviewProbeState(probe);
+        if (probeState.hasInProgress && lastReviewSig != null &&
+            probeState.sig === lastReviewSig) {
+          $('#loading').classList.remove('visible');
+          renderStatusLine();
+          scheduleNext();
+          return;
+        }
+      }
+      data = await MLB.getLiveFeed(gamePk);
       const token = feedToken(data);
       const changed = token !== lastToken || !feed;
       feed = data;
       lastToken = token;
+      lastReviewSig = reviewProbeState((feed.liveData && feed.liveData.plays) || {}).sig;
       // A live feed can be large. Keep the existing DOM when no baseball state changed.
       if (changed) {
         renderAll();

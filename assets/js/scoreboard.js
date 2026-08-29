@@ -4,17 +4,21 @@
 'use strict';
 
 (() => {
-  // Live scoreboard: 3s. While any game's official status says challenge/
-  // review: 1.5s so the ticker is not waiting on the ordinary live interval.
-  const LIVE_POLL_MS = 3000;
-  const REVIEW_POLL_MS = 1500;
-  const IDLE_POLL_MS = 30000;
+  // Live scoreboard: 1s. While any game's official status says challenge/
+  // review: 500ms so the review ticker is not waiting on the ordinary live
+  // interval. Cadence is the gap between poll STARTS — scheduleNext()
+  // subtracts the request we just finished, so a slow response does not
+  // stretch the cycle.
+  const LIVE_POLL_MS = 1000;
+  const REVIEW_POLL_MS = 500;
+  const IDLE_POLL_MS = 15000;
 
   let dateStr = todayStr();
   let games = [];
   let filter = 'all';
   let pollTimer = null;
   let requestInFlight = false;
+  let lastCycleStartedAt = 0;
 
   /* ------------------------------------------------------------------ state */
 
@@ -36,6 +40,7 @@
     if (requestInFlight) return;
     const requestDate = dateStr;
     requestInFlight = true;
+    lastCycleStartedAt = Date.now();
     const listEl = $('#game-list');
     const banner = $('#banner');
     const statusLine = $('#status-line');
@@ -81,12 +86,18 @@
         : { hasActiveReview: false };
       return inspection.hasActiveReview;
     });
-    const interval = overrideMs || (hasActiveReview ? REVIEW_POLL_MS
-      : hasLiveGame ? LIVE_POLL_MS : IDLE_POLL_MS);
+    const interval = overrideMs != null ? overrideMs
+      : (hasActiveReview ? REVIEW_POLL_MS : hasLiveGame ? LIVE_POLL_MS : IDLE_POLL_MS);
+    // Cadence is the gap between poll STARTS (same semantics as the game page
+    // and the Replay Feed): subtract the request we just finished so a slow
+    // response does not stretch the cycle — a review banner otherwise waits
+    // request + interval instead of interval.
+    const elapsed = lastCycleStartedAt ? Date.now() - lastCycleStartedAt : 0;
+    const wait = overrideMs != null ? overrideMs : Math.max(0, interval - elapsed);
     pollTimer = setTimeout(() => {
       if (!document.hidden) load();
       else scheduleNext();
-    }, interval);
+    }, wait);
   }
 
   function updateDateLabel() {

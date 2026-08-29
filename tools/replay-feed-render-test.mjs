@@ -433,7 +433,8 @@ assert.equal(leaked.length, 0, `no rendered string may contain "undefined": ${JS
 
 // 6. Status line summarizes the poll.
 assert.match(registry['#status-line'].textContent, /1 game · 2 review events · updated /);
-assert.match(registry['#status-line'].textContent, /refreshing every 1s/);
+// Review in flight -> the in-review cadence (REVIEW_POLL_MS) is advertised.
+assert.match(registry['#status-line'].textContent, /refreshing every 0\.75s/);
 
 /* 7. The run-at-risk predicate is DUPLICATED on purpose — MLBReviews.
  * runsRemovableByReview() in reviews.js and runsRemovableFromReview() in

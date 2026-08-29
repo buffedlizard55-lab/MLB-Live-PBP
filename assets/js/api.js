@@ -56,7 +56,9 @@ const MLB = (() => {
       }
       // A caller cancellation is deliberate; don't retry or mask it.
       if (signal && signal.aborted) throw lastErr;
-      if (attempt < retries) await sleep(400 * (2 ** attempt));
+      // Short backoff: a retry after 400ms still lands faster than the next
+      // poll, so keep it as low as the network stack tolerates (150ms).
+      if (attempt < retries) await sleep(150 * (2 ** attempt));
     }
     throw lastErr;
   }
@@ -73,7 +75,9 @@ const MLB = (() => {
   async function getSchedule(dateStr, options = {}) {
     const url = `${V1}/schedule?sportId=${SPORT_ID}&date=${dateStr}` +
                 '&hydrate=probablePitcher,linescore,decisions,review,team';
-    const data = await getJSON(url, options);
+    // The schedule is small; a 5s abort cap (instead of the 8s feed default)
+    // so a stalled schedule request fails fast and retries quickly.
+    const data = await getJSON(url, { timeout: 5000, ...options });
     const dates = (data && data.dates) || [];
     return dates.length ? dates[0].games || [] : [];
   }
@@ -171,11 +175,13 @@ const MLB = (() => {
   async function getChallengeCounts(gamePk, options = {}) {
     const fields = 'fields=gameData,review,absChallenges,hasChallenges,away,home,' +
                    'used,remaining,usedSuccessful,usedFailed';
+    // ~200-byte projection: a 4s abort cap so a stalled side-fetch never
+    // delays the review feed (the caller treats this as a non-blocking hint).
     try {
-      return await getJSON(`${V11}/game/${gamePk}/feed/live?${fields}`, options);
+      return await getJSON(`${V11}/game/${gamePk}/feed/live?${fields}`, { timeout: 4000, ...options });
     } catch (err) {
       if (!isLegacyFeedMiss(err)) throw err;
-      return await getJSON(`${V1}/game/${gamePk}/feed/live?${fields}`, options);
+      return await getJSON(`${V1}/game/${gamePk}/feed/live?${fields}`, { timeout: 4000, ...options });
     }
   }
 
@@ -188,7 +194,9 @@ const MLB = (() => {
    */
   async function getPlayByPlay(gamePk, options = {}) {
     try {
-      return await getJSON(`${V1}/game/${gamePk}/playByPlay`, options);
+      // Lean endpoint (no boxscore/rosters); a 5s abort cap lets a stalled
+      // probe fail fast so the next 500ms review poll can start immediately.
+      return await getJSON(`${V1}/game/${gamePk}/playByPlay`, { timeout: 5000, ...options });
     } catch (err) {
       if (!isLegacyFeedMiss(err)) throw err;
       const feed = await getLiveFeed(gamePk, options);
