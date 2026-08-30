@@ -421,6 +421,29 @@ function shouldAlertForReview(review) {
 }
 
 /**
+ * Whether a feed entry belongs in the "All" section of the Replay Feed.
+ *
+ * Requirement: All shows manager challenges, crew-chief/umpire reviews,
+ * boundary calls, "under review" status entries and run-at-risk entries —
+ * but NOT ABS pitch challenges. ABS stays fully tracked (its own "ABS"
+ * filter tab, the "ABS Challenges" stat, and the official challenges-
+ * remaining counters) but lives in its own section, and it stays silent
+ * (shouldAlertForReview() above).
+ *
+ * `typeKey === 'abs'` is produced ONLY from the official StatsAPI code
+ * "MJ" or explicit ABS text in the official play descriptions
+ * (normalizeType in reviews.js — see docs/verification-report.md §2).
+ * So this hides exactly the official ABS pitch-challenge category and
+ * nothing else.
+ *
+ * Unknown / malformed entries fail open (visible in All): an unrecognized
+ * event must never be silently hidden. Pure function — no DOM.
+ */
+function visibleInAllFeed(review) {
+  return !review || review.typeKey !== 'abs';
+}
+
+/**
  * Runs currently on the scoreboard that THIS review could take back off.
  *
  * Mirrors MLBReviews.runsRemovableByReview() exactly, but is self-contained so
@@ -1353,7 +1376,11 @@ function gameChallengeLine(counts, labels, prefix) {
       b.appendChild(el('strong', 'review-stat-value', String(value)));
       return b;
     };
-    wrap.appendChild(stat('Events', entries.length));
+    // "Events" counts the All section: every review category EXCEPT ABS
+    // pitch challenges, which have their own stat (and their own tab)
+    // right next to it. The remaining outcome/status stats are page-wide
+    // trackers and keep counting ABS entries too — ABS is still tracked.
+    wrap.appendChild(stat('Events', entries.filter((e) => visibleInAllFeed(e.review)).length));
     wrap.appendChild(stat('ABS Challenges', entries.filter((e) => e.review.typeKey === 'abs').length, 'stat-abs'));
     wrap.appendChild(stat('Manager Challenges', entries.filter((e) => e.review.typeKey === 'manager').length, 'stat-manager'));
     wrap.appendChild(stat('Boundary Calls', entries.filter((e) => e.review.typeKey === 'boundary').length, 'stat-boundary'));
@@ -1509,7 +1536,10 @@ function gameChallengeLine(counts, labels, prefix) {
   function renderTabs() {
     const entries = [...feedState.seen.values()];
     const counts = {
-      all: entries.length,
+      // "All" shows every category EXCEPT ABS pitch challenges, so its
+      // tab count must match what that section actually renders. ABS
+      // entries are still tracked and counted on their own tab below.
+      all: entries.filter((e) => visibleInAllFeed(e.review)).length,
       abs: entries.filter((e) => e.review.typeKey === 'abs').length,
       manager: entries.filter((e) => e.review.typeKey === 'manager').length,
       crew: entries.filter((e) => e.review.typeKey === 'crew_chief').length,
@@ -1550,7 +1580,12 @@ function gameChallengeLine(counts, labels, prefix) {
   }
 
   function matchesFilter(entry) {
-    if (filter === 'all') return true;
+    // The All section shows every category EXCEPT ABS pitch challenges:
+    // challenges, reviews, boundary calls, under review, runs at risk.
+    // ABS entries stay tracked in the feed state — they render under the
+    // "ABS" tab (and wherever else their category applies: the Under
+    // Review tab, active strip, run-at-risk surfaces).
+    if (filter === 'all') return visibleInAllFeed(entry && entry.review);
     if (filter === 'live') return entry.review.inProgress;
     if (filter === 'runrisk') return runsRemovableFromReview(entry.review) > 0;
     return entry.review.typeKey === filter;
@@ -1903,7 +1938,7 @@ function gameChallengeLine(counts, labels, prefix) {
       sortFeedEntries, gameTeamsLabel,
       isUsableName, officialTeamName, gameSideTeam,
       pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
-      shouldAlertForReview,
+      shouldAlertForReview, visibleInAllFeed,
       runsRemovableFromReview, shouldRunRiskAlert, diffRunRiskKeys,
       normalizeChallengeCounts, challengeCountIrregularities,
       teamSideInGame, teamChallengeLine, gameChallengeLine,
