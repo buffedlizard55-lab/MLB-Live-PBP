@@ -24,7 +24,7 @@
     </div>
     <div id="date-label" class="date-label"></div>
     <div class="feed-controls">
-      <button id="sound-toggle-btn" class="btn btn-ghost" title="Toggle alert sound — a gentle raindrop chime for new challenges/reviews/boundary calls (not ABS), and the same chime whenever an active review could remove a run already on the scoreboard">🔇 Sound Off</button>
+      <button id="sound-toggle-btn" class="btn btn-ghost" title="Toggle alert sound — a gentle raindrop chime for new challenges/reviews/boundary calls and official-scorer pending rulings (not ABS), and the same chime whenever an active review could remove a run already on the scoreboard">🔇 Sound Off</button>
       <button id="notify-toggle-btn" class="btn btn-ghost" title="Toggle desktop notifications for run-at-risk reviews — a popup the moment an active review could take a run off the scoreboard">⚪ Run Alerts Off</button>
       <button id="refresh-btn" class="btn">Refresh</button>
       <span class="countdown" id="countdown" title="Seconds until the next poll"></span>
@@ -54,7 +54,12 @@
       (<a href="https://statsapi.mlb.com" target="_blank" rel="noopener">statsapi.mlb.com</a>) —
       manager challenges, crew chief/umpire reviews and boundary calls come from the live game feed's
       <code>reviewDetails</code>, ABS pitch challenges from <code>absChallenges</code> /
-      pitch-level review events. Challenges-remaining counters are the official per-team
+      pitch-level review events, and <strong>official-scorer pending rulings</strong>
+      (hit vs. error vs. fielder's choice undecided) come from the API's own event-type
+      registry — <code>os_ruling_pending_primary</code> / <code>os_ruling_pending_prior</code>,
+      description "Official Scorer Ruling Pending" (<code>GET /api/v1/eventTypes</code>).
+      A pending ruling decides how the play is charged and never removes a run from the score.
+      Challenges-remaining counters are the official per-team
       values read directly from the StatsAPI (<code>review.away/home.used/remaining</code> for
       manager challenges; <code>gameData.absChallenges.away/home.usedSuccessful/usedFailed/remaining</code>
       for ABS) — never derived by counting feed events, and never zero-filled when a counter is

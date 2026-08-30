@@ -156,9 +156,16 @@ const SCHEDULE_GAMES = [{
 
 // GET /api/v1/game/823342/playByPlay — the ABS pitch-challenge at-bat captured
 // live at atBatIndex 15 (reviewDetails.reviewType "MJ", challengeTeamId 116).
-// The atBatIndex 16 and 17/currentPlay records are deterministic tracker data,
-// separate from the verbatim capture: 2-1 before the play, 3-1 after a safe-at-
-// home call, with one scoring movement tied to the reviewed event.
+// The atBatIndex 16, 17/currentPlay and 18 records are deterministic tracker
+// data, separate from the verbatim capture: 2-1 before the play, 3-1 after a
+// safe-at-home call, with one scoring movement tied to the reviewed event.
+// The atBatIndex 18 entry is the OFFICIAL SCORER PENDING fixture: its marker
+// fields (eventType os_ruling_pending_primary, event/description "Official
+// Scorer Ruling Pending") are the verbatim values from the official StatsAPI
+//   event-type registry (GET /api/v1/eventTypes, fetched live 2026-08-30); the
+//   surrounding play shape mirrors the live playByPlay shape. The marker has
+//   NOT been captured on a real pending play — see
+//   docs/verification-report.md §14 for the exact verification status.
 const PBP = {
   allPlays: [
     {
@@ -173,6 +180,24 @@ const PBP = {
       about: { atBatIndex: 16, inning: 6, halfInning: 'top', isComplete: true },
       result: { description: 'Previous play.', awayScore: 2, homeScore: 1 },
       runners: [], playEvents: [],
+    },
+    // Deterministic OFFICIAL SCORER PENDING fixture (see block comment above):
+    // the batting side comes from halfInning 'top' → away = DET (116).
+    {
+      about: { atBatIndex: 18, startTime: '2026-08-19T18:45:00Z', endTime: null, inning: 7, halfInning: 'top', isTopInning: true, isComplete: false },
+      result: { type: 'atBat' },
+      matchup: { batter: { id: 668804, fullName: 'Bryan Reynolds' }, pitcher: { id: 695549, fullName: 'Jackson Jobe' } },
+      playEvents: [
+        { index: 0, isPitch: true, details: { description: 'In play, no out', type: { description: 'Sinker' } } },
+        {
+          index: 1, isPitch: false, type: 'action',
+          details: {
+            description: 'Official Scorer Ruling Pending',
+            event: 'Official Scorer Ruling Pending',
+            eventType: 'os_ruling_pending_primary',
+          },
+        },
+      ],
     },
   ],
   currentPlay: {
@@ -275,7 +300,7 @@ function collectStrings(node, out) {
 // separately (their own tab below, stat and counters).
 const feedList = registry['#feed-list'];
 const rows = feedList.children.filter((c) => c.cls.includes('feed-row'));
-assert.equal(rows.length, 1, `expected 1 feed row in All (the manager review), got ${rows.length}`);
+assert.equal(rows.length, 2, `expected 2 feed rows in All (manager review + official-scorer pending), got ${rows.length}`);
 const rowRecords = rows.map((row) => {
   const strings = [];
   collectStrings(row, strings);
@@ -283,8 +308,42 @@ const rowRecords = rows.map((row) => {
 });
 const impactRecord = rowRecords.find((record) => record.blob.includes('1 RUN AT RISK'));
 assert.ok(impactRecord, 'active score-impact row rendered in All');
+const pendingRecord = rowRecords.find((record) => record.blob.includes('Official Scoring Pending'));
+assert.ok(pendingRecord, 'official-scorer pending row rendered in All');
 assert.ok(!rowRecords.some((record) => record.blob.includes('ABS Challenge')),
   'the All section must not contain ABS pitch challenges');
+
+// 1-bis. The official-scorer pending row: type chip and ruling-pending
+// outcome pill from the deterministic fixture; batting side DET from the
+// play's halfInning 'top' (away) + the official /teams directory — never
+// guessed; NO run-at-risk flag/badge (a scoring ruling never removes a run).
+const pendingBlob = pendingRecord.blob;
+assert.ok(pendingBlob.includes('Official Scoring Pending'), 'type chip');
+assert.ok(pendingBlob.includes('Ruling Pending'), 'in-progress outcome pill');
+assert.ok(pendingBlob.includes('Batting: DET'), 'batting-side chip');
+assert.ok(!pendingRecord.row.cls.includes('feed-row-run-risk'),
+  'a pending scoring ruling is never flagged run-at-risk');
+assert.equal(findIn(pendingRecord.row, '.feed-run-risk-badge'), null,
+  'no run-at-risk badge on the pending row');
+assert.ok(!pendingBlob.includes('undefined'), `pending row leaked "undefined": ${pendingBlob}`);
+
+// The dedicated scoring-pending strip renders (with the batting team), and
+// the pending ruling is NOT duplicated under the generic LIVE REVIEW strip.
+const osStrip = findIn(registry['#active-strip'], '.feed-active-strip-os');
+assert.ok(osStrip, 'scoring-pending strip renders');
+const osStripStrings = [];
+collectStrings(osStrip, osStripStrings);
+assert.ok(osStripStrings.includes('⚖️ SCORING PENDING'), 'scoring-pending badge');
+assert.ok(osStripStrings.includes('Official Scoring Pending'), 'scoring-pending strip type');
+assert.ok(osStripStrings.includes('Batting: DET'), 'scoring-pending strip batting team');
+// Generic replay strip = every .feed-active-strip child EXCEPT the OS strip.
+const genericStripStrings = [];
+registry['#active-strip'].children
+  .filter((c) => c.cls.includes('feed-active-strip') && !c.cls.includes('feed-active-strip-os'))
+  .forEach((c) => collectStrings(c, genericStripStrings));
+assert.ok(genericStripStrings.includes('🚨 LIVE REVIEW'), 'replay LIVE REVIEW strip still renders');
+assert.ok(!genericStripStrings.includes('Official Scoring Pending'),
+  'pending ruling stays out of the generic LIVE REVIEW strip');
 
 // The ABS pitch challenge is still fully tracked: switch to its own
 // section and it renders there with all of its official fields.
@@ -403,10 +462,12 @@ registry['#feed-stats'].children.forEach((item) => {
   const value = findIn(item, '.review-stat-value');
   if (label && value) statPairs[label.text] = value.text;
 });
-assert.equal(statPairs['Events'], '1',
+assert.equal(statPairs['Events'], '2',
   `Events stat counts the All section (non-ABS), got: ${JSON.stringify(statPairs)}`);
 assert.equal(statPairs['ABS Challenges'], '1',
   `ABS Challenges stat keeps counting the tracked ABS event, got: ${JSON.stringify(statPairs)}`);
+assert.equal(statPairs['Scoring Pending'], '1',
+  `Scoring Pending stat shows the active official-scorer ruling, got: ${JSON.stringify(statPairs)}`);
 
 // 4d-bis. EVERY run-at-risk surface must disclaim that the ruling is not
 // predicted — banner, row badge and stat alike. docs/verification-report.md
@@ -439,10 +500,15 @@ assert.ok(tabStrings.some((s) => /^Boundary Calls \(0\)$/.test(s)),
 assert.ok(tabStrings.some((s) => s === "ReplayFeed.setFilter('boundary')"),
   'Boundary Calls tab wires ReplayFeed.setFilter(\'boundary\')');
 assert.ok(tabStrings.some((s) => /^ABS \(1\)$/.test(s)), 'captured ABS tab count');
-assert.ok(tabStrings.some((s) => /^All \(1\)$/.test(s)),
+assert.ok(tabStrings.some((s) => /^All \(2\)$/.test(s)),
   `All tab counts only what the section shows (no ABS), got: ${JSON.stringify(tabStrings)}`);
+assert.ok(tabStrings.some((s) => /^⚖️ Scoring Pending \(1\)$/.test(s)),
+  `Scoring Pending tab renders with its count, got: ${JSON.stringify(tabStrings)}`);
+assert.ok(tabStrings.some((s) => s === "ReplayFeed.setFilter('pending_scoring')"),
+  "Scoring Pending tab wires ReplayFeed.setFilter('pending_scoring')");
 assert.ok(tabStrings.some((s) => /^Challenges \(1\)$/.test(s)), 'active manager-review tab count');
-assert.ok(tabStrings.some((s) => /^● Under Review \(1\)$/.test(s)), 'active review tab count');
+assert.ok(tabStrings.some((s) => /^● Under Review \(1\)$/.test(s)),
+  'Under Review is a replay-review tab — the scoring-pending row is NOT counted there');
 assert.ok(tabStrings.some((s) => /^⚠️ Runs at Risk \(1\)$/.test(s)),
   `Runs at Risk filter tab renders with its count, got: ${JSON.stringify(tabStrings)}`);
 assert.ok(tabStrings.some((s) => s === "ReplayFeed.setFilter('runrisk')"),
@@ -453,11 +519,11 @@ context.window.ReplayFeed.setFilter('runrisk');
 const riskRows = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
 assert.equal(riskRows.length, 1, 'the runrisk filter shows only the at-risk row');
 assert.match(collectStrings(riskRows[0], []).join(' | '), /1 RUN AT RISK/);
-// All restores every non-ABS row — here exactly the at-risk manager row —
-// and keeps ABS sectioned out.
+// All restores every non-ABS row — the at-risk manager row and the
+// official-scorer pending row — and keeps ABS sectioned out.
 context.window.ReplayFeed.setFilter('all');
 const allRows = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
-assert.equal(allRows.length, 1, 'switching back to All restores every non-ABS row');
+assert.equal(allRows.length, 2, 'switching back to All restores every non-ABS row');
 assert.ok(!collectStrings(allRows[0], []).join(' | ').includes('ABS Challenge'),
   'All must not render the ABS row even after switching filters');
 // The ABS tab is where the tracked ABS pitch challenge lives.
@@ -474,10 +540,11 @@ Object.values(registry).forEach((n) => collectStrings(n, everything));
 const leaked = everything.filter((s) => String(s).includes('undefined'));
 assert.equal(leaked.length, 0, `no rendered string may contain "undefined": ${JSON.stringify(leaked)}`);
 
-// 6. Status line summarizes the poll.
-assert.match(registry['#status-line'].textContent, /1 game · 2 review events · updated /);
-// Review in flight -> the in-review cadence (REVIEW_POLL_MS) is advertised.
-assert.match(registry['#status-line'].textContent, /refreshing every 0\.75s/);
+// 6. Status line summarizes the poll. The feed tracks ABS + manager review +
+// official-scorer pending = 3 events; a review (or pending ruling) in flight
+// uses the in-review cadence REVIEW_POLL_MS = 250 (assets/js/reviews-feed.js).
+assert.match(registry['#status-line'].textContent, /1 game · 3 review events · updated /);
+assert.match(registry['#status-line'].textContent, /refreshing every 0\.25s/);
 
 /* 7. The run-at-risk predicate is DUPLICATED on purpose — MLBReviews.
  * runsRemovableByReview() in reviews.js and runsRemovableFromReview() in

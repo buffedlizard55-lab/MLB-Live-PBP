@@ -73,6 +73,176 @@ const MLBReviews = (() => {
   }
 
   /**
+   * Official StatsAPI event-type registry — GET /api/v1/eventTypes — the
+   * same vocabulary the feed uses for playEvents[].details.eventType.
+   * Verified live (statsapi.mlb.com, 2026-08-30). These are the ONLY two
+   * codes whose description is "Official Scorer Ruling Pending":
+   *
+   *   os_ruling_pending_primary → plateAppearance: true  — the primary
+   *                               plate-appearance event (hit / error /
+   *                               fielder's choice / etc.) is undecided.
+   *   os_ruling_pending_prior   → baseRunningEvent: true, plateAppearance:
+   *                               false — a prior base-running event of the
+   *                               same play is undecided.
+   *
+   * Nothing else is treated as a pending ruling. Both codes and the exact
+   * description text come straight from the registry; we never detect by
+   * substring, and never invent a code or label.
+   */
+  const OFFICIAL_SCORER_PENDING_TYPES = new Set([
+    'os_ruling_pending_primary',
+    'os_ruling_pending_prior',
+  ]);
+  const OFFICIAL_SCORER_PENDING_TEXT = 'Official Scorer Ruling Pending';
+  const PENDING_SCORING_TYPE_KEY = 'pending_scoring';
+  const PENDING_SCORING_LABEL = 'Official Scoring Pending';
+
+  /**
+   * True iff an event/result object carries the official-scorer-pending
+   * marker. Exact registry values only, at the fields the StatsAPI uses for
+   * event-type codes / descriptions:
+   *   playEvents[].details.eventType | .event | .description
+   *   playEvents[].type | .eventType          (defensive, exact code only)
+   *   play.result.eventType | .event | .description
+   * A value is accepted ONLY if it equals one of the two registered codes or
+   * the registered description verbatim. Pure; never throws.
+   */
+  function isOfficialScoringPendingEvent(candidate) {
+    if (!candidate || typeof candidate !== 'object') return false;
+    const details = candidate.details || {};
+    const values = [
+      details.eventType, details.event, details.description,
+      candidate.eventType, candidate.event, candidate.type,
+      candidate.result && candidate.result.eventType,
+      candidate.result && candidate.result.event,
+      candidate.result && candidate.result.description,
+    ];
+    return values.some((v) =>
+      typeof v === 'string' &&
+      (OFFICIAL_SCORER_PENDING_TYPES.has(v) || v === OFFICIAL_SCORER_PENDING_TEXT));
+  }
+
+  /**
+   * Scan one play for official-scorer-pending markers. Returns null when the
+   * play has none, else:
+   *   pendingEvents  — the playEvents that carry the marker
+   *   pendingCodes   — the unique registered codes observed
+   *   primary/prior  — booleans for the two registered codes
+   *   atResult       — true when play.result itself carries the marker
+   * Pure, reads only the supplied play object.
+   */
+  function findOfficialScoringPendingPlay(play) {
+    if (!play || typeof play !== 'object') return null;
+    const pendingEvents = [];
+    const pendingCodes = [];
+    const noteCode = (v) => {
+      if (typeof v === 'string' && OFFICIAL_SCORER_PENDING_TYPES.has(v) &&
+          !pendingCodes.includes(v)) pendingCodes.push(v);
+    };
+
+    (play.playEvents || []).forEach((event) => {
+      if (!event || typeof event !== 'object') return;
+      const details = event.details || {};
+      const values = [
+        details.eventType, details.event, details.description,
+        event.eventType, event.event, event.type,
+      ];
+      const hit = values.find((v) =>
+        typeof v === 'string' &&
+        (OFFICIAL_SCORER_PENDING_TYPES.has(v) || v === OFFICIAL_SCORER_PENDING_TEXT));
+      if (!hit) return;
+      pendingEvents.push(event);
+      values.forEach(noteCode);
+    });
+
+    const result = play.result || {};
+    const resultValues = [result.eventType, result.event, result.description];
+    const resultHit = resultValues.find((v) =>
+      typeof v === 'string' &&
+      (OFFICIAL_SCORER_PENDING_TYPES.has(v) || v === OFFICIAL_SCORER_PENDING_TEXT));
+    const atResult = !!resultHit;
+    if (atResult) resultValues.forEach(noteCode);
+
+    if (!pendingEvents.length && !atResult) return null;
+    return {
+      pendingEvents,
+      pendingCodes,
+      primary: pendingCodes.includes('os_ruling_pending_primary'),
+      prior: pendingCodes.includes('os_ruling_pending_prior'),
+      atResult,
+    };
+  }
+
+  /**
+   * One feed entry for a play whose official scoring ruling is pending.
+   * Produced ONLY from findOfficialScoringPendingPlay() — i.e. from the
+   * official registered codes / description above. The entry carries the
+   * observed payload text verbatim; if the payload had no play/no result
+   * description yet, the exact registry description is used, never a
+   * paraphrase and never a guessed final ruling (hit/error/etc.).
+   */
+  function buildPendingScoringEntry({ play, pending, teamNames, teamIdBySide }) {
+    const about = (play && play.about) || {};
+    const result = (play && play.result) || {};
+    const matchup = (play && play.matchup) || {};
+    const marker = pending.pendingEvents[0] || null;
+    const markerDesc = marker && marker.details &&
+      (marker.details.description || marker.details.event);
+    const desc = markerDesc ||
+      (pending.atResult && (result.description || result.event)) ||
+      OFFICIAL_SCORER_PENDING_TEXT;
+    const half = String(about.halfInning || '').toLowerCase();
+    const battingSide = half === 'top' ? 'away' : half === 'bottom' ? 'home' : null;
+    const battingTeamId = battingSide && teamIdBySide ? teamIdBySide[battingSide] : null;
+    const battingTeam = battingTeamId != null && teamNames ? teamNames[battingTeamId] : null;
+    const pendingNote = [
+      pending.primary ? 'primary plate-appearance ruling' : null,
+      pending.prior ? 'prior base-running ruling' : null,
+    ].filter(Boolean).join(' + ');
+
+    return {
+      id: `osp-${about.atBatIndex != null ? about.atBatIndex : 'cp'}`,
+      atBatIndex: about.atBatIndex != null ? about.atBatIndex : null,
+      inning: about.inning || 1,
+      halfInning: half || 'top',
+      inningLabel: formatInning(about),
+      reviewType: PENDING_SCORING_LABEL,
+      typeKey: PENDING_SCORING_TYPE_KEY,
+      // No challenging team: an official-scorer ruling is not charged to a
+      // team's challenge counter. The BATTING side is still shown as context
+      // (from halfInning + the official team ids — never guessed).
+      teamId: null,
+      teamName: null,
+      teamAbbrev: null,
+      battingSide,
+      battingTeamId,
+      battingTeamName: battingTeam ? battingTeam.name : null,
+      battingTeamAbbrev: battingTeam ? battingTeam.abbrev : null,
+      inProgress: true,
+      isOverturned: null,
+      outcome: 'in_progress',
+      outcomeLabel: 'Ruling Pending',
+      reason: pendingNote
+        ? `Official scorer ruling pending (${pendingNote})`
+        : 'Official scorer ruling pending',
+      description: desc,
+      timestamp: (marker && (marker.startTime || marker.endTime)) ||
+        about.endTime || about.startTime || null,
+      isPitch: false,
+      pitchVelo: null,
+      batter: matchup.batter ? { id: matchup.batter.id, fullName: matchup.batter.fullName } : null,
+      pitcher: matchup.pitcher ? { id: matchup.pitcher.id, fullName: matchup.pitcher.fullName } : null,
+      countBefore: null,
+      countAfter: null,
+      atBatCount: readPitchCount(play && play.count),
+      challenger: null,
+      pendingCodes: pending.pendingCodes,
+      scoreImpact: null,
+      officialScoringPending: true,
+    };
+  }
+
+  /**
    * Extract a concise review reason / topic from play/event descriptions.
    * `typeKey` (optional) disambiguates bare pitch descriptions: "Foul" means
    * an ABS ball/strike topic for an "MJ" review, but a boundary-call topic
@@ -728,7 +898,7 @@ const MLBReviews = (() => {
    * for the same type because it carries the full description.
    */
   function extractReviews(feed) {
-    if (!feed) return { reviews: [], activeReview: null, summary: emptySummary() };
+    if (!feed) return { reviews: [], activeReview: null, summary: emptySummary(), pendingScoring: [] };
 
     const liveData = feed.liveData || {};
     const gameData = feed.gameData || {};
@@ -901,7 +1071,24 @@ const MLBReviews = (() => {
       processPlay(currentPlay, true);
     }
 
-    const reviews = [...entriesByKey.values()];
+    // Official-scorer pending rulings. Separate from replay reviews: these
+    // come from the API's own event-type registry (os_ruling_pending_primary /
+    // os_ruling_pending_prior, description "Official Scorer Ruling Pending"),
+    // NOT from reviewDetails. One entry per at-bat; a play that appears in
+    // BOTH allPlays and currentPlay is deduped by its atBatIndex.
+    const pendingByKey = new Map();
+    const processPending = (play) => {
+      if (!play) return;
+      const pending = findOfficialScoringPendingPlay(play);
+      if (!pending) return;
+      const entry = buildPendingScoringEntry({ play, pending, teamNames, teamIdBySide });
+      const key = `${entry.atBatIndex != null ? entry.atBatIndex : 'cp'}:${entry.battingSide || ''}`;
+      if (!pendingByKey.has(key)) pendingByKey.set(key, entry);
+    };
+    allPlays.forEach(processPending);
+    if (currentPlay) processPending(currentPlay);
+
+    const reviews = [...entriesByKey.values(), ...pendingByKey.values()];
 
     // If game state explicitly says "Manager Challenge" or "Review" but no in-progress review recorded yet:
     if (isGameInReviewStatus && !reviews.some((r) => r.inProgress)) {
@@ -970,7 +1157,7 @@ const MLBReviews = (() => {
     const activeReview = reviews.find((r) => r.inProgress) || null;
     const summary = buildSummary(reviews);
 
-    return { reviews, activeReview, summary };
+    return { reviews, activeReview, summary, pendingScoring: [...pendingByKey.values()] };
   }
 
   function emptySummary() {
@@ -979,8 +1166,10 @@ const MLBReviews = (() => {
       overturned: 0,
       stands: 0,
       inProgress: 0,
+      pendingScoring: 0,
+      pendingScoringActive: 0,
       overturnRate: '0.0%',
-      byType: { manager: 0, crew_chief: 0, abs: 0, boundary: 0, umpire: 0, rules: 0, review: 0 },
+      byType: { manager: 0, crew_chief: 0, abs: 0, boundary: 0, umpire: 0, rules: 0, review: 0, pending_scoring: 0 },
       byTeam: {},
     };
   }
@@ -990,6 +1179,20 @@ const MLBReviews = (() => {
     summary.total = reviews.length;
 
     reviews.forEach((r) => {
+      // Official-scorer pending rulings are NOT replay outcomes: a resolved
+      // scoring ruling (hit/error/fielder's choice) is neither "overturned"
+      // nor "stands" in the replay sense, so it never enters the overturn
+      // rate. It is tracked separately (pendingScoring below) and as
+      // inProgress while the scorer is still deciding.
+      if (r.typeKey === 'pending_scoring') {
+        // NOT counted in summary.inProgress: \"Under Review\" on the game
+        // page is a replay-review counter. Active scoring rulings have their
+        // own counts/stats (pendingScoringActive).
+        if (r.inProgress) summary.pendingScoringActive += 1;
+        summary.pendingScoring += 1;
+        summary.byType[r.typeKey] = (summary.byType[r.typeKey] || 0) + 1;
+        return;
+      }
       if (r.inProgress) summary.inProgress += 1;
       else if (r.outcome === 'overturned') summary.overturned += 1;
       else summary.stands += 1;
@@ -1048,7 +1251,10 @@ const MLBReviews = (() => {
   function renderLiveAlertBanner(activeReview) {
     if (!activeReview) return null;
     const banner = UI.el('div', 'review-live-alert');
-    const badge = UI.el('span', 'review-alert-badge', '🚨 LIVE REVIEW');
+    const badge = UI.el('span', 'review-alert-badge',
+      activeReview.typeKey === PENDING_SCORING_TYPE_KEY
+        ? '⚖️ OFFICIAL SCORER RULING'
+        : '🚨 LIVE REVIEW');
     const typeChip = UI.el('span', `chip-review-type chip-${activeReview.typeKey}`, activeReview.reviewType);
     const content = UI.el('div', 'review-alert-content');
     const title = UI.el('strong', 'review-alert-title',
@@ -1083,13 +1289,25 @@ const MLBReviews = (() => {
     if (review.teamAbbrev) {
       left.appendChild(UI.el('span', 'review-team-tag', review.teamAbbrev));
     }
+    // Official-scorer pending: the batting side (from halfInning + official
+    // team ids) is context, not a "challenging team" — no challenge counter.
+    // Rendered only when a real name exists; never guessed.
+    if (review.typeKey === 'pending_scoring' && (review.battingTeamAbbrev || review.battingTeamName)) {
+      const bat = UI.el('span', 'review-team-tag review-batting-tag',
+        `Batting: ${review.battingTeamAbbrev || review.battingTeamName}`);
+      if (review.battingTeamName) bat.title = review.battingTeamName;
+      left.appendChild(bat);
+    }
     head.appendChild(left);
 
     const right = UI.el('div', 'review-card-head-right');
     const outcomeCls = review.inProgress ? 'outcome-in-progress' :
       review.outcome === 'overturned' ? 'outcome-overturned' :
-      review.outcome === 'confirmed' ? 'outcome-confirmed' : 'outcome-stands';
-    const outcomeIcon = review.inProgress ? '⚡ ' : review.outcome === 'overturned' ? '✓ ' : '✗ ';
+      review.outcome === 'confirmed' ? 'outcome-confirmed' :
+      review.outcome === 'resolved' ? 'outcome-resolved' : 'outcome-stands';
+    const outcomeIcon = review.inProgress ? '⚡ ' :
+      review.outcome === 'resolved' ? '✓ ' :
+      review.outcome === 'overturned' ? '✓ ' : '✗ ';
     right.appendChild(UI.el('span', `review-outcome-pill ${outcomeCls}`, `${outcomeIcon}${review.outcomeLabel}`));
     head.appendChild(right);
     card.appendChild(head);
@@ -1158,6 +1376,16 @@ const MLBReviews = (() => {
     statsBar.appendChild(statItem('Overturn Rate', summary.overturnRate));
     if (summary.inProgress > 0) {
       statsBar.appendChild(statItem('Under Review', summary.inProgress, 'stat-active-pulse'));
+    }
+    // Official-scorer pending rulings are tracked separately from replay
+    // outcome stats (see buildSummary). Value = rulings pending RIGHT NOW,
+    // matching the Replay Feed stat; the tooltip reports the tracked total.
+    if (summary.pendingScoring > 0) {
+      const item = statItem('Scoring Pending', summary.pendingScoringActive, 'stat-os-pending');
+      item.title = `${summary.pendingScoring} official-scorer ruling${summary.pendingScoring === 1 ? '' : 's'} tracked for this game, ${summary.pendingScoringActive} still pending. ` +
+        'A ruling decides how the play is charged (hit / error / fielder\u2019s choice) — it never removes a run from the score. ' +
+        'Detected only from the StatsAPI event registry os_ruling_pending_primary / os_ruling_pending_prior (GET /api/v1/eventTypes).';
+      statsBar.appendChild(item);
     }
     container.appendChild(statsBar);
 
@@ -1231,6 +1459,12 @@ const MLBReviews = (() => {
   function runsRemovableByReview(review) {
     if (!review) return 0;
     if (review.inProgress !== true) return 0;
+    // An official-scorer pending ruling decides how to CHARGE the play (hit /
+    // error / fielder's choice, earned vs. unearned runs) — it never removes
+    // a run from the scoreboard, so nothing is "at risk". See MLB Official
+    // Scoring Rules (official scorer decides hits/errors) and the API's
+    // registered os_ruling_pending_* event types.
+    if (review.typeKey === 'pending_scoring') return 0;
     const impact = review.scoreImpact;
     if (!impact || typeof impact !== 'object') return 0;
     const candidates = [
@@ -1307,6 +1541,13 @@ const MLBReviews = (() => {
     reviewCouldRemoveRuns,
     runsRemovableByReview,
     runRiskSummary,
+    OFFICIAL_SCORER_PENDING_TYPES,
+    OFFICIAL_SCORER_PENDING_TEXT,
+    PENDING_SCORING_TYPE_KEY,
+    PENDING_SCORING_LABEL,
+    isOfficialScoringPendingEvent,
+    findOfficialScoringPendingPlay,
+    buildPendingScoringEntry,
   };
 })();
 

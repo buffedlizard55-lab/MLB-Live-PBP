@@ -451,13 +451,18 @@
       return;
     }
 
-    // Prominent live review notification in the live module if active
+    // Prominent live review notification in the live module if active.
+    // An official-scorer pending ruling is NOT a replay review, so it uses
+    // its own heading (the scorer is deciding hit/error/fielder's choice).
     if (activeReview) {
+      const isPendingScoring = activeReview.typeKey === 'pending_scoring';
       const revStrip = UI.el('div', 'live-active-review-card');
-      revStrip.appendChild(UI.el('div', 'live-review-pulse', '🚨'));
+      revStrip.appendChild(UI.el('div', 'live-review-pulse', isPendingScoring ? '⚖️' : '🚨'));
       const textWrap = UI.el('div', 'live-review-body');
       textWrap.appendChild(UI.el('div', 'live-review-head',
-        `PLAY UNDER REVIEW — ${activeReview.reviewType.toUpperCase()}${activeReview.teamAbbrev ? ` (${activeReview.teamAbbrev})` : ''}`));
+        isPendingScoring
+          ? `OFFICIAL SCORER RULING PENDING${activeReview.battingTeamAbbrev ? ` (${activeReview.battingTeamAbbrev} batting)` : ''}`
+          : `PLAY UNDER REVIEW — ${activeReview.reviewType.toUpperCase()}${activeReview.teamAbbrev ? ` (${activeReview.teamAbbrev})` : ''}`));
       textWrap.appendChild(UI.el('div', 'live-review-reason', activeReview.reason));
       textWrap.appendChild(UI.el('div', 'live-review-desc', activeReview.description));
       const scoreImpact = window.MLBReviews && window.MLBReviews.renderScoreImpact

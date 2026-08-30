@@ -194,6 +194,26 @@ function reviewChanged(previousReview, nextReview) {
 }
 
 /**
+ * Transition an official-scorer-pending entry to its observed RESOLUTION.
+ * Called when the pending marker disappears from the payload: the scorer has
+ * ruled, so the play now carries its final hit/error in the game feed. We
+ * keep the observed pending row (never delete a tracked event) and mark it
+ * resolved. The final ruling itself is NOT read from the new payload here,
+ * so no hit/error text is guessed — the row keeps what was observed while
+ * pending plus this resolution state.
+ */
+function completePendingScoringReview(review) {
+  if (!review) return review;
+  return {
+    ...review,
+    inProgress: false,
+    outcome: 'resolved',
+    outcomeLabel: 'Ruling Complete',
+    resolvedWhenMarkerCleared: true,
+  };
+}
+
+/**
  * Merge a game's freshly extracted reviews into feed state.
  * state = { seen: Map<key, {gamePk, review, firstSeen, lastSeen}>, order: [] }
  * Returns { added: [], updated: [], ended: [] } with the same entry objects.
@@ -260,12 +280,29 @@ function mergeFeedEvents(state, gamePk, reviews) {
   const keys = [...seen.keys()];
   keys.forEach((key) => {
     if (!key.startsWith(`${gamePk}:`)) return;
-    if (!currentKeys.has(key)) {
-      seen.delete(key);
-      const orderIdx = order.indexOf(key);
-      if (orderIdx >= 0) order.splice(orderIdx, 1);
-      ended.push(key);
+    if (currentKeys.has(key)) return;
+
+    // Official-scorer pending: the marker disappears the moment the scorer
+    // rules (the play then carries its final hit/error). Keep the observed
+    // row and mark it resolved in place — a tracked pending event must never
+    // vanish from the feed, and "resolved" is observed, not invented. The
+    // row is retained for as long as this date's feed exists, exactly like
+    // every other resolved review row.
+    const prev = seen.get(key);
+    const pendingReview = prev && prev.review;
+    if (pendingReview && pendingReview.officialScoringPending === true) {
+      if (!pendingReview.resolvedWhenMarkerCleared) {
+        prev.review = completePendingScoringReview(pendingReview);
+        prev.lastSeen = now;
+        updated.push(prev);
+      }
+      return;
     }
+
+    seen.delete(key);
+    const orderIdx = order.indexOf(key);
+    if (orderIdx >= 0) order.splice(orderIdx, 1);
+    ended.push(key);
   });
 
   return { added, updated, ended };
@@ -411,9 +448,11 @@ function gameTeamsLabel(game, teamsById) {
 
 /**
  * Whether a review should trigger the audio alert (gentle raindrop chime).
- * Requirement: challenges, reviews, boundary calls, but NOT ABS.
- * ABS is typeKey 'abs'. Everything else (manager, crew_chief, boundary,
- * review, rules, umpire) qualifies. Pure function — no DOM.
+ * Requirement: challenges, reviews, boundary calls, official-scorer pending
+ * rulings, but NOT ABS. ABS is typeKey 'abs'. Everything else (manager,
+ * crew_chief, boundary, review, rules, umpire, pending_scoring) qualifies —
+ * an official-scorer pending ruling is exactly what the user wants to hear
+ * about immediately. Pure function — no DOM.
  */
 function shouldAlertForReview(review) {
   if (!review || typeof review.typeKey !== 'string') return false;
@@ -470,6 +509,12 @@ function visibleInAllFeed(review) {
 function runsRemovableFromReview(review) {
   if (!review) return 0;
   if (review.inProgress !== true) return 0;
+  // Official-scorer pending rulings decide how to CHARGE the play (hit /
+  // error / fielder's choice, earned vs. unearned runs) — they never take a
+  // run off the scoreboard, so nothing is at risk. The ruling is the API's
+  // own os_ruling_pending_primary / os_ruling_pending_prior event type
+  // (description "Official Scorer Ruling Pending", GET /api/v1/eventTypes).
+  if (review.typeKey === 'pending_scoring') return 0;
   const impact = review.scoreImpact;
   if (!impact || typeof impact !== 'object') return 0;
   const candidates = [
@@ -985,12 +1030,12 @@ function gameChallengeLine(counts, labels, prefix) {
       btn.textContent = '🔔 Sound On';
       btn.classList.add('btn-sound-on');
       btn.classList.remove('btn-ghost');
-      btn.title = 'Alert sound ON — gentle raindrop chime for new challenges/reviews/boundary calls (not ABS), and the same chime whenever an active review could take a run OFF the scoreboard (any review type, ABS included). Click to mute.';
+      btn.title = 'Alert sound ON — gentle raindrop chime for new challenges/reviews/boundary calls and official-scorer pending rulings (not ABS), and the same chime whenever an active review could take a run OFF the scoreboard (any review type, ABS included). Click to mute.';
     } else {
       btn.textContent = '🔇 Sound Off';
       btn.classList.remove('btn-sound-on');
       btn.classList.add('btn-ghost');
-      btn.title = 'Alert sound OFF — click to enable the gentle raindrop chime for new challenges/reviews/boundary calls and for run-at-risk reviews';
+      btn.title = 'Alert sound OFF — click to enable the gentle raindrop chime for new challenges/reviews/boundary calls, official-scorer pending rulings, and run-at-risk reviews';
     }
   }
 
@@ -1384,9 +1429,24 @@ function gameChallengeLine(counts, labels, prefix) {
     wrap.appendChild(stat('ABS Challenges', entries.filter((e) => e.review.typeKey === 'abs').length, 'stat-abs'));
     wrap.appendChild(stat('Manager Challenges', entries.filter((e) => e.review.typeKey === 'manager').length, 'stat-manager'));
     wrap.appendChild(stat('Boundary Calls', entries.filter((e) => e.review.typeKey === 'boundary').length, 'stat-boundary'));
+    // Official-scorer pending rulings (hit / error / fielder's choice
+    // undecided). The value is the number of rulings pending RIGHT NOW; the
+    // tooltip also reports how many have been tracked today so the feed is
+    // transparent about the history it keeps.
+    const osEntries = entries.filter((e) => e.review.typeKey === 'pending_scoring');
+    if (osEntries.length) {
+      const osActive = osEntries.filter((e) => e.review.inProgress).length;
+      const item = stat('Scoring Pending', osActive, 'stat-os-pending');
+      item.title = `${osEntries.length} official-scorer ruling${osEntries.length === 1 ? '' : 's'} tracked today, ${osActive} still pending. ` +
+        'A ruling decides how the play is charged (hit / error / fielder\u2019s choice) — it never removes a run from the score. ' +
+        'Detected only from the official StatsAPI event types os_ruling_pending_primary / os_ruling_pending_prior ("Official Scorer Ruling Pending", GET /api/v1/eventTypes).';
+      wrap.appendChild(item);
+    }
     wrap.appendChild(stat('Overturned', entries.filter((e) => e.review.outcome === 'overturned').length, 'stat-overturned'));
     wrap.appendChild(stat('Stands / Upheld', entries.filter((e) => e.review.outcome === 'stands').length, 'stat-stands'));
-    const inProgress = entries.filter((e) => e.review.inProgress);
+    // \"Under Review\" is a replay-review counter; official-scorer pending
+    // rulings are counted by their own Scoring Pending stat above.
+    const inProgress = entries.filter((e) => e.review.inProgress && e.review.typeKey !== 'pending_scoring');
     if (inProgress.length) {
       wrap.appendChild(stat('Under Review', inProgress.length, 'stat-active-pulse'));
     }
@@ -1405,10 +1465,44 @@ function gameChallengeLine(counts, labels, prefix) {
   function renderActiveStrip() {
     const wrap = UI.clear($('#active-strip'));
     renderRunRiskBanner(wrap);
+
+    // Official-scorer pending rulings — their own live strip, distinct from
+    // replay reviews ("LIVE REVIEW" would be wrong for a scoring decision).
+    const osEntries = [];
+    feedState.seen.forEach((entry) => {
+      if (entry.review && entry.review.typeKey === 'pending_scoring' &&
+          entry.review.inProgress) osEntries.push(entry);
+    });
+    if (osEntries.length) {
+      const osBar = el('div', 'feed-active-strip feed-active-strip-os');
+      osBar.appendChild(el('span', 'feed-active-badge feed-active-badge-os', '⚖️ SCORING PENDING'));
+      osEntries.forEach((entry) => {
+        const g = games.find((x) => x.gamePk === entry.gamePk);
+        if (!g) return;
+        const item = el('a', 'feed-active-link feed-active-link-os', '',
+          { href: `game.html?gamePk=${entry.gamePk}` });
+        item.appendChild(el('span', 'feed-active-game', matchupFor(entry, g)));
+        item.appendChild(el('span', 'feed-active-type', entry.review.reviewType));
+        if (entry.review.reason) {
+          item.appendChild(el('span', 'feed-active-reason', entry.review.reason));
+        }
+        if (entry.review.battingTeamAbbrev || entry.review.battingTeamName) {
+          const teamChip = el('span', 'feed-active-team',
+            `Batting: ${entry.review.battingTeamAbbrev || entry.review.battingTeamName}`);
+          if (entry.review.battingTeamName) teamChip.title = entry.review.battingTeamName;
+          item.appendChild(teamChip);
+        }
+        osBar.appendChild(item);
+      });
+      wrap.appendChild(osBar);
+    }
+
     const activeGames = new Map();
 
     feedState.seen.forEach((entry, key) => {
-      if (entry.review.inProgress) {
+      // Official-scorer pending rulings have their own strip above; they are
+      // never labeled "LIVE REVIEW" (a scoring decision is not a replay).
+      if (entry.review.inProgress && entry.review.typeKey !== 'pending_scoring') {
         if (!activeGames.has(entry.gamePk)) activeGames.set(entry.gamePk, []);
         activeGames.get(entry.gamePk).push(entry);
       }
@@ -1544,11 +1638,15 @@ function gameChallengeLine(counts, labels, prefix) {
       manager: entries.filter((e) => e.review.typeKey === 'manager').length,
       crew: entries.filter((e) => e.review.typeKey === 'crew_chief').length,
       boundary: entries.filter((e) => e.review.typeKey === 'boundary').length,
-      live: entries.filter((e) => e.review.inProgress).length,
+      // \"Under Review\" is a REPLAY-review surface; official-scorer pending
+      // rulings are counted on their own Scoring Pending tab.
+      live: entries.filter((e) => e.review.inProgress && e.review.typeKey !== 'pending_scoring').length,
       runrisk: entries.filter((e) => runsRemovableFromReview(e.review) > 0).length,
+      pending_scoring: entries.filter((e) => e.review.typeKey === 'pending_scoring').length,
     };
     const tabs = [
       ['all', `All (${counts.all})`],
+      ['pending_scoring', `⚖️ Scoring Pending (${counts.pending_scoring})`],
       ['abs', `ABS (${counts.abs})`],
       ['manager', `Challenges (${counts.manager})`],
       ['crew', `Reviews (${counts.crew})`],
@@ -1586,8 +1684,9 @@ function gameChallengeLine(counts, labels, prefix) {
     // "ABS" tab (and wherever else their category applies: the Under
     // Review tab, active strip, run-at-risk surfaces).
     if (filter === 'all') return visibleInAllFeed(entry && entry.review);
-    if (filter === 'live') return entry.review.inProgress;
+    if (filter === 'live') return entry.review.inProgress && entry.review.typeKey !== 'pending_scoring';
     if (filter === 'runrisk') return runsRemovableFromReview(entry.review) > 0;
+    if (filter === 'pending_scoring') return entry.review.typeKey === 'pending_scoring';
     return entry.review.typeKey === filter;
   }
 
@@ -1656,6 +1755,14 @@ function gameChallengeLine(counts, labels, prefix) {
       const chip = el('span', 'feed-team', teamAbbrev);
       if (teamFullName) chip.title = teamFullName;
       head.appendChild(chip);
+    }
+    // Official-scorer pending: the batting side (from halfInning + official
+    // team ids) is context, not a "challenging team" — no challenge counter.
+    if (r.typeKey === 'pending_scoring' && (r.battingTeamAbbrev || r.battingTeamName)) {
+      const bat = el('span', 'feed-batting',
+        `Batting: ${r.battingTeamAbbrev || r.battingTeamName}`);
+      if (r.battingTeamName) bat.title = r.battingTeamName;
+      head.appendChild(bat);
     }
     if (r.inningLabel) head.appendChild(el('span', 'feed-inn', r.inningLabel));
     head.appendChild(outcomePill(r));
@@ -1734,8 +1841,11 @@ function gameChallengeLine(counts, labels, prefix) {
   function outcomePill(r) {
     const cls = r.inProgress ? 'outcome-in-progress' :
       r.outcome === 'overturned' ? 'outcome-overturned' :
-      r.outcome === 'confirmed' ? 'outcome-confirmed' : 'outcome-stands';
-    const icon = r.inProgress ? '⚡ ' : r.outcome === 'overturned' ? '✓ ' : '✗ ';
+      r.outcome === 'confirmed' ? 'outcome-confirmed' :
+      r.outcome === 'resolved' ? 'outcome-resolved' : 'outcome-stands';
+    const icon = r.inProgress ? '⚡ ' :
+      r.outcome === 'resolved' ? '✓ ' :
+      r.outcome === 'overturned' ? '✓ ' : '✗ ';
     return el('span', `review-outcome-pill ${cls}`, `${icon}${r.outcomeLabel}`);
   }
 
@@ -1935,6 +2045,7 @@ function gameChallengeLine(counts, labels, prefix) {
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       buildEventKey, mergeFeedEvents, reconcileScoreImpact, reviewChanged,
+      completePendingScoringReview,
       sortFeedEntries, gameTeamsLabel,
       isUsableName, officialTeamName, gameSideTeam,
       pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
