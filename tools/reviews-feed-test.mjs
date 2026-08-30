@@ -107,7 +107,7 @@ const {
   sortFeedEntries, gameTeamsLabel,
   isUsableName, officialTeamName, gameSideTeam,
   pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
-  shouldAlertForReview,
+  shouldAlertForReview, visibleInAllFeed,
   runsRemovableFromReview, shouldRunRiskAlert, diffRunRiskKeys,
   normalizeChallengeCounts, challengeCountIrregularities,
   teamSideInGame, teamChallengeLine, gameChallengeLine,
@@ -502,6 +502,32 @@ assert.equal(shouldAlertForReview({ typeKey: 'rules' }), true);
 assert.equal(shouldAlertForReview(null), false);
 assert.equal(shouldAlertForReview({}), false);
 assert.equal(shouldAlertForReview({ typeKey: 42 }), false);
+
+/* --------------- 10b. All-section visibility (ABS has its own section)
+ *
+ * The All section shows challenges, reviews, boundary calls, under-review
+ * status and run-at-risk entries, but NOT ABS pitch challenges. ABS stays
+ * tracked (own tab / stat / counters) and stays silent (§10 above). This
+ * gate is independent of alerting: a run-at-risk ABS-typed entry is still
+ * hidden from All (its own tab + the run-at-risk surfaces show it) while
+ * the run-at-risk ALERT gate remains data-driven, unchanged.
+ */
+
+// The one excluded category: ABS pitch challenges (official code "MJ").
+assert.equal(visibleInAllFeed({ typeKey: 'abs' }), false);
+// Every other observed review typeKey belongs in All…
+['manager', 'crew_chief', 'boundary', 'review', 'rules'].forEach((typeKey) => {
+  assert.equal(visibleInAllFeed({ typeKey }), true, `${typeKey} must stay in the All section`);
+});
+// …even when flagged run-at-risk or under review (All keeps those
+// categories; only the ABS type itself is sectioned out).
+assert.equal(visibleInAllFeed({ typeKey: 'manager', inProgress: true }), true);
+// Defensive: unknown / malformed entries fail OPEN — an unrecognized event
+// must never be silently hidden from the main feed.
+assert.equal(visibleInAllFeed(null), true);
+assert.equal(visibleInAllFeed(undefined), true);
+assert.equal(visibleInAllFeed({}), true);
+assert.equal(visibleInAllFeed({ typeKey: 42 }), true);
 
 /* ---------------------- 11. Audio alert is a gentle raindrop chime
  *

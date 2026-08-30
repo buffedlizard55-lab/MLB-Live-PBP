@@ -208,3 +208,48 @@ using the API's own `fields` projection.
 | Counter irregularities are flagged, not corrected | ✅ deterministic test | The only encoded invariant is monotonicity of `used`/`usedSuccessful`/`usedFailed` within one game (a spent challenge cannot be un-spent). A backwards move is appended to the row as “⚠️ Counter irregularity flagged for review: …” with the raw observed values; `remaining` is deliberately never flagged in either direction (it legitimately rises on retained/regained challenges). To avoid false flags from a schedule cache lagging feed/live, a schedule-only poll may not overwrite manager counters already observed from feed/live. `tools/reviews-feed-test.mjs` §15d–e. |
 | No manual input, no invention | ✅ | `normalizeChallengeCounts()` accepts only finite non-negative numbers; anything else stays `null` and the corresponding UI line is omitted. A failed counters request keeps the last observed values (never zero-fills). Whole-page “undefined” sweep unchanged in `tools/replay-feed-render-test.mjs`. |
 | End-to-end render | ✅ | `tools/replay-feed-render-test.mjs` §4a-ter drives the real page against the verbatim 823342 captures (2026-08-19 §1–2, including its absChallenges `away {usedSuccessful:0,usedFailed:1,remaining:1}`): the ABS row shows `DET: 1 ABS challenge left now (0 successful · 1 failed)`, the manager row `PIT: 1 manager challenge left now (0 used)`, both-teams summary `Challenges left: DET 1 MGR · 1 ABS — PIT 1 MGR · 2 ABS` on hover and on the live strip. `tools/smoke-test.mjs` now pins the projected feed/live URL in CI. |
+
+## 13. ABS challenges sectioned out of the All feed (added 2026-08-29)
+
+Requirement (user, verbatim): keep the **challenges, reviews, boundary calls,
+under review, runs at risk** in the All section, but have **ABS challenges not
+show up in the All section**. ABS challenges must still be **tracked**, and
+alerts must fire only for **challenges, reviews, boundary calls, under review,
+runs at risk**.
+
+Every line below was verified against the official StatsAPI and official MLB
+sources on 2026-08-29 (live fetches of `statsapi.mlb.com` via the API's own
+`fields` projection, plus official mlb.com pages). No behavior was guessed.
+
+| Line changed (reviews-feed.js) | What it does | Verified against |
+| --- | --- | --- |
+| `visibleInAllFeed()` (new pure helper) | Returns false only for `typeKey === 'abs'`; unknown/malformed entries fail **open** (visible) so an unrecognized event is never silently hidden | `typeKey 'abs'` is produced **only** by the official StatsAPI code `"MJ"` or explicit ABS text in official play descriptions (`normalizeType` in `reviews.js`; codes verified in §2 from live games 823342/823667/824075). No other review category maps to `'abs'`, so the exclusion covers exactly the official ABS pitch-challenge category — nothing else. |
+| `matchesFilter()` — `filter === 'all'` | All now shows every non-ABS entry: manager challenges, crew-chief/umpire reviews, boundary calls, under-review status entries, run-at-risk entries | The excluded set is exactly `'abs'` (above). All other tabs (`abs`, `manager`, `crew`, `boundary`, `live`, `runrisk`) are unchanged, so ABS entries remain rendered and tracked. |
+| `renderTabs()` — All tab count | `All (n)` counts only what the All section renders (non-ABS) | Pinned by `tools/replay-feed-render-test.mjs` (`All (1)` alongside `ABS (1)` for the same 2-entry fixture). |
+| `renderStats()` — `Events` stat | Counts the All section (non-ABS); the separate **ABS Challenges** stat keeps its own count, so the stats bar partitions the two sections | Pinned by `tools/replay-feed-render-test.mjs` (`Events` = 1, `ABS Challenges` = 1 for the same fixture). |
+| Alert gates (`shouldAlertForReview`, `pendingAlertableCount`, run-at-risk path) | **Unchanged**, re-pinned: the new-review chime fires for every category except ABS (§10); the run-at-risk alert is data-driven (§11–§12b) and fires for the *runs at risk* category | `tools/reviews-feed-test.mjs` §10/§12b; `tools/replay-feed-render-test.mjs` §4d. ABS tracking is unchanged end-to-end: feed-state dedupe, ABS tab, ABS stat, challenges-remaining counters, active strip. |
+
+### Live re-verification performed 2026-08-29 (official StatsAPI)
+
+- `GET /api/v1/schedule?sportId=1&date=2026-08-28&hydrate=review` (fields-projected): all 15 games carry `review.{away,home}.{used,remaining}`; `hasChallenges:true` exactly when a `used` counter is > 0; successful manager challenges read `used:1, remaining:1` (games 824396, 823013) and failed ones `used:1, remaining:0` (824877, 823666, 824960). Matches `normalizeChallengeCounts()` and §1/§12.
+- `GET /api/v1.1/game/824638/feed/live` (fields-projected): `gameData.absChallenges` = away `{usedSuccessful:3, usedFailed:0, remaining:2}`, home `{usedSuccessful:5, usedFailed:0, remaining:2}` — successful ABS challenges are retained (`remaining` stays 2), as documented in §12 and confirmed by the official MLB press release below. `gameData.review` (manager) reads `{used:0, remaining:1}` both sides — the two counters are independent.
+- Schedule team objects carry only `{id, name, link}` (no abbreviation) — unchanged from §1.
+
+### Official MLB rule sources re-checked 2026-08-29
+
+- **ABS Challenge System** — MLB official press release (mlb.com, 2025-09-23, "MLB announces ABS Challenge System coming to the Major Leagues beginning in the 2026 season"): each club starts with two challenges, all successful challenges are retained, only the pitcher, catcher or batter may challenge, and in each extra inning a team is awarded a challenge if it has none remaining. Confirms the ABS comments in `reviews.js`/`reviews-feed.js` and the retained-on-success counter display.
+- **Manager Challenge** — official mlb.com Glossary "Manager Challenge": one manager challenge to start every regular-season game; the club retains it if the replay official overturns any challenged call, and loses it if no calls are overturned. Confirms why `remaining` can legitimately stay at 1 after `used:1`.
+- **Replay Review** — official mlb.com Glossary "Replay Review": a crew chief may initiate review of a potential home run (boundary call) at any time without a manager challenge; from the eighth inning a crew chief may review all reviewable calls on his own initiative. Confirms the boundary-call (`NH`) handling being crew-chief-initiated with no challenging club.
+
+### Flagged for review (deliberate decisions, no code defect found)
+
+1. **Run-at-risk alert stays type-independent.** The run-at-risk gate is driven by the official payload (runs credited to the reviewed event), not by review type — so a hypothetical ABS-tagged event carrying a credited run would alert under the *runs at risk* category while remaining hidden from All. In practice, captured ABS pitch challenges credit no runners (§11), so this does not occur; the gate was left data-driven so a run at risk can never be silently ignored. Not changed.
+2. **Page-wide stats keep counting ABS.** `Overturned`, `Stands / Upheld`, `Under Review` and `Runs at Risk` remain whole-feed trackers (ABS included — ABS is still tracked); only `Events` now counts the All section. Not changed.
+3. **Under Review tab / active strip still show in-progress ABS challenges.** They are tracked surfaces, not the All section; an in-progress ABS challenge is visible there and in the ABS tab. Not changed.
+4. **`tools/smoke-test.mjs` could not run in this sandbox** (the shell has no outbound network; it runs nightly in CI). All five deterministic suites pass locally: `review-test.mjs`, `reviews-feed-test.mjs`, `replay-feed-render-test.mjs`, `hit-model-test.mjs`, `review-probe-test.mjs`.
+5. **The `"MJ"` → `'abs'` classification was not re-captured live today** (unchanged logic; it rests on the verbatim 2026-08-19 captures in §2 and the render-test fixture). The live re-verification above covers the counters and schedule shapes the changed lines depend on.
+
+### New/updated regression coverage
+
+- `tools/reviews-feed-test.mjs` §10b — pins `visibleInAllFeed()`: `'abs'` → hidden; `manager`/`crew_chief`/`boundary`/`review`/`rules` → visible (including while under review); `null`/`{}`/non-string typeKey → fail open.
+- `tools/replay-feed-render-test.mjs` §1/§4c/§4d/§4e — pins, against the verbatim 823342 captures: All renders the manager row and never the ABS row; the ABS tab renders exactly the ABS row with its full content; `All (1)` + `ABS (1)` tab counts; `Events` = 1 and `ABS Challenges` = 1 stats; switching between run-risk / All / ABS filters restores each section correctly.

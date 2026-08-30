@@ -58,8 +58,12 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
     boundary reviews are not charged to a team's counter, so those rows show
     no counter line by design. Includes
     an "Under Review" live strip, per-type
-    filters (All / ABS / Challenges / Reviews / Boundary Calls / Under Review /
-    ⚠️ Runs at Risk),
+    filters — **All** (every category except ABS pitch challenges:
+    challenges, reviews, boundary calls, under review, runs at risk),
+    **ABS** (ABS challenges stay fully tracked here, in the **ABS
+    Challenges** stat, and in the challenges-remaining counters),
+    **Challenges**, **Reviews**, **Boundary Calls**, **Under Review**,
+    **⚠️ Runs at Risk** —,
     summary stats for the whole day, and an optional **sound alert** — a gentle
     synthesized raindrop chime (three soft drops blooming into a warm two-note
     chime, ~1.2s, pure sine tones with a light echo) when a new challenge, review,

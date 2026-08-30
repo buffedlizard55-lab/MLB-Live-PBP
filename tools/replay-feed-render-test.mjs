@@ -21,7 +21,10 @@
  *
  * Asserts: captured team/review fields remain official — the string
  * "undefined" can never appear — and the marked deterministic Replay Feed row
- * renders all three score states without inventing Actual.
+ * renders all three score states without inventing Actual. Also pins the
+ * sectioning requirement: the All section renders challenges/reviews/
+ * boundary/under-review/run-at-risk rows but NOT the ABS pitch challenge,
+ * which stays fully tracked under its own ABS tab (and its stat/counters).
  *
  * Run: node tools/replay-feed-render-test.mjs
  * ==========================================================================*/
@@ -265,20 +268,34 @@ function collectStrings(node, out) {
   return out;
 }
 
-// 1. The feed rendered the captured ABS review plus the deterministic active
-// score-impact review.
+// 1. The default All section renders the deterministic active score-impact
+// review — and must NOT render the captured ABS pitch challenge. Per the
+// sectioning requirement, All shows challenges, reviews, boundary calls,
+// under-review status and run-at-risk entries; ABS challenges are tracked
+// separately (their own tab below, stat and counters).
 const feedList = registry['#feed-list'];
 const rows = feedList.children.filter((c) => c.cls.includes('feed-row'));
-assert.equal(rows.length, 2, `expected 2 feed rows, got ${rows.length}`);
+assert.equal(rows.length, 1, `expected 1 feed row in All (the manager review), got ${rows.length}`);
 const rowRecords = rows.map((row) => {
   const strings = [];
   collectStrings(row, strings);
   return { row, blob: strings.join(' | ') };
 });
-const absRecord = rowRecords.find((record) => record.blob.includes('ABS Challenge'));
 const impactRecord = rowRecords.find((record) => record.blob.includes('1 RUN AT RISK'));
-assert.ok(absRecord, 'captured ABS row rendered');
-assert.ok(impactRecord, 'active score-impact row rendered');
+assert.ok(impactRecord, 'active score-impact row rendered in All');
+assert.ok(!rowRecords.some((record) => record.blob.includes('ABS Challenge')),
+  'the All section must not contain ABS pitch challenges');
+
+// The ABS pitch challenge is still fully tracked: switch to its own
+// section and it renders there with all of its official fields.
+context.window.ReplayFeed.setFilter('abs');
+const absRows = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
+assert.equal(absRows.length, 1, `expected exactly 1 ABS row under the ABS tab, got ${absRows.length}`);
+const absStrings = [];
+collectStrings(absRows[0], absStrings);
+const absRecord = { row: absRows[0], blob: absStrings.join(' | ') };
+assert.ok(absRecord.blob.includes('ABS Challenge'), 'captured ABS row rendered under its own tab');
+context.window.ReplayFeed.setFilter('all');
 const rowBlob = absRecord.blob;
 
 // 2. Official team names are shown — never "undefined", never a guess.
@@ -378,6 +395,19 @@ const runRiskStat = findIn(registry['#feed-stats'], '.stat-run-risk');
 assert.ok(runRiskStat, 'Runs at Risk stat has its urgent class');
 assert.equal(findIn(runRiskStat, '.review-stat-value').text, '1');
 
+// The stats bar partitions the two sections: Events counts the All section
+// (no ABS), while ABS Challenges keeps its own count — ABS stays tracked.
+const statPairs = {};
+registry['#feed-stats'].children.forEach((item) => {
+  const label = findIn(item, '.review-stat-label');
+  const value = findIn(item, '.review-stat-value');
+  if (label && value) statPairs[label.text] = value.text;
+});
+assert.equal(statPairs['Events'], '1',
+  `Events stat counts the All section (non-ABS), got: ${JSON.stringify(statPairs)}`);
+assert.equal(statPairs['ABS Challenges'], '1',
+  `ABS Challenges stat keeps counting the tracked ABS event, got: ${JSON.stringify(statPairs)}`);
+
 // 4d-bis. EVERY run-at-risk surface must disclaim that the ruling is not
 // predicted — banner, row badge and stat alike. docs/verification-report.md
 // §11 makes exactly this claim, so it is pinned here rather than trusted.
@@ -409,6 +439,8 @@ assert.ok(tabStrings.some((s) => /^Boundary Calls \(0\)$/.test(s)),
 assert.ok(tabStrings.some((s) => s === "ReplayFeed.setFilter('boundary')"),
   'Boundary Calls tab wires ReplayFeed.setFilter(\'boundary\')');
 assert.ok(tabStrings.some((s) => /^ABS \(1\)$/.test(s)), 'captured ABS tab count');
+assert.ok(tabStrings.some((s) => /^All \(1\)$/.test(s)),
+  `All tab counts only what the section shows (no ABS), got: ${JSON.stringify(tabStrings)}`);
 assert.ok(tabStrings.some((s) => /^Challenges \(1\)$/.test(s)), 'active manager-review tab count');
 assert.ok(tabStrings.some((s) => /^● Under Review \(1\)$/.test(s)), 'active review tab count');
 assert.ok(tabStrings.some((s) => /^⚠️ Runs at Risk \(1\)$/.test(s)),
@@ -421,9 +453,20 @@ context.window.ReplayFeed.setFilter('runrisk');
 const riskRows = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
 assert.equal(riskRows.length, 1, 'the runrisk filter shows only the at-risk row');
 assert.match(collectStrings(riskRows[0], []).join(' | '), /1 RUN AT RISK/);
+// All restores every non-ABS row — here exactly the at-risk manager row —
+// and keeps ABS sectioned out.
 context.window.ReplayFeed.setFilter('all');
-assert.equal(registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row')).length, 2,
-  'switching back to All restores every row');
+const allRows = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
+assert.equal(allRows.length, 1, 'switching back to All restores every non-ABS row');
+assert.ok(!collectStrings(allRows[0], []).join(' | ').includes('ABS Challenge'),
+  'All must not render the ABS row even after switching filters');
+// The ABS tab is where the tracked ABS pitch challenge lives.
+context.window.ReplayFeed.setFilter('abs');
+const absOnlyRows = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
+assert.equal(absOnlyRows.length, 1, 'the ABS tab shows exactly the tracked ABS row');
+assert.ok(collectStrings(absOnlyRows[0], []).join(' | ').includes('ABS Challenge'),
+  'the ABS tab renders the ABS row with its content');
+context.window.ReplayFeed.setFilter('all');
 
 // 5. Whole-page sweep: stats bar, tabs, active strip, status line included.
 const everything = [];
