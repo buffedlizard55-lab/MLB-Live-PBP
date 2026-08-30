@@ -16,6 +16,11 @@
   const REVIEW_POLL_MS = 250;
   const PREVIEW_POLL_MS = 60000;
   const FINAL_POLL_MS = 180000;
+  // Review probe fetch: fail fast. The probe runs at the 250ms cadence while
+  // a review is in flight, so a retry inside the SAME probe only delays the
+  // next tick; the next probe retries anyway (probe failure → retry in 1s).
+  const PROBE_TIMEOUT_MS = 3000;
+  const PROBE_RETRIES = 0;
 
   let gamePk = null;
   let feed = null;
@@ -112,7 +117,9 @@
         // falls through to the full feed, so no review update can be missed.
         let probe = null;
         try {
-          probe = await MLB.getPlayByPlay(gamePk);
+          probe = await MLB.getPlayByPlay(gamePk, {
+            timeout: PROBE_TIMEOUT_MS, retries: PROBE_RETRIES,
+          });
         } catch (probeErr) {
           // Network trouble: don't chain a (likely-failing) full feed after
           // it; retry the probe on the next fast tick instead.
@@ -451,13 +458,18 @@
       return;
     }
 
-    // Prominent live review notification in the live module if active
+    // Prominent live review notification in the live module if active.
+    // An official-scorer pending ruling is NOT a replay review, so it uses
+    // its own heading (the scorer is deciding hit/error/fielder's choice).
     if (activeReview) {
+      const isPendingScoring = activeReview.typeKey === 'pending_scoring';
       const revStrip = UI.el('div', 'live-active-review-card');
-      revStrip.appendChild(UI.el('div', 'live-review-pulse', '🚨'));
+      revStrip.appendChild(UI.el('div', 'live-review-pulse', isPendingScoring ? '⚖️' : '🚨'));
       const textWrap = UI.el('div', 'live-review-body');
       textWrap.appendChild(UI.el('div', 'live-review-head',
-        `PLAY UNDER REVIEW — ${activeReview.reviewType.toUpperCase()}${activeReview.teamAbbrev ? ` (${activeReview.teamAbbrev})` : ''}`));
+        isPendingScoring
+          ? `OFFICIAL SCORER RULING PENDING${activeReview.battingTeamAbbrev ? ` (${activeReview.battingTeamAbbrev} batting)` : ''}`
+          : `PLAY UNDER REVIEW — ${activeReview.reviewType.toUpperCase()}${activeReview.teamAbbrev ? ` (${activeReview.teamAbbrev})` : ''}`));
       textWrap.appendChild(UI.el('div', 'live-review-reason', activeReview.reason));
       textWrap.appendChild(UI.el('div', 'live-review-desc', activeReview.description));
       const scoreImpact = window.MLBReviews && window.MLBReviews.renderScoreImpact

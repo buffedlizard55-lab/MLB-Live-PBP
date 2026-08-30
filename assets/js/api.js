@@ -189,18 +189,79 @@ const MLB = (() => {
    * Play-by-play only for one game (allPlays + currentPlay + scoringPlays).
    * Much leaner than feed/live (no boxscore/players), and carries the same
    * review data: play-level reviewDetails, event-level details.hasReview and
-   * currentPlay. Used by the all-games Replay Feed to scan many games quickly.
-   * Falls back to feed/live if the split endpoint is unavailable.
+   * currentPlay. Used by the all-games Replay Feed to scan many games quickly
+   * (every poll, ~15 games in parallel) and by game.js's review probe — so
+   * PAYLOAD SIZE IS THE LATENCY. A `fields` projection is therefore the
+   * default; it was verified live against statsapi.mlb.com on 2026-08-30:
+   *   - game 823342 (full): 76 API chunks unprojected vs 26 projected (≈3x
+   *     smaller), and the projected response still carries the captured ABS
+   *     review at atBatIndex 15 verbatim:
+   *       playEvents[].reviewDetails = { isOverturned:false, inProgress:false,
+   *                                      reviewType:"MJ", challengeTeamId:116 }
+   *     plus details.hasReview, details.eventType/event/description, count,
+   *     matchup.batter/pitcher{id,fullName}, runners[].movement/details and
+   *     about/result exactly as the unprojected call returns them.
+   *   - game 822688 (live): the same projection returns every field the
+   *     feed's extractReviews() reads.
+   *
+   * The field list below is NOT guessed. The REQUIRED names are properties
+   * the projected payload is actually read by, line by line (cites in
+   * tools/api-fields-test.mjs):
+   *   reviews.js extractReviews / processPlay / buildAbsContext /
+   *   deriveScoreImpact / reviewedScoringRunners / findReviewedPitch /
+   *   scoreBeforePlay / buildPendingScoringEntry  (assets/js/reviews.js)
+   *   game.js reviewProbeState                       (assets/js/game.js)
+   * A few extra leaf names (isTopInning, rbi, isOut, batSide, pitchHand,
+   * call, start, end) are explicitly listed as a belt-and-braces GUARD: the
+   * statsapi `fields` parameter is a whitelist applied at any depth, and a
+   * named container (about/result/matchup/details/count/reviewDetails/
+   * runners/movement) returns its full child objects — so an extra leaf
+   * costs bytes only if the API ever prunes a container's children.
+   * tools/api-fields-test.mjs pins every whitelisted name to REQUIRED
+   * (read) or GUARD (deliberate) — nothing unaccounted.
    */
+  const PBP_FIELDS = [
+    'allPlays', 'currentPlay',
+    // about (play / currentPlay)
+    'about', 'atBatIndex', 'inning', 'halfInning', 'isTopInning',
+    'startTime', 'endTime', 'isComplete', 'hasReview',
+    // result
+    'result', 'type', 'event', 'eventType', 'description',
+    'rbi', 'awayScore', 'homeScore', 'isOut',
+    // matchup
+    'matchup', 'batter', 'pitcher', 'id', 'fullName', 'batSide', 'pitchHand',
+    // playEvents + pitch data
+    'playEvents', 'index', 'isPitch', 'pitchData', 'startSpeed',
+    // event details
+    'details', 'call',
+    // counts
+    'count', 'balls', 'strikes', 'outs',
+    // review markers (manager ABS / under-review / official-scorer pending
+    // detection reads eventType/event/description on details AND result)
+    'reviewDetails', 'inProgress', 'isOverturned', 'reviewType', 'challengeTeamId',
+    // scoring runners (run-at-risk model)
+    'runners', 'movement', 'start', 'end', 'outBase',
+    'runner', 'isScoringEvent', 'playIndex',
+  ];
+
   async function getPlayByPlay(gamePk, options = {}) {
+    const opts = { timeout: 5000, ...options };
     try {
-      // Lean endpoint (no boxscore/rosters); a 5s abort cap lets a stalled
-      // probe fail fast so the next 250ms review poll can start immediately.
-      return await getJSON(`${V1}/game/${gamePk}/playByPlay`, { timeout: 5000, ...options });
-    } catch (err) {
-      if (!isLegacyFeedMiss(err)) throw err;
-      const feed = await getLiveFeed(gamePk, options);
-      return (feed.liveData && feed.liveData.plays) || {};
+      return await getJSON(
+        `${V1}/game/${gamePk}/playByPlay?fields=${PBP_FIELDS.join(',')}`, opts);
+    } catch (errProjected) {
+      if (!isLegacyFeedMiss(errProjected)) throw errProjected;
+      // A 4xx on the projection can mean this game/version rejected a field
+      // name. Fall back to the SAME lean endpoint WITHOUT `fields` (one extra
+      // round-trip, rare) before the heavier feed/live fallback — never mask
+      // a real review because of a projection quirk.
+      try {
+        return await getJSON(`${V1}/game/${gamePk}/playByPlay`, opts);
+      } catch (errUnprojected) {
+        if (!isLegacyFeedMiss(errUnprojected)) throw errUnprojected;
+        const feed = await getLiveFeed(gamePk, opts);
+        return (feed.liveData && feed.liveData.plays) || {};
+      }
     }
   }
 

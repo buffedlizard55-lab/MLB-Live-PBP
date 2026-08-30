@@ -253,3 +253,241 @@ sources on 2026-08-29 (live fetches of `statsapi.mlb.com` via the API's own
 
 - `tools/reviews-feed-test.mjs` §10b — pins `visibleInAllFeed()`: `'abs'` → hidden; `manager`/`crew_chief`/`boundary`/`review`/`rules` → visible (including while under review); `null`/`{}`/non-string typeKey → fail open.
 - `tools/replay-feed-render-test.mjs` §1/§4c/§4d/§4e — pins, against the verbatim 823342 captures: All renders the manager row and never the ABS row; the ABS tab renders exactly the ABS row with its full content; `All (1)` + `ABS (1)` tab counts; `Events` = 1 and `ABS Challenges` = 1 stats; switching between run-risk / All / ABS filters restores each section correctly.
+
+## 14. Official-scorer pending rulings on the Replay Feed (added 2026-08-30)
+
+Requirement (user, verbatim): track **official scoring pending** plays in the
+all-games Replay Feed — a play where the official scorer cannot immediately
+rule hit vs. error vs. fielder's choice. It must **appear immediately** in the
+Replay Feed "all games" section, **trigger the existing sound alert
+immediately**, need **no manual input**, work **automatically**, and **flag
+irregularities**. No field names were guessed: every string below was
+line-by-line verified against official StatsAPI responses fetched live from
+`statsapi.mlb.com` on 2026-08-30.
+
+### The signal (verified. this is the ONLY source)
+
+`GET /api/v1/eventTypes` (two chunks, both read) returns the registry that the
+StatsAPI uses for `playEvents[].details.eventType` / `result.eventType`. Two
+entries, verbatim:
+
+```json
+{"plateAppearance":false,"hit":false,"code":"os_ruling_pending_prior","baseRunningEvent":true,"description":"Official Scorer Ruling Pending"}
+{"plateAppearance":true,"hit":false,"code":"os_ruling_pending_primary","baseRunningEvent":false,"description":"Official Scorer Ruling Pending"}
+```
+
+These are the **only** two codes whose description is "Official Scorer Ruling
+Pending". `primary` = the plate-appearance event (the hit/error/FC itself) is
+undecided; `prior` = a prior base-running event of the same play is undecided
+(`baseRunningEvent:true`). Nothing else in the registry matches.
+
+No third-party source, GitHub project, or blog post was used. There is no
+documented branch of the `feed/live` schema for this marker and no official
+live payload containing it was reachable from this sandbox (see the flagged
+item below), so the code checks **every** field the registry vocabulary can
+land on — `playEvents[].details.{eventType,event,description}`,
+`playEvents[].{eventType,event,type}` (defensive, code-only), and
+`play.result.{eventType,event,description}` — with exact equality against the
+two codes or the exact description. No substring matching, no paraphrases.
+
+### Line-by-line verification table (reviews.js — the parser)
+
+| Line / symbol | What it does | Source |
+| --- | --- | --- |
+| `OFFICIAL_SCORER_PENDING_TYPES` | Exact set `{os_ruling_pending_primary, os_ruling_pending_prior}` | `GET /api/v1/eventTypes` (fetched 2026-08-30, both chunks read) |
+| `OFFICIAL_SCORER_PENDING_TEXT` | Exact description `"Official Scorer Ruling Pending"` | Same |
+| `isOfficialScoringPendingEvent()` | Exact-equality test on the 8 possible landing fields above | Registry field names, per the play-shape confirmed from live `playByPlay` responses of games 822688 / 823539 (08-30 / 08-29) |
+| `findOfficialScoringPendingPlay()` | Scans a play's `playEvents[]` then `result`; returns `{pendingEvents,pendingCodes,primary,prior,atResult}` | Same |
+| `buildPendingScoringEntry()` | Builds the feed entry: atBatIndex from `about.atBatIndex` (play-shape field, confirmed live); batting side from `about.halfInning` (`top`→away, `bottom`→home); `teamId` **null** (a scoring ruling is not a team challenge); `scoreImpact: null`; `officialScoringPending: true`; entry id `osp-<atBatIndex>` | `about.halfInning` / `about.isTopInning` / `about.atBatIndex` confirmed in live playByPlay responses |
+| `extractReviews()` | Scans `allPlays` then `currentPlay`, dedupes by `<atBatIndex>:<battingSide>` | Live shape: a play in progress appears in both `allPlays` and `currentPlay` (confirmed via 822688) |
+| `runsRemovableByReview()` | Returns **0** for `pending_scoring` | A scoring ruling decides how the play is *charged* — it never removes a run from the scoreboard (MLB Official Scoring Rules; official scorer decides hits/errors) |
+| `buildSummary()` | Pending rulings are counted separately (`summary.pendingScoring`) and never as `stands`/`overturned` — a scoring ruling is not a replay call outcome, so it can't pollute the overturn rate | Same; pinned by `tools/official-scoring-test.mjs` §4 |
+| `renderReviewCard()` / `renderReviewsTab()` | `outcome:'resolved'` renders ✓ `Ruling Complete` (`.outcome-resolved`), a `Batting:` tag for the card, and a `Scoring Pending` stat in the per-game Reviews bar | Same |
+
+The batting team abbreviation/full name comes from `about.halfInning` plus the
+official per-game `teamIdBySide` and the `/teams` directory — never guessed,
+never fabricated. If the directory is absent, the row shows the full official
+team name from the schedule; if even that is missing, it quietly renders no
+team chip.
+
+### Line-by-line verification table (reviews-feed.js — feed integration)
+
+| Line / symbol | What it does | Requirement met |
+| --- | --- | --- |
+| `mergeFeedEvents()` | Pending rows are **retained** and flipped to `resolvedWhenMarkerCleared` when the marker disappears; re-appearance flips them back to in-progress | "no manual input" + track the ruling |
+| `completePendingScoringReview()` | `inProgress:false`, `outcome:'resolved'`, label `Ruling Complete` — the row is never deleted | Track forever, never guess final hit/error |
+| `shouldAlertForReview()` | `pending_scoring` qualifies (only `abs` excluded) | "trigger the existing sound alert immediately" |
+| `visibleInAllFeed()` | `pending_scoring` is not `abs`, so it shows in All | "appear immediately in the Replay Feed all games section" |
+| `renderActiveStrip()` | Dedicated `⚖️ SCORING PENDING` strip with game link, ruling type, batting team; pending rulings are EXCLUDED from the generic `🚨 LIVE REVIEW` strip (a scoring decision is never labeled a replay review) | Live visibility + no mislabeling |
+| `renderStats()` | `Scoring Pending` stat (active count; tooltip: tracked today + no-run-removal + source) — and the replay `Under Review` counter explicitly EXCLUDES pending rulings | Transparency |
+| `renderTabs()` / `matchesFilter()` | `⚖️ Scoring Pending (n)` tab + `setFilter('pending_scoring')`; `Under Review` tab keeps counting replay reviews only | Dedicated filter + no double counting |
+| `buildSummary()` / per-game reviews tab | `pendingScoring`/`pendingScoringActive` counts; pending never enters replay `inProgress`/`stands`/`overturned`/overturn rate | Same |
+| `feedRow()` | `.feed-batting` chip from `battingTeamAbbrev`/`battingTeamName` | Context, never a "challenging team" |
+| `outcomePill()` | `outcome:'resolved'` → `✓ Ruling Complete` (`.outcome-resolved`) | Resolution state, observed not invented |
+| `runsRemovableFromReview()` | Returns **0** for `pending_scoring` | A pending scoring ruling never puts a run "at risk" (no false run-risk alert) |
+
+### Flagged for review (deliberate decisions / limitations)
+
+1. **The marker was NOT captured on a live pending play from this sandbox.**
+   The sandbox can reach `statsapi.mlb.com` via the API fetcher but not via
+   shell `curl`/node fetch, and no live game on 2026-08-29/30 produced an
+   `os_ruling_pending_*` event during probing (822688 MIA@WSH live —
+   currentPlay, allPlays; 823539 BOS@NYY final — allPlays). The detection code
+   therefore checks all 8 possible landing fields, and the deterministic tests
+   (below) pin extraction from a play-shaped fixture that mirrors the live
+   shape field-for-field with the exact registry values. **Flagged**: the exact
+   landing field remains unverified live — the first real pending play should
+   be re-checked against this report.
+2. **Ruling content is never shown.** When the marker clears, the feed marks
+   the observed row "Ruling Complete" and deliberately does NOT read the new
+   payload's hit/error text into the old row (the play now appears under its
+   own normal event row anyway). No final ruling is guessed.
+3. **`isOfficialScoringPendingEvent()` accepts the exact description string in
+   addition to the two codes**, because the API's registry exposes the
+   description as the human-readable value and a play event's `details.event`
+   may carry it. Exact equality only — a value like "official scorer ruling"
+   (substring) is rejected. This is deliberately strict, not loose.
+4. **StatsAPI v1 `feed/live` returns 404**; only v1.1 works. The feed uses
+   `playByPlay` (v1), which was verified live for 822688/823539 and carries
+   `allPlays` + `currentPlay` with the fields the parser reads. The parser does
+   not depend on `feed/live`.
+5. **`Under Review` counts replay reviews only.** An active pending ruling is
+   in-progress, but it is excluded from the `Under Review` tab/counter and the
+   generic `🚨 LIVE REVIEW` strip, because a scoring decision is not a replay
+   under review; it has its own `⚖️ Scoring Pending` surfaces (tab, stat,
+   strip, game-page panel heading). The poll cadence still treats it as
+   in-progress (`hasActiveReviewSignal`), so the ruling's resolution is picked
+   up at the fast cadence.
+
+### New/updated regression coverage
+
+- `tools/official-scoring-test.mjs` (new) — deterministic: registry constants,
+  exactness (substring/near-miss rejection), extraction from a live-shaped
+  play fixture, dedupe, merge/resolution/retention across three polls, alert
+  qualification, All-feed visibility, run-risk = 0, summary separation
+  (`pendingScoring`, never `stands`/`overturned`), game-page integration
+  surface.
+- `tools/replay-feed-render-test.mjs` — fixture extended with a deterministic
+  pending row (marker fields verbatim from the registry): All renders manager
+  review + pending row (`All (2)`), NOT the ABS row; `⚖️ Scoring Pending (1)`
+  tab + `setFilter` wiring; `Scoring Pending` stat = 1; `Events` = 2; pending
+  row never flagged run-at-risk, has `Batting: DET` chip and `Ruling Pending`
+  pill; the OS strip + exclusion from the generic LIVE REVIEW strip; the
+  Under Review tab counts only replay reviews (`(1)`); status line reports
+  3 tracked events on the
+  250 ms in-review cadence (`REVIEW_POLL_MS`, verified in reviews-feed.js).
+- Existing suites re-run clean: `review-test.mjs`, `reviews-feed-test.mjs`,
+  `replay-feed-render-test.mjs`, `official-scoring-test.mjs`, `hit-model-test.mjs`,
+  `review-probe-test.mjs`. (`smoke-test.mjs` remains network-only; it cannot
+  run in this sandbox, unchanged from §13.)
+
+## 15. Update latency on the Replay Feed (added 2026-08-30)
+
+Goal: challenges, reviews, boundary calls, under-review, runs at risk and
+official-scorer-pending updates reach the all-games Replay Feed as fast as
+possible — structurally (fewer round-trips, smaller payload, no serialized
+wait), with every change line-by-line verified and no field names guessed.
+
+### What changed
+
+| File / location | Change | Effect |
+|---|---|---|
+| `assets/js/api.js` PBP_FIELDS (≈L195-241) + getPlayByPlay (≈L243) | playByPlay now defaults to a `fields=` projection; on a 4xx the SAME endpoint is retried WITHOUT `fields`, then feed/live as last resort | one request carries every parser field; payload ≈3× smaller (verified: 26 vs 76 API chunks for game 823342); a projection quirk can never mask a review |
+| `assets/js/reviews-feed.js` L745-750 | `SCHEDULE_TTL_MS = 3000`, `PBP_TIMEOUT_MS = 3000`, `PBP_RETRIES = 0` | schedule reused for 3s; per-game playByPlay fails fast, next poll retries |
+| `assets/js/reviews-feed.js` scheduleFor (L1181-1216), load() (L1233+) | schedule refresh kicked off IN PARALLEL with the scan of already-known games (previously serialized in front of EVERY poll) | the schedule RTT is no longer on the critical path; a fresh cache resolves instantly |
+| `assets/js/reviews-feed.js` maybeAlertNow (L1398-1432) + ingestGame | chime fires from ingestGame the moment the FIRST game response reports a new/at-risk event (render already painted), instead of after the slowest game | sound is no longer delayed by unrelated games; `pollAlertFired` keeps at most one chime per poll |
+| `assets/js/reviews-feed.js` load() end | run-risk desktop notifications deferred to end-of-poll, accumulated per key | one notification per poll; a poll where two games go at-risk at once still names BOTH |
+| `assets/js/game.js` L22-23, L121 | review probe passes `PROBE_TIMEOUT_MS=3000, PROBE_RETRIES=0` | the 250 ms in-review probe stops chaining a retry + backoff inside one probe; the projected payload it already uses is 3× smaller |
+| unchanged | `REVIEW_POLL_MS=250`, `LIVE_POLL_MS=500`, `IDLE_POLL_MS=5000`, `FETCH_CONCURRENCY=30`, reviewFetchPriority, at-most-one chime per poll | cadence/policy unchanged — the speed-up is from removing serialized waits and shrinking payloads |
+
+### Line-by-line verification (no guesses)
+
+- **Field list** — `PBP_FIELDS` is split into REQUIRED (every name the
+  projected payload is read by, cited to `reviews.js`/`game.js` line numbers
+  in `tools/api-fields-test.mjs`) and GUARD (extra leaves `isTopInning`,
+  `rbi`, `isOut`, `batSide`, `pitchHand`, `call`, `start`, `end` kept
+  deliberately: `fields` is a whitelist applied at any depth, so a named
+  container could theoretically be pruned of children). The test fails on
+  any whitelisted name that is neither REQUIRED nor GUARD.
+- **scheduleFor** — cache hit (`scheduleDate` + TTL) returns the current
+  `games` array; a refresh in flight is shared, never duplicated; a failure
+  resolves `null` (NOT cached — `lastScheduleAt` only updates on success) so
+  the next poll retries; the playByPlay scan of known games proceeds
+  regardless.
+- **scanGames / ingestGame** — `ingestGame` returns `true` on success
+  (including a settled Final no-op) and `false` on fetch failure, so
+  `knownSuccess`/`freshSuccess` count real successes (verified by the
+  backoff branch test).
+- **maybeAlertNow** — called per ingested game AFTER `renderFeedUpdates`
+  (sound never precedes paint); `pollAlertFired` guarantees ≤1 chime per
+  poll; run-risk entries accumulate into `pendingRunRiskNotify` (deduped by
+  event key) for the single end-of-poll desktop notification.
+- **resetFeed** — clears the schedule cache + slate on date change so the
+  parallel flow can never scan the previous date's games.
+
+### Live verification performed 2026-08-30 (official StatsAPI)
+
+- `statsapi.mlb.com/api/v1/game/823342/playByPlay?fields=<PBP_FIELDS>`:
+  **26 chunks** (vs **76 chunks** unprojected, ≈2.9× smaller). Chunk 5,
+  atBatIndex 15, playEvents[4] carries `reviewDetails` VERBATIM:
+  `{isOverturned:false, inProgress:false, reviewType:"MJ", challengeTeamId:116}`,
+  plus `details.hasReview:true`, `pitchData.startSpeed:98.1`, count 2-2;
+  `result/about/count/matchup/runners` all intact. This is the exact
+  ABS-ball/manager challenge the parser must surface.
+- `statsapi.mlb.com/api/v1/game/823342/playByPlay` (no fields): 76 chunks —
+  the extra bulk is pitch coordinates/breaks etc., explaining the saving.
+- `statsapi.mlb.com/api/v1/game/822688/playByPlay?fields=<projection>`
+  (live, 2026-08-30): all container/leaf fields the feed reads present; no
+  pending-ruling event observed at that moment (not a negative proof — see
+  §14 limitations; the parser checks both `playEvents[].details` and
+  `play.result`).
+
+### New regression coverage
+
+- `tools/api-fields-test.mjs` (new) — deterministic, no network: pins the
+  exact projected URL; REQUIRED ⊆ projection; no unaccounted whitelisted
+  name (anti-hallucination check); projected 400 → unprojected → feed/live
+  fallback chain (`retries:0`); `getSchedule`/`getChallengeCounts` shapes
+  unchanged; timeout abort signal wired.
+- `tools/replay-feed-render-test.mjs` — new latency-path section: poll 1 =
+  one schedule + one playByPlay scan; poll 2 within the 3s TTL refetches NO
+  schedule (count stays 1) but still scans playByPlay (count 2); no duplicate
+  rows (`All (2)`) and the status line still reports exactly `3 review
+  events` — the loop is idempotent.
+
+### Test results (all passed)
+
+`api-fields-test.mjs`, `official-scoring-test.mjs`, `review-test.mjs`,
+`reviews-feed-test.mjs`, `replay-feed-render-test.mjs`, `hit-model-test.mjs`,
+`review-probe-test.mjs`. (`smoke-test.mjs` is network-only; it cannot run in
+this sandbox, unchanged.)
+
+### Flagged for review (deliberate decisions / limitations)
+
+1. **Chime priority when two different games report in one poll window** —
+   arrival order now wins the single chime (previously run-risk always beat
+   the generic chime because the decision was made once after all games
+   resolved). Every event still renders; the run-risk desktop notification
+   covers ALL at-risk games of the poll (accumulated). Sound remains ≤1 per
+   poll. This is the trade-off for an immediate chime.
+2. **Run-risk desktop notification is end-of-poll** (the chime is immediate)
+   so one notification can name simultaneous at-risk games; worst-case
+   deferral is one scan wave (~one RTT), same as before.
+3. **Schedule TTL 3 s** — a game that goes Live is revealed ≤3 s + one poll
+   interval later; always fresh on first poll and on date change. Deliberate:
+   the schedule's only moving parts (status/counters) are also carried by
+   per-game playByPlay, which is polled every cycle.
+4. **PBP timeout 3 s / 0 retries** — a genuinely stalled game can hold its
+   own slot up to 3 s; other games still fetch concurrently (30-way); next
+   poll retries. Worst-case update latency on a pathological network ≈
+   timeout + next poll interval + one scan — bounded and strictly better
+   than the previous default (5 s timeout + retry ≈ 10.5 s stall).
+5. **Projection fallback costs one extra round-trip** in the rare 4xx case
+   (a game that rejects a field name), and feed/live is the heavier last
+   resort — chosen so a review can never be masked by the projection.
+6. **No wall-clock latency measurement in this sandbox** — the tools have no
+   outbound network and `smoke-test.mjs` is CI-only. The improvements are
+   structural (serialized schedule RTT removed, per-game immediate chime,
+   3× smaller payload, fail-fast fetches) and chunk-verified; absolute
+   browser timings should be confirmed via DevTools Network against a live
+   slate.
