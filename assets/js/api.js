@@ -195,7 +195,7 @@ const MLB = (() => {
   async function getPlayByPlay(gamePk, options = {}) {
     try {
       // Lean endpoint (no boxscore/rosters); a 5s abort cap lets a stalled
-      // probe fail fast so the next 500ms review poll can start immediately.
+      // probe fail fast so the next 250ms review poll can start immediately.
       return await getJSON(`${V1}/game/${gamePk}/playByPlay`, { timeout: 5000, ...options });
     } catch (err) {
       if (!isLegacyFeedMiss(err)) throw err;

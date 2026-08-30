@@ -5,13 +5,13 @@
 
 (() => {
   // Live scoreboard: 1s. While any game's official status says challenge/
-  // review: 500ms so the review ticker is not waiting on the ordinary live
+  // review: 250ms so the review ticker is not waiting on the ordinary live
   // interval. Cadence is the gap between poll STARTS — scheduleNext()
   // subtracts the request we just finished, so a slow response does not
   // stretch the cycle.
-  const LIVE_POLL_MS = 1000;
-  const REVIEW_POLL_MS = 500;
-  const IDLE_POLL_MS = 15000;
+  const LIVE_POLL_MS = 500;
+  const REVIEW_POLL_MS = 250;
+  const IDLE_POLL_MS = 5000;
 
   let dateStr = todayStr();
   let games = [];
