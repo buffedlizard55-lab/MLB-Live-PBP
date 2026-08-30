@@ -682,20 +682,20 @@ function gameChallengeLine(counts, labels, prefix) {
   // Cadence is the gap between poll STARTS (scan duration is subtracted in
   // waitAfterScan). The StatsAPI is pull-only — a shorter poll only reduces
   // how long a landed review sits unseen. Hidden tabs still pause.
-  //   live games          : 1.5s
-  //   a review in flight  : 750ms (outcome flips are what the feed is for;
+  //   live games          : 500ms
+  //   a review in flight  : 250ms (outcome flips are what the feed is for;
   //                          in-review games are fetched first, so the flip
   //                          lands ~1 request after poll start)
-  //   no live games       : 10s
-  const LIVE_POLL_MS = 1500;
-  const REVIEW_POLL_MS = 750;
-  const IDLE_POLL_MS = 10000;
-  // playByPlay is one request per live / unsettled-final game. 15 at a time
+  //   no live games       : 5s
+  const LIVE_POLL_MS = 500;
+  const REVIEW_POLL_MS = 250;
+  const IDLE_POLL_MS = 5000;
+  // playByPlay is one request per live / unsettled-final game. 30 at a time
   // (the slate is ~15-17 games) keeps a full scan to ONE wave: a single
   // request round-trip instead of two, so every poll — and the review
   // outcome in particular — lands sooner. Same host (HTTP/2), same
   // CORS-open endpoint.
-  const FETCH_CONCURRENCY = 15;
+  const FETCH_CONCURRENCY = 30;
 
   let dateStr = todayStr();
   let games = [];

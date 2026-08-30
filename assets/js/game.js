@@ -8,12 +8,12 @@
 
 (() => {
   // Cadence is the gap between poll STARTS (scan duration is subtracted).
-  // Live play-by-play: 1s. While a review is in flight: 500ms — the game is
-  // frozen during a review, so each 500ms tick probes the lean playByPlay
+  // Live play-by-play: 500ms. While a review is in flight: 250ms — the game is
+  // frozen during a review, so each 250ms tick probes the lean playByPlay
   // endpoint (not the full feed) and only pulls the full feed once when the
   // review state actually flips. Preview/final back off.
-  const LIVE_POLL_MS = 1000;
-  const REVIEW_POLL_MS = 500;
+  const LIVE_POLL_MS = 500;
+  const REVIEW_POLL_MS = 250;
   const PREVIEW_POLL_MS = 60000;
   const FINAL_POLL_MS = 180000;
 
@@ -63,7 +63,7 @@
    * While a review is in flight the game is frozen — no pitch, count or score
    * can move — so the ONLY fields that can still change on the server are the
    * review flags. Comparing this signature lets load() probe the lean
-   * playByPlay endpoint (no boxscore/rosters) at the 500ms cadence and fetch
+   * playByPlay endpoint (no boxscore/rosters) at the 250ms cadence and fetch
    * the full feed exactly once: the moment the review state flips.
    *
    * Safety: the probe carries NO gameData.status, so a review that is visible
@@ -106,7 +106,7 @@
       if (lastActiveReview) {
         // Fast path: probe the lean playByPlay endpoint while a review is
         // in flight. Skip the 1-2MB full feed download — and tick again in
-        // 500ms — ONLY when the probe still sees the review in progress and
+        // 250ms — ONLY when the probe still sees the review in progress and
         // nothing review-related changed. Every other case (resolved,
         // overturned, confirmed, status-only review, or a probe failure)
         // falls through to the full feed, so no review update can be missed.
