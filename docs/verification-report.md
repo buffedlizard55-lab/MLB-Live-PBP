@@ -380,3 +380,114 @@ team chip.
   `replay-feed-render-test.mjs`, `official-scoring-test.mjs`, `hit-model-test.mjs`,
   `review-probe-test.mjs`. (`smoke-test.mjs` remains network-only; it cannot
   run in this sandbox, unchanged from §13.)
+
+## 15. Update latency on the Replay Feed (added 2026-08-30)
+
+Goal: challenges, reviews, boundary calls, under-review, runs at risk and
+official-scorer-pending updates reach the all-games Replay Feed as fast as
+possible — structurally (fewer round-trips, smaller payload, no serialized
+wait), with every change line-by-line verified and no field names guessed.
+
+### What changed
+
+| File / location | Change | Effect |
+|---|---|---|
+| `assets/js/api.js` PBP_FIELDS (≈L195-241) + getPlayByPlay (≈L243) | playByPlay now defaults to a `fields=` projection; on a 4xx the SAME endpoint is retried WITHOUT `fields`, then feed/live as last resort | one request carries every parser field; payload ≈3× smaller (verified: 26 vs 76 API chunks for game 823342); a projection quirk can never mask a review |
+| `assets/js/reviews-feed.js` L745-750 | `SCHEDULE_TTL_MS = 3000`, `PBP_TIMEOUT_MS = 3000`, `PBP_RETRIES = 0` | schedule reused for 3s; per-game playByPlay fails fast, next poll retries |
+| `assets/js/reviews-feed.js` scheduleFor (L1181-1216), load() (L1233+) | schedule refresh kicked off IN PARALLEL with the scan of already-known games (previously serialized in front of EVERY poll) | the schedule RTT is no longer on the critical path; a fresh cache resolves instantly |
+| `assets/js/reviews-feed.js` maybeAlertNow (L1398-1432) + ingestGame | chime fires from ingestGame the moment the FIRST game response reports a new/at-risk event (render already painted), instead of after the slowest game | sound is no longer delayed by unrelated games; `pollAlertFired` keeps at most one chime per poll |
+| `assets/js/reviews-feed.js` load() end | run-risk desktop notifications deferred to end-of-poll, accumulated per key | one notification per poll; a poll where two games go at-risk at once still names BOTH |
+| `assets/js/game.js` L22-23, L121 | review probe passes `PROBE_TIMEOUT_MS=3000, PROBE_RETRIES=0` | the 250 ms in-review probe stops chaining a retry + backoff inside one probe; the projected payload it already uses is 3× smaller |
+| unchanged | `REVIEW_POLL_MS=250`, `LIVE_POLL_MS=500`, `IDLE_POLL_MS=5000`, `FETCH_CONCURRENCY=30`, reviewFetchPriority, at-most-one chime per poll | cadence/policy unchanged — the speed-up is from removing serialized waits and shrinking payloads |
+
+### Line-by-line verification (no guesses)
+
+- **Field list** — `PBP_FIELDS` is split into REQUIRED (every name the
+  projected payload is read by, cited to `reviews.js`/`game.js` line numbers
+  in `tools/api-fields-test.mjs`) and GUARD (extra leaves `isTopInning`,
+  `rbi`, `isOut`, `batSide`, `pitchHand`, `call`, `start`, `end` kept
+  deliberately: `fields` is a whitelist applied at any depth, so a named
+  container could theoretically be pruned of children). The test fails on
+  any whitelisted name that is neither REQUIRED nor GUARD.
+- **scheduleFor** — cache hit (`scheduleDate` + TTL) returns the current
+  `games` array; a refresh in flight is shared, never duplicated; a failure
+  resolves `null` (NOT cached — `lastScheduleAt` only updates on success) so
+  the next poll retries; the playByPlay scan of known games proceeds
+  regardless.
+- **scanGames / ingestGame** — `ingestGame` returns `true` on success
+  (including a settled Final no-op) and `false` on fetch failure, so
+  `knownSuccess`/`freshSuccess` count real successes (verified by the
+  backoff branch test).
+- **maybeAlertNow** — called per ingested game AFTER `renderFeedUpdates`
+  (sound never precedes paint); `pollAlertFired` guarantees ≤1 chime per
+  poll; run-risk entries accumulate into `pendingRunRiskNotify` (deduped by
+  event key) for the single end-of-poll desktop notification.
+- **resetFeed** — clears the schedule cache + slate on date change so the
+  parallel flow can never scan the previous date's games.
+
+### Live verification performed 2026-08-30 (official StatsAPI)
+
+- `statsapi.mlb.com/api/v1/game/823342/playByPlay?fields=<PBP_FIELDS>`:
+  **26 chunks** (vs **76 chunks** unprojected, ≈2.9× smaller). Chunk 5,
+  atBatIndex 15, playEvents[4] carries `reviewDetails` VERBATIM:
+  `{isOverturned:false, inProgress:false, reviewType:"MJ", challengeTeamId:116}`,
+  plus `details.hasReview:true`, `pitchData.startSpeed:98.1`, count 2-2;
+  `result/about/count/matchup/runners` all intact. This is the exact
+  ABS-ball/manager challenge the parser must surface.
+- `statsapi.mlb.com/api/v1/game/823342/playByPlay` (no fields): 76 chunks —
+  the extra bulk is pitch coordinates/breaks etc., explaining the saving.
+- `statsapi.mlb.com/api/v1/game/822688/playByPlay?fields=<projection>`
+  (live, 2026-08-30): all container/leaf fields the feed reads present; no
+  pending-ruling event observed at that moment (not a negative proof — see
+  §14 limitations; the parser checks both `playEvents[].details` and
+  `play.result`).
+
+### New regression coverage
+
+- `tools/api-fields-test.mjs` (new) — deterministic, no network: pins the
+  exact projected URL; REQUIRED ⊆ projection; no unaccounted whitelisted
+  name (anti-hallucination check); projected 400 → unprojected → feed/live
+  fallback chain (`retries:0`); `getSchedule`/`getChallengeCounts` shapes
+  unchanged; timeout abort signal wired.
+- `tools/replay-feed-render-test.mjs` — new latency-path section: poll 1 =
+  one schedule + one playByPlay scan; poll 2 within the 3s TTL refetches NO
+  schedule (count stays 1) but still scans playByPlay (count 2); no duplicate
+  rows (`All (2)`) and the status line still reports exactly `3 review
+  events` — the loop is idempotent.
+
+### Test results (all passed)
+
+`api-fields-test.mjs`, `official-scoring-test.mjs`, `review-test.mjs`,
+`reviews-feed-test.mjs`, `replay-feed-render-test.mjs`, `hit-model-test.mjs`,
+`review-probe-test.mjs`. (`smoke-test.mjs` is network-only; it cannot run in
+this sandbox, unchanged.)
+
+### Flagged for review (deliberate decisions / limitations)
+
+1. **Chime priority when two different games report in one poll window** —
+   arrival order now wins the single chime (previously run-risk always beat
+   the generic chime because the decision was made once after all games
+   resolved). Every event still renders; the run-risk desktop notification
+   covers ALL at-risk games of the poll (accumulated). Sound remains ≤1 per
+   poll. This is the trade-off for an immediate chime.
+2. **Run-risk desktop notification is end-of-poll** (the chime is immediate)
+   so one notification can name simultaneous at-risk games; worst-case
+   deferral is one scan wave (~one RTT), same as before.
+3. **Schedule TTL 3 s** — a game that goes Live is revealed ≤3 s + one poll
+   interval later; always fresh on first poll and on date change. Deliberate:
+   the schedule's only moving parts (status/counters) are also carried by
+   per-game playByPlay, which is polled every cycle.
+4. **PBP timeout 3 s / 0 retries** — a genuinely stalled game can hold its
+   own slot up to 3 s; other games still fetch concurrently (30-way); next
+   poll retries. Worst-case update latency on a pathological network ≈
+   timeout + next poll interval + one scan — bounded and strictly better
+   than the previous default (5 s timeout + retry ≈ 10.5 s stall).
+5. **Projection fallback costs one extra round-trip** in the rare 4xx case
+   (a game that rejects a field name), and feed/live is the heavier last
+   resort — chosen so a review can never be masked by the projection.
+6. **No wall-clock latency measurement in this sandbox** — the tools have no
+   outbound network and `smoke-test.mjs` is CI-only. The improvements are
+   structural (serialized schedule RTT removed, per-game immediate chime,
+   3× smaller payload, fail-fast fetches) and chunk-verified; absolute
+   browser timings should be confirmed via DevTools Network against a live
+   slate.

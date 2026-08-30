@@ -238,11 +238,12 @@ const CHALLENGE_COUNTS = {
   },
 };
 
+const callCounts = { schedule: 0, teams: 0, pbp: 0, counts: 0 };
 const MLBStub = {
-  getSchedule: async () => SCHEDULE_GAMES,
-  getTeams: async () => TEAMS_DIR,
-  getPlayByPlay: async () => PBP,
-  getChallengeCounts: async () => CHALLENGE_COUNTS,
+  getSchedule: async () => { callCounts.schedule += 1; return SCHEDULE_GAMES; },
+  getTeams: async () => { callCounts.teams += 1; return TEAMS_DIR; },
+  getPlayByPlay: async () => { callCounts.pbp += 1; return PBP; },
+  getChallengeCounts: async () => { callCounts.counts += 1; return CHALLENGE_COUNTS; },
   // Mirrors MLB.ordinal in assets/js/api.js exactly.
   ordinal: (n) => {
     const ORD = ['th', 'st', 'nd', 'rd', 'th', 'th', 'th', 'th', 'th', 'th'];
@@ -593,5 +594,31 @@ predicateCases.forEach(([label, review]) => {
 const positives = predicateCases.filter(([, r]) => MLBReviewsInVm.runsRemovableByReview(r) > 0);
 assert.ok(positives.length >= 5, `predicate table covers the at-risk branch (${positives.length} cases)`);
 assert.ok(predicateCases.length - positives.length >= 10, 'predicate table covers the not-at-risk branch');
+
+/* 8. LATENCY PATH (low-poll-count verification of the load() restructure).
+ * The schedule is cached for SCHEDULE_TTL_MS (assets/js/reviews-feed.js) and
+ * refreshed in PARALLEL with the playByPlay scan, so a poll must NEVER issue
+ * a second schedule request back-to-back, and the scan must run every poll.
+ * First poll: exactly 1 schedule + 1 teams + 1 playByPlay (fixture = 1 game).
+ * Second poll: schedule + teams served from cache (counts stay 1); the scan
+ * still fetches playByPlay again (count 2). */
+const afterBoot = { ...callCounts };
+assert.equal(afterBoot.schedule, 1, 'first poll fetches the schedule once');
+assert.equal(afterBoot.pbp, 1, 'first poll scans the one candidate game once');
+context.window.ReplayFeed.refresh();
+await new Promise((r) => setImmediate(r));
+await new Promise((r) => setImmediate(r));
+await new Promise((r) => setImmediate(r));
+assert.equal(callCounts.schedule, 1,
+  `a second poll within the schedule TTL must NOT refetch the schedule (${callCounts.schedule})`);
+// (teams is still CALLED each poll by the feed, but api.js serves it from its
+// own cached promise — no network; the stub has no such cache, so no count
+// assertion is made here.)
+assert.equal(callCounts.pbp, 2, 'the playByPlay scan still runs on every poll');
+// The second poll is idempotent: no duplicate feed rows, no re-alert.
+const rowsAfterReboot = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
+assert.equal(rowsAfterReboot.length, 2, 'second poll keeps exactly the two All rows');
+assert.match(registry['#status-line'].textContent, /1 game · 3 review events · /,
+  'second poll does not double-count events (still 3 tracked)');
 
 console.log('Replay-feed render test passed successfully!');

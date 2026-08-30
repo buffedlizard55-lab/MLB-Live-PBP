@@ -735,6 +735,19 @@ function gameChallengeLine(counts, labels, prefix) {
   const LIVE_POLL_MS = 500;
   const REVIEW_POLL_MS = 250;
   const IDLE_POLL_MS = 5000;
+  // The schedule is re-fetched at most once per SCHEDULE_TTL_MS (the slate
+  // for one date is static; only status/counters change). It is refreshed IN
+  // PARALLEL with the playByPlay scan instead of serialized in front of it:
+  // a schedule round-trip was previously added to EVERY poll before any
+  // playByPlay request started, which is pure latency for the events the feed
+  // exists to surface. A fresh cache resolves immediately, so a poll cycle is
+  // just the playByPlay wave.
+  const SCHEDULE_TTL_MS = 3000;
+  // Per-game playByPlay: fail fast, no retry. A stalled game must not hold the
+  // whole poll (requestInFlight) for 5s+; the NEXT poll (≤ interval later)
+  // retries, and a retry inside the same poll only delays that next poll.
+  const PBP_TIMEOUT_MS = 3000;
+  const PBP_RETRIES = 0;
   // playByPlay is one request per live / unsettled-final game. 30 at a time
   // (the slate is ~15-17 games) keeps a full scan to ONE wave: a single
   // request round-trip instead of two, so every poll — and the review
@@ -752,6 +765,15 @@ function gameChallengeLine(counts, labels, prefix) {
   let lastCycleStartedAt = 0;
   let requestInFlight = false;
   let settledGames = new Set();     // Final games: fetched once, immutable
+  // Schedule cache: the last games array used + when it was observed, and any
+  // refresh already in flight (deduped so two parallel polls never issue two
+  // schedule requests at once).
+  let scheduleDate = null;
+  let lastScheduleAt = 0;
+  let scheduleInFlight = null;
+  // One alert (chime + notification) per poll at most — but fired the moment
+  // the FIRST game response reports it, instead of after the slowest game.
+  let pollAlertFired = false;
   const feedState = { seen: new Map(), order: [] };
   // gamePk -> { counts: normalizeChallengeCounts(...), issues: [], updatedAt }
   // Official per-team challenge counters (manager `review` + `absChallenges`)
@@ -777,6 +799,10 @@ function gameChallengeLine(counts, labels, prefix) {
   // genuinely new review on the same play can alert again.
   const alertedRunRiskKeys = new Set();
   let pendingRunRiskAlerts = [];
+  // Run-risk desktop notifications defer to the END of the poll so a poll
+  // where two games go at-risk at the same instant produces ONE notification
+  // covering both (the chime itself fires immediately from maybeAlertNow).
+  let pendingRunRiskNotify = [];
   let notifyEnabled = false;
 
   try {
@@ -814,6 +840,14 @@ function gameChallengeLine(counts, labels, prefix) {
     pendingAlertableCount = 0;
     alertedRunRiskKeys.clear();
     pendingRunRiskAlerts = [];
+    pendingRunRiskNotify = [];
+    // Date changed: the schedule cache belongs to the old date and the
+    // parallel scan must start from an empty known-slate (the new poll awaits
+    // the new schedule first), never scan the previous date's games.
+    games = [];
+    scheduleDate = null;
+    lastScheduleAt = 0;
+    scheduleInFlight = null;
   }
 
   function $ (sel) { return document.querySelector(sel); }
@@ -1135,6 +1169,67 @@ function gameChallengeLine(counts, labels, prefix) {
 
   /* ------------------------------------------------------------- polling */
 
+  /** Candidate games for one poll: live or final (finals fetched once). */
+  function candidateGames(list) {
+    return (list || []).filter((g) => {
+      const state = g && g.status && g.status.abstractGameState;
+      return state === 'Live' || state === 'Final';
+    });
+  }
+
+  /**
+   * Fresh schedule for a date, cached for SCHEDULE_TTL_MS and deduped while a
+   * refresh is in flight. Resolves to the games array (the cached one when
+   * fresh). Never throws: on failure it resolves null and the caller keeps the
+   * last games — the playByPlay scan is unaffected by a schedule blip.
+   */
+  function scheduleFor(requestDate) {
+    const now = Date.now();
+    if (scheduleDate === requestDate && scheduleInFlight) return scheduleInFlight;
+    if (scheduleDate === requestDate && lastScheduleAt &&
+        now - lastScheduleAt < SCHEDULE_TTL_MS) {
+      return Promise.resolve(games);
+    }
+    scheduleDate = requestDate;
+    scheduleInFlight = MLB.getSchedule(requestDate)
+      .then((s) => {
+        // Only adopt the response for the date it was requested for.
+        if (scheduleDate === requestDate) {
+          games = s;
+          lastScheduleAt = Date.now();
+        }
+        return s;
+      })
+      .catch((err) => {
+        console.warn('schedule refresh failed — using last known games', err);
+        return null;
+      })
+      .finally(() => {
+        if (scheduleInFlight) scheduleInFlight = null;
+      });
+    return scheduleInFlight;
+  }
+
+  /**
+   * Fetch + ingest one batch of games with the existing priority ordering.
+   * Returns the number of games successfully ingested (a game that failed
+   * fetch returns false; a settled Final is a no-op success).
+   */
+  async function scanGames(list, requestDate) {
+    const candidates = candidateGames(list);
+    // Games already under review first, then other live games, then finals.
+    // That cuts the wait for an outcome flip on a 15-game slate.
+    candidates.sort((a, b) =>
+      reviewFetchPriority(a, gameHasInProgress(a.gamePk)) -
+      reviewFetchPriority(b, gameHasInProgress(b.gamePk)));
+    let success = 0;
+    await mapPool(candidates, FETCH_CONCURRENCY, async (g) => {
+      if (requestDate !== dateStr) return;
+      if (await ingestGame(g)) success += 1;
+    });
+    return success;
+  }
+
   async function load() {
     if (requestInFlight) return;
     const requestDate = dateStr;
@@ -1144,17 +1239,32 @@ function gameChallengeLine(counts, labels, prefix) {
     setLivePulse(true);
     pendingAlertableCount = 0;
     pendingRunRiskAlerts = [];
+    pendingRunRiskNotify = [];
+    pollAlertFired = false;
 
     try {
-      const scheduleGames = await MLB.getSchedule(requestDate);
+      // Poll flow (latency-ordered):
+      //   1. Kick off the schedule refresh IN PARALLEL with the playByPlay
+      //      scan of the games we already know. Previously the schedule
+      //      round-trip was awaited before ANY playByPlay request started,
+      //      adding a full RTT to every poll for data the scan does not need.
+      //   2. Scan any games the fresh schedule newly reveals (e.g. a game
+      //      that just went Live) — first poll, or slate changes.
+      const knownCandidates = candidateGames(games);
+      const knownPks = new Set(knownCandidates.map((g) => g.gamePk));
+      const scheduleReady = scheduleFor(requestDate);
+      const scanKnown = scanGames(knownCandidates, requestDate);
+
+      const scheduleGames = await scheduleReady;
       if (requestDate !== dateStr) return;
-      games = scheduleGames;
+      if (scheduleGames) games = scheduleGames;
 
       // Official team directory for the schedule's season: the schedule's own
       // team objects have NO abbreviation (verified live 2026-08-19), so
       // official abbreviations are resolved here — never fabricated. If this
       // request fails, official full names still render from the schedule and
-      // abbreviation chips simply stay hidden.
+      // abbreviation chips simply stay hidden. (Cached in api.js after the
+      // first poll, so this is a no-op wait on essentially every cycle.)
       const season = (games.find((g) => g && g.season) || {}).season
         || requestDate.slice(0, 4);
       try {
@@ -1165,50 +1275,53 @@ function gameChallengeLine(counts, labels, prefix) {
       }
       if (requestDate !== dateStr) return;
 
-      // Manager-challenge counters ride along on every schedule poll
+      // Manager-challenge counters ride along on the schedule refresh
       // (hydrate=review — shape verified live 2026-08-28: every game carries
-      // review.away/home.used/remaining). ABS counters are NOT in the
-      // schedule; ingestGame fetches them per game that has feed events.
-      games.forEach((g) => {
-        if (g && g.gamePk != null && g.review) updateGameCounts(g.gamePk, g.review, null, false);
-      });
+      // review.away/home.used/remaining). When the schedule is served from the
+      // 3s cache nothing changes here — the per-game feed/live side-fetch in
+      // ingestGame keeps counters fresh when an event actually moves them.
+      if (scheduleGames) {
+        games.forEach((g) => {
+          if (g && g.gamePk != null && g.review) updateGameCounts(g.gamePk, g.review, null, false);
+        });
+      }
 
-      const candidates = games.filter((g) => {
-        const state = g.status && g.status.abstractGameState;
-        return state === 'Live' || state === 'Final';
-      });
-
-      // Games already under review first, then other live games, then finals.
-      // That cuts the wait for an outcome flip on a 15-game slate.
-      candidates.sort((a, b) =>
-        reviewFetchPriority(a, gameHasInProgress(a.gamePk)) -
-        reviewFetchPriority(b, gameHasInProgress(b.gamePk)));
-
-      await mapPool(candidates, FETCH_CONCURRENCY, async (g) => {
-        if (requestDate !== dateStr) return;
-        await ingestGame(g);
-      });
+      let freshSuccess = 0;
+      if (scheduleGames) {
+        // Games not in the last-known slate (first poll, or a game that just
+        // went Live). Their FIRST scan necessarily waits for the schedule.
+        const freshCandidates = candidateGames(scheduleGames)
+          .filter((g) => !knownPks.has(g.gamePk));
+        freshSuccess = await scanGames(freshCandidates, requestDate);
+      }
       if (requestDate !== dateStr) return;
+      const knownSuccess = await scanKnown;
+
+      // Nothing at all came back (host unreachable): back off like the old
+      // single-fetch path instead of hammering a dead host every tick.
+      // A schedule blip ALONE is not fatal — the cached slate still scans, and
+      // the next poll refreshes the schedule.
+      if (scheduleGames === null && knownSuccess === 0 && freshSuccess === 0) {
+        statusLine.textContent = "Couldn't reach the MLB StatsAPI — retrying…";
+        scheduleNext(10000);
+        return;
+      }
 
       // Run-at-risk scan. Done once per poll across the WHOLE slate (not per
       // game) so a key that moved games/re-keyed is reconciled in one pass,
       // and so one poll produces at most one alert no matter how many games
-      // report at the same instant.
+      // report at the same instant. Per-game alerting (maybeAlertNow inside
+      // ingestGame) has usually already fired by now; this final pass both
+      // reconciles keys and catches a poll where the alert arrived after all
+      // games resolved (e.g. a run-risk key cleared and a new one started in
+      // the same cycle).
       syncRunRiskTracking();
-
-      // Alerting. A newly at-risk run takes priority: it is the one case that
-      // also raises a desktop notification, and it fires on the very first
-      // load too (only a still-ACTIVE review can put a run at risk, so there
-      // is no backlog of historical events to blast through). Both paths play
-      // the same raindrop chime, and the if/else guarantees at most one per
-      // poll so the chime is never triggered twice over itself.
-      if (pendingRunRiskAlerts.length) {
-        playRunRiskAlertSound();
-        notifyRunRisk(pendingRunRiskAlerts);
-      } else if (!isFirstLoad && pendingAlertableCount > 0) {
-        // This poll discovered new non-ABS events and it is not the very first
-        // load (initial page population).
-        playAlertSound();
+      maybeAlertNow();
+      // Desktop notifications: once per poll, covering EVERY run that went
+      // at-risk this cycle (the chime already fired immediately above).
+      if (pendingRunRiskNotify.length) {
+        notifyRunRisk(pendingRunRiskNotify);
+        pendingRunRiskNotify = [];
       }
       isFirstLoad = false;
 
@@ -1265,17 +1378,64 @@ function gameChallengeLine(counts, labels, prefix) {
     });
   }
 
+  /**
+   * Fire this poll's single CHIME immediately — called from ingestGame the
+   * moment a NEW event or a newly-run-at-risk review is observed, instead of
+   * waiting for every game in the slate to respond (the old flow). The
+   * game under review is fetched with the top priority and in the same
+   * parallel wave, so its response is typically the first change to land —
+   * but even when another game wins, waiting for the SLOWEST game added a
+   * variable extra 100s-of-ms to every alert. `pollAlertFired` keeps the
+   * existing "at most one chime per poll" guarantee, so the sound is never
+   * triggered twice over itself.
+   *
+   * A newly at-risk run always gets its desktop notification — but deferred
+   * to the end of the poll (see load()) so a poll where two games go at-risk
+   * in the same instant still raises ONE notification covering both. The
+   * chime fires here, immediately; only a still-ACTIVE review can put a run
+   * at risk, so there is no backlog of historical events to blast through.
+   */
+  function maybeAlertNow() {
+    syncRunRiskTracking();
+    if (pendingRunRiskAlerts.length) {
+      // Accumulate for the end-of-poll notification (dedup by event key).
+      const keys = new Set(pendingRunRiskNotify.map((e) => buildEventKey(e.gamePk, e.review)));
+      pendingRunRiskAlerts.forEach((e) => {
+        const key = buildEventKey(e.gamePk, e.review);
+        if (!keys.has(key)) {
+          keys.add(key);
+          pendingRunRiskNotify.push(e);
+        }
+      });
+      if (pollAlertFired) return;
+      pollAlertFired = true;
+      playRunRiskAlertSound();
+    } else if (!isFirstLoad && pendingAlertableCount > 0) {
+      // New non-ABS event after the initial page population.
+      if (pollAlertFired) return;
+      pollAlertFired = true;
+      playAlertSound();
+    }
+  }
+
+  /**
+   * Fetch + extract one game. Returns true on success (including a settled
+   * Final that was correctly skipped), false when the playByPlay fetch failed.
+   */
   async function ingestGame(game) {
     const gamePk = game.gamePk;
     const state = game.status && game.status.abstractGameState;
-    if (state === 'Final' && settledGames.has(gamePk)) return;
+    if (state === 'Final' && settledGames.has(gamePk)) return true;
 
     let pbp;
     try {
-      pbp = await MLB.getPlayByPlay(gamePk);
+      // Lean fields-projected playByPlay (see api.js PBP_FIELDS — verified
+      // 2026-08-30 to carry every field the parser reads, ~3x smaller than
+      // the raw response). Fail fast: retries are left to the next poll.
+      pbp = await MLB.getPlayByPlay(gamePk, { timeout: PBP_TIMEOUT_MS, retries: PBP_RETRIES });
     } catch (err) {
       // A game that just started may not have a playByPlay yet; skip quietly.
-      return;
+      return false;
     }
     if (state === 'Final') settledGames.add(gamePk);
 
@@ -1353,6 +1513,10 @@ function gameChallengeLine(counts, labels, prefix) {
     if (result.added.length || result.updated.length || result.ended.length) {
       renderFeedUpdates(result);
     }
+    // Alert now (chime + desktop notification) if this game's response
+    // carries the first new/at-risk event of the poll — render above already
+    // painted, sound must not wait for the slowest game in the slate.
+    maybeAlertNow();
     if (needsCounts && MLB.getChallengeCounts) {
       MLB.getChallengeCounts(gamePk)
         .then((countsFeed) => {
@@ -1364,6 +1528,7 @@ function gameChallengeLine(counts, labels, prefix) {
           console.warn(`challenge counters unavailable this poll (game ${gamePk})`, countErr);
         });
     }
+    return true;
   }
 
   /* -------------------------------------------------- run-at-risk tracking */
