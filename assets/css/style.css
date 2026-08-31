@@ -1501,6 +1501,15 @@ a:hover { text-decoration: underline; }
   color: #c5d4e8;
   line-height: 1.45;
 }
+.review-resolved-text {
+  margin: 8px 0 0 0;
+  font-size: 13px;
+  color: #a7f3d0;
+  line-height: 1.45;
+  font-style: italic;
+  border-left: 2px solid #16a34a;
+  padding-left: 8px;
+}
 .review-card-foot {
   display: flex;
   align-items: center;
@@ -1796,6 +1805,15 @@ a:hover { text-decoration: underline; }
   font-size: 13.5px;
   color: #c5d4e8;
   line-height: 1.45;
+}
+.feed-resolved {
+  margin: 6px 0 0 0;
+  font-size: 13px;
+  color: #a7f3d0;
+  line-height: 1.45;
+  font-style: italic;
+  border-left: 2px solid #16a34a;
+  padding-left: 8px;
 }
 .feed-abs-meta {
   display: flex;
