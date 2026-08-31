@@ -175,6 +175,32 @@ const pendingPrimaryPlay = {
     },
   ],
 };
+
+// The same play after the marker clears, with the resolved result.
+// This simulates what the API returns once the scorer has ruled.
+const resolvedPrimaryPlay = {
+  result: {
+    type: 'atBat',
+    event: 'Field Error',
+    eventType: 'field_error',
+    description: 'Anthony Seigler reaches on a fielding error by third baseman.',
+    rbi: 0, awayScore: 0, homeScore: 0, isOut: false,
+  },
+  about: {
+    atBatIndex: 10, halfInning: 'top', isTopInning: true, inning: 3,
+    startTime: '2026-08-30T16:40:12.000Z', endTime: '2026-08-30T16:42:00.000Z', isComplete: true,
+  },
+  matchup: {
+    batter: { id: 678011, fullName: 'Anthony Seigler', link: '/api/v1/people/678011' },
+    pitcher: { id: 674841, fullName: 'Andrew Alvarez', link: '/api/v1/people/674841' },
+    batSide: { code: 'R', description: 'Right' },
+    pitchHand: { code: 'L', description: 'Left' },
+  },
+  playEvents: [
+    { details: { description: 'In play, no out', type: { description: 'Sinker' } }, index: 0, isPitch: true, type: 'pitch' },
+    { details: { description: 'Fielding error by third baseman', type: { description: 'Field Error' } }, index: 1, isPitch: false, type: 'action' },
+  ],
+};
 const foundPrimary = MLBReviews.findOfficialScoringPendingPlay(pendingPrimaryPlay);
 assert.ok(foundPrimary, 'pending marker is detected');
 assert.equal(foundPrimary.primary, true);
@@ -278,6 +304,17 @@ const none = MLBReviews.extractReviews({
 });
 assert.equal((none.reviews || []).filter((r) => r.typeKey === 'pending_scoring').length, 0);
 
+// Extract with resolved play (no pending marker) → playsByAtBatIndex should
+// contain the play keyed by atBatIndex 10.
+const resolvedFeed = MLBReviews.extractReviews({
+  ...pseudoFeed,
+  liveData: { plays: { allPlays: [resolvedPrimaryPlay], currentPlay: null }, linescore: null },
+});
+assert.ok(resolvedFeed.playsByAtBatIndex, 'playsByAtBatIndex is returned');
+assert.ok(resolvedFeed.playsByAtBatIndex instanceof Map, 'playsByAtBatIndex is a Map');
+assert.equal(resolvedFeed.playsByAtBatIndex.get('10'), resolvedPrimaryPlay,
+  'resolved play is indexed by atBatIndex');
+
 /* -------------------- 5. Feed semantics: alert, visibility, no run risk */
 
 assert.equal(shouldAlertForReview(pend), true,
@@ -320,6 +357,23 @@ assert.equal(poll3.added.length + poll3.updated.length + poll3.ended.length, 0,
 const poll4 = mergeFeedEvents(state, 822688, [pend]);
 assert.equal(poll4.updated.length, 1);
 assert.equal(state.seen.get('822688:osp-10').review.inProgress, true);
+
+// Test with playsByAtBatIndex: when a pending marker clears, the resolved
+// play's description should be captured.
+const state2 = { seen: new Map(), order: [] };
+const poll5 = mergeFeedEvents(state2, 822688, [pend], new Map([['10', resolvedPrimaryPlay]]));
+assert.equal(poll5.added.length, 1, 'pending ruling is added on first observation');
+// Now simulate the marker clearing: no pending entry in reviews, but playsByAtBatIndex has the resolved play.
+const poll6 = mergeFeedEvents(state2, 822688, [], new Map([['10', resolvedPrimaryPlay]]));
+assert.equal(poll6.updated.length, 1, 'pending ruling is marked resolved');
+const resolved2 = state2.seen.get('822688:osp-10').review;
+assert.equal(resolved2.inProgress, false);
+assert.equal(resolved2.outcome, 'resolved');
+assert.equal(resolved2.outcomeLabel, 'Ruling Complete');
+assert.equal(resolved2.resolvedWhenMarkerCleared, true);
+assert.equal(resolved2.resolvedDescription,
+  'Anthony Seigler reaches on a fielding error by third baseman.',
+  'resolved description is captured from the resolved play');
 
 /* ----------------------- 7. completePendingScoringReview (pure helper) */
 

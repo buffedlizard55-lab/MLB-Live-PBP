@@ -190,28 +190,48 @@ function reviewChanged(previousReview, nextReview) {
     previousReview.outcomeLabel !== nextReview.outcomeLabel ||
     previousReview.reason !== nextReview.reason ||
     previousReview.description !== nextReview.description ||
+    previousReview.resolvedDescription !== nextReview.resolvedDescription ||
     JSON.stringify(previousReview.scoreImpact || null) !== JSON.stringify(nextReview.scoreImpact || null);
 }
 
-/**
- * Transition an official-scorer-pending entry to its observed RESOLUTION.
- * Called when the pending marker disappears from the payload: the scorer has
- * ruled, so the play now carries its final hit/error in the game feed. We
- * keep the observed pending row (never delete a tracked event) and mark it
- * resolved. The final ruling itself is NOT read from the new payload here,
- * so no hit/error text is guessed — the row keeps what was observed while
- * pending plus this resolution state.
- */
-function completePendingScoringReview(review) {
-  if (!review) return review;
-  return {
-    ...review,
-    inProgress: false,
-    outcome: 'resolved',
-    outcomeLabel: 'Ruling Complete',
-    resolvedWhenMarkerCleared: true,
-  };
-}
+  /**
+   * Transition an official-scorer-pending entry to its observed RESOLUTION.
+   * Called when the pending marker disappears from the payload: the scorer has
+   * ruled, so the play now carries its final hit/error in the game feed. We
+   * keep the observed pending row (never delete a tracked event) and mark it
+   * resolved. The final ruling IS read from the resolved play's result
+   * description (the official text describing hit/error/fielder's choice) so
+   * both the pending state and the actual ruling are shown. The resolved
+   * description comes from play.result.description of the same at-bat,
+   * captured when the marker clears.
+   *
+   * @param {Object} review - the pending review entry
+   * @param {Object} resolvedPlay - the play object from the current payload
+   *                                that now has the final result (no pending marker)
+   */
+  function completePendingScoringReview(review, resolvedPlay) {
+    if (!review) return review;
+    // Capture the resolved play's official description if available.
+    // This is the actual ruling text (e.g., "reaches on a fielder's choice")
+    // from the official StatsAPI payload, never guessed or fabricated.
+    const resolvedDesc = resolvedPlay && resolvedPlay.result
+      ? (resolvedPlay.result.description || resolvedPlay.result.event || null)
+      : null;
+    // Preserve any existing resolvedDescription if we already captured it
+    // (e.g., from a previous poll), so we don't lose the ruling text.
+    const existingResolvedDesc = review.resolvedDescription || null;
+    return {
+      ...review,
+      inProgress: false,
+      outcome: 'resolved',
+      outcomeLabel: 'Ruling Complete',
+      resolvedWhenMarkerCleared: true,
+      // Store the official resolved description for display.
+      // The original pending description remains in `description`; this new
+      // field carries what the scorer actually ruled.
+      resolvedDescription: existingResolvedDesc || resolvedDesc,
+    };
+  }
 
 /**
  * Merge a game's freshly extracted reviews into feed state.
@@ -222,7 +242,7 @@ function completePendingScoringReview(review) {
  *  - ended   : keys that existed before but are gone now (e.g. a synthesized
  *              "live-active-review" that cleared once the review finished)
  */
-function mergeFeedEvents(state, gamePk, reviews) {
+function mergeFeedEvents(state, gamePk, reviews, playsByAtBatIndex) {
   const seen = state.seen;
   const order = state.order;
   const now = Date.now();
@@ -292,7 +312,11 @@ function mergeFeedEvents(state, gamePk, reviews) {
     const pendingReview = prev && prev.review;
     if (pendingReview && pendingReview.officialScoringPending === true) {
       if (!pendingReview.resolvedWhenMarkerCleared) {
-        prev.review = completePendingScoringReview(pendingReview);
+        // Look up the resolved play by atBatIndex to capture the actual ruling.
+        const resolvedPlay = playsByAtBatIndex && pendingReview.atBatIndex != null
+          ? playsByAtBatIndex.get(String(pendingReview.atBatIndex))
+          : null;
+        prev.review = completePendingScoringReview(pendingReview, resolvedPlay);
         prev.lastSeen = now;
         updated.push(prev);
       }
@@ -1468,7 +1492,7 @@ function gameChallengeLine(counts, labels, prefix) {
     const reviewData = window.MLBReviews
       ? window.MLBReviews.extractReviews(pseudoFeed)
       : { reviews: [], activeReview: null };
-    const result = mergeFeedEvents(feedState, gamePk, reviewData.reviews);
+    const result = mergeFeedEvents(feedState, gamePk, reviewData.reviews, reviewData.playsByAtBatIndex);
 
     // Official challenges-remaining counters. The schedule already supplied
     // the manager `review` half; the ABS half only lives in feed/live's
@@ -1950,6 +1974,14 @@ function gameChallengeLine(counts, labels, prefix) {
 
     const desc = el('div', 'feed-desc', r.description);
     body.appendChild(desc);
+
+    // Official-scorer pending rulings: show both the pending description and
+    // the resolved ruling (hit/error/fielder's choice) when available.
+    if (r.typeKey === 'pending_scoring' && r.resolvedDescription) {
+      const resolved = el('div', 'feed-resolved', `Resolved as: ${r.resolvedDescription}`);
+      resolved.title = 'Official scorer ruling: the play was charged as shown above.';
+      body.appendChild(resolved);
+    }
 
     if (window.MLBReviews && window.MLBReviews.absContextLines) {
       const absLines = window.MLBReviews.absContextLines(r);

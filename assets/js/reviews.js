@@ -1157,7 +1157,21 @@ const MLBReviews = (() => {
     const activeReview = reviews.find((r) => r.inProgress) || null;
     const summary = buildSummary(reviews);
 
-    return { reviews, activeReview, summary, pendingScoring: [...pendingByKey.values()] };
+    // Build a map of all plays keyed by atBatIndex for resolving pending
+    // rulings. When a pending marker clears, the caller can use this to look
+    // up the resolved play and capture its final description.
+    const playsByAtBatIndex = new Map();
+    [currentPlay, ...allPlays].forEach((play) => {
+      if (play && play.about && play.about.atBatIndex != null) {
+        const key = String(play.about.atBatIndex);
+        // Store the first play we see for each atBatIndex (dedupe).
+        if (!playsByAtBatIndex.has(key)) {
+          playsByAtBatIndex.set(key, play);
+        }
+      }
+    });
+
+    return { reviews, activeReview, summary, pendingScoring: [...pendingByKey.values()], playsByAtBatIndex };
   }
 
   function emptySummary() {
@@ -1320,6 +1334,10 @@ const MLBReviews = (() => {
     const absMeta = renderAbsContext(review);
     if (absMeta) body.appendChild(absMeta);
     body.appendChild(UI.el('p', 'review-desc-text', review.description));
+    // Official-scorer pending rulings: show the resolved ruling when available.
+    if (review.typeKey === 'pending_scoring' && review.resolvedDescription) {
+      body.appendChild(UI.el('p', 'review-resolved-text', `Resolved as: ${review.resolvedDescription}`));
+    }
     card.appendChild(body);
 
     // Footer: Batter / Pitcher context (only when a name actually exists —
