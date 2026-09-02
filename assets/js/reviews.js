@@ -37,6 +37,193 @@ const MLBReviews = (() => {
    * to a generic "Replay Review" label — we never invent labels for codes we
    * have not observed.
    */
+
+  /* ====================================================================
+   * OFFICIAL GAME-STATUS REGISTRY — GET https://statsapi.mlb.com/api/v1/gameStatus
+   * ---------------------------------------------------------------------
+   * Verified live 2026-09-02 (all 4 pages of the registry read; this is the
+   * API's own list of every value `status` can take, not a guess). The
+   * review/challenge subset — every entry with abstractGameState "Live":
+   *
+   *   codedGameState "I" : IH  "Instant Replay"                 reason "Review"
+   *   codedGameState "M" : manager challenges + the player/ABS
+   *                        pitch challenge MJ ("Player challenge:
+   *                        Pitch Result")                      (23 codes)
+   *   codedGameState "N" : umpire reviews + the umpire/ABS pitch
+   *                        challenge NJ ("Umpire Challenge:
+   *                        Pitch Result")                      (23 codes)
+   *
+   * 47 codes in total — 1 + 23 + 23 — which tools/review-status-test.mjs §1
+   * pins, and tools/smoke-test.mjs re-diffs against the live registry.
+   *
+   * `detailedState` and `reason` below are the registry's own strings,
+   * verbatim. Nothing is inferred from the code letter.
+   *
+   * CROSS-CHECK against this repo's own live captures — the registry's
+   * `statusCode` is the SAME two-letter vocabulary the feed puts in
+   * `reviewDetails.reviewType`, and every code this project already observed
+   * matches the registry's meaning exactly:
+   *   MA "Tag play"           — game 823341 "Tigers challenged (tag play)"
+   *   MF "Close play at 1st"  — game 824075 "Royals challenged (play at 1st)"
+   *   MJ "Pitch Result" = ABS — games 823342 / 823667 / 824075 ABS challenges
+   *   NH "Home run"           — game 824801 foul/potential-HR boundary review
+   *
+   * WHY THIS IS THE LATENCY FIX:
+   *   `status.detailedState` / `status.statusCode` flip the instant a review
+   *   is CALLED. The play text this parser also reads ("Tigers challenged
+   *   (tag play), call on the field was overturned: …") is written when the
+   *   review RESOLVES. So the status is the earliest official signal that a
+   *   review exists, and it carries the official reason before any play text
+   *   exists. It is also cheap: one `fields`-projected schedule request
+   *   returns gamePk + status for the whole slate (see MLB.getReviewStatus).
+   *
+   *   The old detection was `/challenge|review/i.test(detailedState)`. That
+   *   misses the crew-chief state verbatim: "Instant Replay" contains
+   *   neither word, so `IH` reviews were never seen as active. Detection is
+   *   now by registry code / codedGameState, with the old text test kept
+   *   only as a fallback for payloads that carry detailedState alone.
+   * ==================================================================== */
+  const REVIEW_STATUS_BY_CODE = {
+    /* ---- codedGameState "I" — generic instant-replay review ---- */
+    IH: { codedGameState: 'I', detailedState: 'Instant Replay', reason: 'Review' },
+
+    /* ---- codedGameState "M" — manager challenges (MJ is the player/ABS
+     *      pitch challenge, whose detailedState reads "Player challenge") ---- */
+    MF: { codedGameState: 'M', detailedState: 'Manager challenge: Close play at 1st', reason: 'Close play at 1st' },
+    MA: { codedGameState: 'M', detailedState: 'Manager challenge: Tag play', reason: 'Tag play' },
+    MU: { codedGameState: 'M', detailedState: 'Manager challenge: Tag-up play', reason: 'Tag-up play' },
+    MM: { codedGameState: 'M', detailedState: 'Manager challenge: Timing play', reason: 'Timing play' },
+    MC: { codedGameState: 'M', detailedState: 'Manager challenge: Force play', reason: 'Force play' },
+    MP: { codedGameState: 'M', detailedState: 'Manager challenge: Home-plate collision', reason: 'Home-plate collision' },
+    ME: { codedGameState: 'M', detailedState: 'Manager challenge: Slide interference', reason: 'Slide interference' },
+    MH: { codedGameState: 'M', detailedState: 'Manager challenge: Home run', reason: 'Home run' },
+    MO: { codedGameState: 'M', detailedState: 'Manager challenge: Fair/foul in outfield', reason: 'Fair/foul in outfield' },
+    MD: { codedGameState: 'M', detailedState: 'Manager challenge: Catch/drop in outfield', reason: 'Catch/drop in outfield' },
+    MT: { codedGameState: 'M', detailedState: 'Manager challenge: Trap play in outfield', reason: 'Trap play in outfield' },
+    MI: { codedGameState: 'M', detailedState: 'Manager challenge: Hit by pitch', reason: 'Hit by pitch' },
+    MB: { codedGameState: 'M', detailedState: 'Manager challenge: Touching a base', reason: 'Touching a base' },
+    MR: { codedGameState: 'M', detailedState: 'Manager challenge: Passing runners', reason: 'Passing runners' },
+    MN: { codedGameState: 'M', detailedState: 'Manager challenge: Fan interference', reason: 'Fan interference' },
+    MS: { codedGameState: 'M', detailedState: 'Manager challenge: Stadium boundary call', reason: 'Stadium boundary call' },
+    MG: { codedGameState: 'M', detailedState: 'Manager challenge: Grounds rule', reason: 'Grounds rule' },
+    MQ: { codedGameState: 'M', detailedState: 'Manager challenge: Rules check', reason: 'Rules check' },
+    MK: { codedGameState: 'M', detailedState: 'Manager challenge: Record keeping', reason: 'Record keeping' },
+    ML: { codedGameState: 'M', detailedState: 'Manager challenge: Multiple issues', reason: 'Multiple issues' },
+    MX: { codedGameState: 'M', detailedState: 'Manager challenge', reason: null },
+    MV: { codedGameState: 'M', detailedState: 'Manager challenge: Catchers Interference', reason: 'Catchers Interference' },
+    MJ: { codedGameState: 'M', detailedState: 'Player challenge: Pitch Result', reason: 'Pitch Result' },
+
+    /* ---- codedGameState "N" — umpire reviews (NJ is the umpire/ABS pitch
+     *      challenge) ---- */
+    NF: { codedGameState: 'N', detailedState: 'Umpire review: Close play at 1st', reason: 'Close play at 1st' },
+    NA: { codedGameState: 'N', detailedState: 'Umpire review: Tag play', reason: 'Tag play' },
+    NW: { codedGameState: 'N', detailedState: 'Umpire review: Def Shift Violation', reason: 'Def Shift Violation' },
+    NU: { codedGameState: 'N', detailedState: 'Umpire review: Tag-up play', reason: 'Tag-up play' },
+    NM: { codedGameState: 'N', detailedState: 'Umpire review: Timing play', reason: 'Timing play' },
+    NC: { codedGameState: 'N', detailedState: 'Umpire review: Force play', reason: 'Force play' },
+    NP: { codedGameState: 'N', detailedState: 'Umpire review: Home-plate collision', reason: 'Home-plate collision' },
+    NE: { codedGameState: 'N', detailedState: 'Umpire review: Slide interference', reason: 'Slide interference' },
+    NH: { codedGameState: 'N', detailedState: 'Umpire review: Home run', reason: 'Home run' },
+    NO: { codedGameState: 'N', detailedState: 'Umpire review: Fair/foul in outfield', reason: 'Fair/foul in outfield' },
+    ND: { codedGameState: 'N', detailedState: 'Umpire review: Catch/drop in outfield', reason: 'Catch/drop in outfield' },
+    NT: { codedGameState: 'N', detailedState: 'Umpire review: Trap play in outfield', reason: 'Trap play in outfield' },
+    NI: { codedGameState: 'N', detailedState: 'Umpire review: Hit by pitch', reason: 'Hit by pitch' },
+    NB: { codedGameState: 'N', detailedState: 'Umpire review: Touching a base', reason: 'Touching a base' },
+    NR: { codedGameState: 'N', detailedState: 'Umpire review: Passing runners', reason: 'Passing runners' },
+    NN: { codedGameState: 'N', detailedState: 'Umpire review: Fan interference', reason: 'Fan interference' },
+    NS: { codedGameState: 'N', detailedState: 'Umpire review: Stadium boundary call', reason: 'Stadium boundary call' },
+    NG: { codedGameState: 'N', detailedState: 'Umpire review: Grounds rule', reason: 'Grounds rule' },
+    NQ: { codedGameState: 'N', detailedState: 'Umpire review: Rules check', reason: 'Rules check' },
+    NK: { codedGameState: 'N', detailedState: 'Umpire review: Record keeping', reason: 'Record keeping' },
+    NL: { codedGameState: 'N', detailedState: 'Umpire review: Multiple issues', reason: 'Multiple issues' },
+    NX: { codedGameState: 'N', detailedState: 'Umpire review', reason: null },
+    NJ: { codedGameState: 'N', detailedState: 'Umpire Challenge: Pitch Result', reason: 'Pitch Result' },
+  };
+
+  /**
+   * The review category a registry `statusCode` belongs to. Same buckets the
+   * feed parser already uses, so a row built from the status and a row built
+   * later from `reviewDetails.reviewType` never disagree:
+   *   MJ / NJ → ABS pitch challenge (the registry calls these "Player
+   *             challenge" / "Umpire Challenge", reason "Pitch Result")
+   *   NH      → boundary call (registry "Umpire review: Home run" — the
+   *             potential-home-run / fair-foul-at-the-wall review this repo
+   *             already verified live in game 824801)
+   *   IH      → generic instant-replay review
+   *   other M → manager challenge
+   *   other N → umpire review (the same bucket the description-text path
+   *             below already assigns to "umpire review" / "crew chief")
+   */
+  function reviewTypeForStatusCode(code) {
+    const raw = String(code || '').trim().toUpperCase();
+    if (raw === 'MJ' || raw === 'NJ') return { key: 'abs', label: 'ABS Challenge' };
+    if (raw === 'NH') return { key: 'boundary', label: 'Boundary Call' };
+    if (raw === 'IH') return { key: 'review', label: 'Instant Replay' };
+    if (raw.charAt(0) === 'M') return { key: 'manager', label: 'Manager Challenge' };
+    if (raw.charAt(0) === 'N') return { key: 'crew_chief', label: 'Umpire Review' };
+    return null;
+  }
+
+  /**
+   * Text fallback for a status that carries only `detailedState`. The old
+   * `/challenge|review/i` test plus "instant replay", which is the verbatim
+   * registry wording for the crew-chief state (statusCode IH) that the old
+   * test silently missed.
+   */
+  function isReviewStatusText(text) {
+    return /challenge|review|instant replay/i.test(String(text == null ? '' : text));
+  }
+
+  /**
+   * Is this an official game `status` object for a game that is under review
+   * RIGHT NOW? Registry-first (statusCode, then codedGameState M/N), text
+   * only as a last resort. Pure; never throws.
+   *
+   * Every "Live" review state in the registry is covered, and no non-review
+   * state is: `tools/review-status-test.mjs` walks the whole registry table
+   * and asserts both directions.
+   */
+  function isReviewGameStatus(status) {
+    if (!status || typeof status !== 'object') return false;
+    const code = String(status.statusCode || '').trim().toUpperCase();
+    if (Object.prototype.hasOwnProperty.call(REVIEW_STATUS_BY_CODE, code)) return true;
+    // codedGameState "M" and "N" are used ONLY by the registry's challenge /
+    // umpire-review states — "I" is plain "In Progress" and must NOT match.
+    const coded = String(status.codedGameState || '').trim().toUpperCase();
+    if (coded === 'M' || coded === 'N') return true;
+    return isReviewStatusText(status.detailedState);
+  }
+
+  /**
+   * Everything the official status tells us about a live review, or null.
+   * `reason` is the registry's own `reason` string; when the registry entry
+   * has none (MX / NX are bare) the payload's own `status.reason` is used,
+   * and if that is absent too the reason stays null rather than being
+   * invented.
+   */
+  function reviewStatusInfo(status) {
+    if (!isReviewGameStatus(status)) return null;
+    const code = String(status.statusCode || '').trim().toUpperCase();
+    const entry = Object.prototype.hasOwnProperty.call(REVIEW_STATUS_BY_CODE, code)
+      ? REVIEW_STATUS_BY_CODE[code] : null;
+    const coded = String(status.codedGameState || '').trim().toUpperCase();
+    const detailed = typeof status.detailedState === 'string' && status.detailedState.trim()
+      ? status.detailedState : (entry ? entry.detailedState : null);
+    const payloadReason = typeof status.reason === 'string' && status.reason.trim()
+      ? status.reason.trim() : null;
+    const type = reviewTypeForStatusCode(code) ||
+      reviewTypeForStatusCode(`${coded}X`) ||
+      normalizeType(detailed, detailed);
+    return {
+      statusCode: code || null,
+      codedGameState: coded || null,
+      detailedState: detailed,
+      reason: (entry && entry.reason) || payloadReason || null,
+      typeKey: type ? type.key : 'review',
+      typeLabel: type ? type.label : (detailed || 'Replay Review'),
+    };
+  }
+
   function normalizeType(rawType, text) {
     const combined = `${rawType || ''} ${text || ''}`.toLowerCase();
     const raw = String(rawType || '').trim();
@@ -49,12 +236,16 @@ const MLBReviews = (() => {
       return { key: 'abs', label: 'ABS Challenge' };
     }
 
-    // 2. Short code from reviewDetails.reviewType (observed values above).
+    // 2. Short code from reviewDetails.reviewType. The game-status registry
+    //    above is the authority: `status.statusCode` and
+    //    `reviewDetails.reviewType` are the same two-letter vocabulary (see
+    //    the registry's cross-check against games 823341/824075/823342/
+    //    824801). NJ — the umpire pitch challenge — previously fell through
+    //    to the generic "Replay Review" label here.
     if (/^[A-Za-z]{1,4}$/.test(raw)) {
       const code = raw.toUpperCase();
-      if (code === 'MJ') return { key: 'abs', label: 'ABS Challenge' };
-      if (code === 'NH') return { key: 'boundary', label: 'Boundary Call' };
-      if (code.startsWith('M')) return { key: 'manager', label: 'Manager Challenge' };
+      const registry = reviewTypeForStatusCode(code);
+      if (registry) return { key: registry.key, label: registry.label };
       // Unverified codes: label honestly as a generic replay review.
       return { key: 'review', label: 'Replay Review' };
     }
@@ -905,8 +1096,13 @@ const MLBReviews = (() => {
     const playsData = liveData.plays || {};
     const allPlays = playsData.allPlays || [];
     const currentPlay = playsData.currentPlay || null;
-    const status = (gameData.status && gameData.status.detailedState) || '';
-    const isGameInReviewStatus = /challenge|review/i.test(status);
+    const gameStatus = gameData.status || {};
+    const status = (gameStatus.detailedState) || '';
+    // Official registry lookup, not a word match: "Instant Replay" (statusCode
+    // IH, the crew-chief state) contains neither "challenge" nor "review" and
+    // was therefore invisible to the old `/challenge|review/i` test.
+    const statusInfo = reviewStatusInfo(gameStatus);
+    const isGameInReviewStatus = !!statusInfo;
     const fallbackScore = readScorePair(liveData.linescore);
 
     const teamNames = {};
@@ -1090,19 +1286,32 @@ const MLBReviews = (() => {
 
     const reviews = [...entriesByKey.values(), ...pendingByKey.values()];
 
-    // If game state explicitly says "Manager Challenge" or "Review" but no in-progress review recorded yet:
+    // If game state explicitly says "Manager Challenge" / "Umpire review" /
+    // "Instant Replay" but no in-progress review recorded yet:
     if (isGameInReviewStatus && !reviews.some((r) => r.inProgress)) {
-      const activeTypeMeta = normalizeType(status, status);
+      // The registry classification (from statusCode) wins over the
+      // detailedState text: it is what separates MJ/NJ (ABS pitch challenge),
+      // NH (boundary call), M* (manager) and N* (umpire) before any play text
+      // exists. Text-only payloads still fall back to normalizeType().
+      const activeTypeMeta = (statusInfo && statusInfo.statusCode &&
+          reviewTypeForStatusCode(statusInfo.statusCode)) ||
+        normalizeType(status, status);
       const cp = currentPlay || (allPlays.length ? allPlays[allPlays.length - 1] : null) || {};
       const about = cp.about || {};
       const matchup = cp.matchup || {};
       const liveDesc = (cp.result && cp.result.description) || 'Play currently under review.';
+      // The challenging club, when the feed already exposes it. Read from the
+      // official challengeTeamId only — the game status says which TOPIC is
+      // under review, never which side challenged, so teamId stays null
+      // rather than being guessed from the batting side.
+      const liveChallengeTeamId = (cp.reviewDetails && cp.reviewDetails.challengeTeamId) || null;
+      const liveTeam = liveChallengeTeamId ? teamNames[liveChallengeTeamId] : null;
       const liveAbs = buildAbsContext({
         play: cp,
         event: null,
         typeKey: activeTypeMeta.key,
         desc: liveDesc,
-        challengeTeamId: (cp.reviewDetails && cp.reviewDetails.challengeTeamId) || null,
+        challengeTeamId: liveChallengeTeamId,
         teamNames,
         teamIdBySide,
       });
@@ -1124,18 +1333,25 @@ const MLBReviews = (() => {
         inningLabel: formatInning(about) || (liveData.linescore ? `${liveData.linescore.inningState || ''} ${liveData.linescore.currentInningOrdinal || ''}` : ''),
         reviewType: activeTypeMeta.label,
         typeKey: activeTypeMeta.key,
-        teamId: null,
-        teamName: null,
-        teamAbbrev: null,
+        teamId: liveChallengeTeamId,
+        teamName: liveTeam ? liveTeam.name : null,
+        teamAbbrev: liveTeam ? liveTeam.abbrev : null,
         inProgress: true,
         isOverturned: null,
         outcome: 'in_progress',
         outcomeLabel: 'In Progress',
-        reason: 'Call under replay review',
+        // The registry's own `reason` ("Tag play", "Home run", "Pitch
+        // Result", …) — official, and available the instant the status flips,
+        // long before the play description carries the review text.
+        reason: (statusInfo && statusInfo.reason) || 'Call under replay review',
         description: liveDesc,
         timestamp: new Date().toISOString(),
         isPitch: false,
         pitchVelo: null,
+        // Provenance for the "as soon as the play is under review" path: the
+        // exact official status this row was synthesized from.
+        statusCode: statusInfo ? statusInfo.statusCode : null,
+        officialStatus: statusInfo ? statusInfo.detailedState : null,
         batter: matchup.batter ? { id: matchup.batter.id, fullName: matchup.batter.fullName } : null,
         pitcher: matchup.pitcher ? { id: matchup.pitcher.id, fullName: matchup.pitcher.fullName } : null,
         countBefore: liveAbs.countBefore,
@@ -1245,9 +1461,13 @@ const MLBReviews = (() => {
     if (!game) return { hasActiveReview: false, typeLabel: null };
     const status = game.status || {};
     const detailed = status.detailedState || '';
-    const isReview = /challenge|review/i.test(detailed);
-    if (isReview) {
-      const typeMeta = normalizeType(detailed, detailed);
+    // Registry lookup (statusCode / codedGameState), not a word match —
+    // "Instant Replay" (crew-chief review, statusCode IH) contains neither
+    // "challenge" nor "review" and was missed by the old text test.
+    const info = reviewStatusInfo(status);
+    if (info) {
+      const typeMeta = (info.statusCode && reviewTypeForStatusCode(info.statusCode)) ||
+        normalizeType(detailed, detailed);
       return { hasActiveReview: true, typeLabel: typeMeta.label };
     }
     const ls = game.linescore;
@@ -1540,6 +1760,13 @@ const MLBReviews = (() => {
     determineOutcome,
     extractReviews,
     inspectScheduleGame,
+    /* Official game-status registry (GET /api/v1/gameStatus, verified live
+     * 2026-09-02) — the earliest official signal that a review exists. */
+    REVIEW_STATUS_BY_CODE,
+    reviewTypeForStatusCode,
+    isReviewStatusText,
+    isReviewGameStatus,
+    reviewStatusInfo,
     renderLiveAlertBanner,
     renderReviewCard,
     renderReviewsTab,

@@ -369,19 +369,98 @@ function waitAfterScan(intervalMs, elapsedMs) {
 
 /**
  * Fetch order for the all-games scanner. Lower number = sooner.
- *   0 — schedule status already says challenge/review, or we already have
+ *   0 — the official status already says challenge/review, or we already have
  *       an in-progress entry for that game (catch the outcome first)
  *   1 — other live games
  *   2 — finals / everything else
- * Uses only status.detailedState / abstractGameState plus the boolean the
- * caller already computed from feed state — no guessed fields.
+ * Uses the registry-based isReviewStatusCode() (statusCode/codedGameState)
+ * plus the boolean the caller already computed from feed state — no guessed
+ * fields, and "Instant Replay" (crew-chief, IH) now counts.
  */
 function reviewFetchPriority(game, hasInProgress) {
-  const detailed = (game && game.status && game.status.detailedState) || '';
-  if (hasInProgress || /challenge|review/i.test(detailed)) return 0;
+  if (hasInProgress || isReviewStatusCode(game && game.status)) return 0;
   const state = game && game.status && game.status.abstractGameState;
   if (state === 'Live') return 1;
   return 2;
+}
+
+/**
+ * Is this official game `status` a review/challenge state?
+ *
+ * Deliberate self-contained copy of MLBReviews.isReviewGameStatus() — the
+ * same "pure helper layer needs no other module loaded" pattern this file
+ * already uses for runsRemovableFromReview(). tools/review-status-test.mjs
+ * §3 loads both modules and asserts this copy, plus the game.js /
+ * scoreboard.js / ui.js copies, agree with MLBReviews on every entry of the
+ * official registry (and on every non-review state), so they cannot drift.
+ *
+ * Authority: GET https://statsapi.mlb.com/api/v1/gameStatus (verified live
+ * 2026-09-02). Every review state is either
+ *   statusCode MH/MA/MF/… (codedGameState "M", manager + player challenges),
+ *   statusCode NH/NA/NF/… (codedGameState "N", umpire reviews), or
+ *   statusCode "IH"       (codedGameState "I", "Instant Replay").
+ * codedGameState "M"/"N" are used by NO other state, and "I" alone is plain
+ * "In Progress", so it must not match. The text test is the last-resort
+ * fallback for a payload that carries only detailedState, and it now includes
+ * "instant replay" — the verbatim registry wording for IH, which the old
+ * /challenge|review/i test missed entirely.
+ */
+function isReviewStatusCode(status) {
+  if (!status || typeof status !== 'object') return false;
+  const code = String(status.statusCode || '').trim().toUpperCase();
+  if (/^[MN][A-Z]$/.test(code) || code === 'IH') return true;
+  const coded = String(status.codedGameState || '').trim().toUpperCase();
+  if (coded === 'M' || coded === 'N') return true;
+  return /challenge|review|instant replay/i.test(String(status.detailedState || ''));
+}
+
+/**
+ * Diff one review-status sweep against the previous one. Pure: reads
+ * `prevCodes` (Map gamePk -> statusCode seen last sweep) and `nextGames`
+ * (the games array from MLB.getReviewStatus), returns the games whose REVIEW
+ * state changed plus the code map for the next call.
+ *
+ * A game is reported when it
+ *   - enters a review state (the event the feed exists to surface),
+ *   - leaves one (the ruling landed — the outcome), or
+ *   - moves between two different review codes (a new challenge on the same
+ *     game, e.g. MA "Tag play" -> MF "Close play at 1st"): that is a second
+ *     review, not a repeat of the first.
+ * Everything else (In Progress -> Delayed, Pre-Game -> In Progress, a game
+ * disappearing from the slate) is not a review signal and is not reported —
+ * but its code is still tracked so the next sweep compares correctly.
+ */
+function reviewStatusFlips(prevCodes, nextGames) {
+  const prev = prevCodes instanceof Map ? prevCodes : new Map();
+  const codes = new Map();
+  const changed = [];
+  (Array.isArray(nextGames) ? nextGames : []).forEach((game) => {
+    if (!game || game.gamePk == null) return;
+    const status = game.status || {};
+    const code = String(status.statusCode || '').trim().toUpperCase() || null;
+    const pk = game.gamePk;
+    codes.set(pk, code);
+    const isReview = isReviewStatusCode(status);
+    const prevCode = prev.has(pk) ? prev.get(pk) : undefined;
+    // undefined = never seen: a game that is ALREADY under review on the very
+    // first sweep is a real, reportable event (the page may have been opened
+    // mid-review), so it is not suppressed.
+    const wasReview = prevCode !== undefined &&
+      isReviewStatusCode({ statusCode: prevCode });
+    if (isReview === wasReview && (!isReview || code === prevCode)) return;
+    changed.push({
+      gamePk: pk,
+      statusCode: code,
+      codedGameState: String(status.codedGameState || '').trim().toUpperCase() || null,
+      detailedState: status.detailedState || null,
+      reason: typeof status.reason === 'string' && status.reason.trim()
+        ? status.reason.trim() : null,
+      review: isReview,
+      started: isReview && !wasReview,
+      ended: !isReview && wasReview,
+    });
+  });
+  return { changed, codes };
 }
 
 /** Run `fn` over items with a fixed concurrency cap. Preserves completion of every item. */
@@ -778,6 +857,37 @@ function gameChallengeLine(counts, labels, prefix) {
   // outcome in particular — lands sooner. Same host (HTTP/2), same
   // CORS-open endpoint.
   const FETCH_CONCURRENCY = 30;
+  /* ----------------------------------------------------------------------
+   * REVIEW-STATUS WATCHER — the latency fix.
+   *
+   * The official game status is the EARLIEST signal that a review exists:
+   * MLB flips statusCode to an M-code, an N-code or IH the instant a review
+   * is CALLED, while
+   * the play text the parser also reads ("Tigers challenged (tag play), call
+   * on the field was overturned: …") is written when the review RESOLVES.
+   * Registry: GET /api/v1/gameStatus, verified live 2026-09-02.
+   *
+   * Before this watcher, the only status the feed could see came off the
+   * 3s SCHEDULE_TTL_MS cache above — so a review could sit undetected for up
+   * to ~3s after MLB published it, and the "under review" row only appeared
+   * on the next poll that happened to refresh the schedule. The watcher
+   * polls a `fields`-projected, hydration-free schedule (MLB.getReviewStatus
+   * — gamePk + status for the whole slate, ~2.4 KB / 1 chunk, verified live
+   * 2026-09-02 against the 8-chunk hydrated schedule getSchedule() uses) on
+   * its own timer, merges the fresh status into `games`, and on any review
+   * flip kicks an out-of-band scan instead of waiting for the next tick.
+   *
+   *   worst case before : ~3000ms (schedule cache) + up to 500ms poll
+   *   worst case after  : ~250ms (watcher) + one round trip
+   *
+   * It runs on its own timer rather than inside load() so it adds ZERO
+   * serialized latency to the playByPlay scan, and it is only fast while a
+   * game is actually live — a review cannot start on a game that has not
+   * started, so an idle slate backs off to 5s.
+   * ------------------------------------------------------------------- */
+  const REVIEW_STATUS_POLL_MS = 250;
+  const REVIEW_STATUS_IDLE_MS = 5000;
+  const REVIEW_STATUS_TIMEOUT_MS = 2500;
 
   let dateStr = todayStr();
   let games = [];
@@ -795,6 +905,14 @@ function gameChallengeLine(counts, labels, prefix) {
   let scheduleDate = null;
   let lastScheduleAt = 0;
   let scheduleInFlight = null;
+  // Review-status watcher state: its own timer, an in-flight guard (a sweep
+  // must never overlap itself and stack requests), the last observed
+  // gamePk -> statusCode map, and a flag that tells load() a review flipped
+  // while a scan was already running so it re-scans immediately on exit.
+  let reviewStatusTimer = null;
+  let reviewStatusInFlight = false;
+  let reviewStatusCodes = new Map();
+  let reviewStatusFlipPending = false;
   // One alert (chime + notification) per poll at most — but fired the moment
   // the FIRST game response reports it, instead of after the slowest game.
   let pollAlertFired = false;
@@ -872,6 +990,11 @@ function gameChallengeLine(counts, labels, prefix) {
     scheduleDate = null;
     lastScheduleAt = 0;
     scheduleInFlight = null;
+    // The watcher's code map belongs to the old date too: keeping it would
+    // make the new date's first sweep look like "nothing changed" for a game
+    // whose gamePk collides, and suppress a review that is already running.
+    reviewStatusCodes = new Map();
+    reviewStatusFlipPending = false;
   }
 
   function $ (sel) { return document.querySelector(sel); }
@@ -1258,6 +1381,10 @@ function gameChallengeLine(counts, labels, prefix) {
     if (requestInFlight) return;
     const requestDate = dateStr;
     requestInFlight = true;
+    // This scan is now the one that will see the flip the watcher reported, so
+    // the "re-scan after me" request is satisfied and must not fire a second
+    // redundant scan in the finally block.
+    reviewStatusFlipPending = false;
     lastCycleStartedAt = Date.now();
     const statusLine = $('#status-line');
     setLivePulse(true);
@@ -1360,7 +1487,17 @@ function gameChallengeLine(counts, labels, prefix) {
     } finally {
       requestInFlight = false;
       setLivePulse(false);
-      if (requestDate !== dateStr) load();
+      if (requestDate !== dateStr) {
+        load();
+      } else if (reviewStatusFlipPending) {
+        // The watcher saw a review flip while this scan was already running,
+        // so its `load()` call was dropped by the requestInFlight guard.
+        // Re-scan immediately instead of waiting for the next scheduled tick —
+        // this is the difference between the row landing one poll later and
+        // landing now. Cleared here so it can only ever cost ONE extra scan.
+        reviewStatusFlipPending = false;
+        load();
+      }
     }
   }
 
@@ -1535,6 +1672,13 @@ function gameChallengeLine(counts, labels, prefix) {
     // where the outcome flipped. The tracker merges as soon as the response
     // lands; the next cycle re-renders the row with fresh counters.
     if (result.added.length || result.updated.length || result.ended.length) {
+      // renderFeedUpdates() already repaints the header stats, the LIVE REVIEW
+      // strip and the ⚠️ RUNS AT RISK banner (it calls renderStats /
+      // renderActiveStrip / renderTabs after rebuilding the rows), so all of
+      // those land with the FIRST response that carries them — not after the
+      // slowest game in the wave. Verified by tools/review-watcher-test.mjs
+      // §4b, which holds one game's playByPlay pending for 4s while a second
+      // game's review banner is asserted on screen.
       renderFeedUpdates(result);
     }
     // Alert now (chime + desktop notification) if this game's response
@@ -1696,10 +1840,11 @@ function gameChallengeLine(counts, labels, prefix) {
         activeGames.get(entry.gamePk).push(entry);
       }
     });
-    // A game whose status itself says "Manager Challenge"/"In Review".
+    // A game whose official status says it is under review right now —
+    // statusCode M*/N*/IH (registry-verified), not a word match, so a
+    // crew-chief "Instant Replay" appears here too.
     games.forEach((g) => {
-      const detailed = (g.status && g.status.detailedState) || '';
-      if (/challenge|review/i.test(detailed) && !activeGames.has(g.gamePk)) {
+      if (isReviewStatusCode(g && g.status) && !activeGames.has(g.gamePk)) {
         activeGames.set(g.gamePk, []);
       }
     });
@@ -1718,8 +1863,17 @@ function gameChallengeLine(counts, labels, prefix) {
       item.appendChild(el('span', 'feed-active-game',
         matchupFor(null, g)));
       item.appendChild(el('span', 'feed-active-type', label));
-      if (entries.length && entries[0].review.reason) {
-        item.appendChild(el('span', 'feed-active-reason', entries[0].review.reason));
+      // Official reason: from the feed row when we have one, else straight off
+      // the game status (`status.reason` — "Tag play", "Home run", "Pitch
+      // Result", …, all verbatim from GET /api/v1/gameStatus). That is what
+      // makes this strip informative on the very first poll after the status
+      // flips, before the play description carries any review text at all.
+      const statusReason = !entries.length &&
+        typeof (g.status && g.status.reason) === 'string' && g.status.reason.trim()
+        ? g.status.reason.trim() : null;
+      const reasonText = entries.length ? entries[0].review.reason : statusReason;
+      if (reasonText) {
+        item.appendChild(el('span', 'feed-active-reason', reasonText));
       }
       if (entries.length && window.MLBReviews && window.MLBReviews.scoreImpactPresentation) {
         const impact = window.MLBReviews.scoreImpactPresentation(entries[0].review);
@@ -2104,10 +2258,9 @@ function gameChallengeLine(counts, labels, prefix) {
       if (entry.review && entry.review.inProgress) inFeed = true;
     });
     if (inFeed) return true;
-    return games.some((g) => {
-      const detailed = (g.status && g.status.detailedState) || '';
-      return /challenge|review/i.test(detailed);
-    });
+    // Registry-based: the official statusCode/codedGameState, so a crew-chief
+    // "Instant Replay" (IH) drops the poll to the fast cadence too.
+    return games.some((g) => isReviewStatusCode(g && g.status));
   }
 
   function currentInterval() {
@@ -2146,6 +2299,8 @@ function gameChallengeLine(counts, labels, prefix) {
   function stopPolling() {
     clearTimeout(pollTimer);
     clearInterval(countdownTimer);
+    // The watcher has its own timer; a hidden tab must stop sweeping too.
+    stopReviewStatus();
     const node = $('#countdown');
     if (node) node.textContent = '';
   }
@@ -2168,6 +2323,97 @@ function gameChallengeLine(counts, labels, prefix) {
       }
     }, wait);
     startCountdown(wait);
+  }
+
+  /* ------------------------------------------------ review-status watcher */
+
+  /**
+   * Watcher cadence. Fast only while a review is possible: a review cannot
+   * start on a game that has not started, so a slate with nothing Live backs
+   * off to 5s and the watcher costs nothing overnight.
+   */
+  function reviewStatusIntervalMs() {
+    const canReview = games.some((g) => g && g.status &&
+      (g.status.abstractGameState === 'Live' || isReviewStatusCode(g.status)));
+    return canReview ? REVIEW_STATUS_POLL_MS : REVIEW_STATUS_IDLE_MS;
+  }
+
+  function scheduleReviewStatus() {
+    clearTimeout(reviewStatusTimer);
+    // A hidden tab parks at the idle cadence instead of spinning at 250ms
+    // (stopPolling() normally clears this timer outright; this is the safety
+    // net for a tab hidden between ticks).
+    const wait = document.hidden
+      ? REVIEW_STATUS_IDLE_MS : reviewStatusIntervalMs();
+    reviewStatusTimer = setTimeout(() => {
+      if (document.hidden) { scheduleReviewStatus(); return; }
+      pollReviewStatus();
+    }, wait);
+  }
+
+  function stopReviewStatus() {
+    clearTimeout(reviewStatusTimer);
+    reviewStatusTimer = null;
+  }
+
+  /**
+   * One sweep. Never throws: the ordinary schedule cache keeps refreshing
+   * status on its 3s tick no matter what happens here, so a failed sweep is
+   * silently retried on the next tick rather than surfaced as an error.
+   */
+  async function pollReviewStatus() {
+    // No endpoint = no feature (api.js always ships it on reviews.html). Stop
+    // rather than park a timer that can never do anything.
+    if (!MLB.getReviewStatus) return;
+    // A sweep must never overlap itself: the in-flight one reschedules in its
+    // own finally, so this call simply drops.
+    if (reviewStatusInFlight) return;
+    const requestDate = dateStr;
+    reviewStatusInFlight = true;
+    try {
+      const list = await MLB.getReviewStatus(requestDate,
+        { timeout: REVIEW_STATUS_TIMEOUT_MS, retries: 0 });
+      if (requestDate !== dateStr) return;
+      const diff = reviewStatusFlips(reviewStatusCodes, list);
+      reviewStatusCodes = diff.codes;
+      if (diff.changed.length) {
+        mergeReviewStatusIntoGames(list);
+        reviewStatusFlipPending = true;
+        // Paint the "LIVE REVIEW" strip from the status alone, right now —
+        // the full feed row (batter/pitcher, score impact, runs at risk)
+        // follows from the out-of-band scan kicked off just below. Only the
+        // strip is touched: a full render() here could race the in-flight
+        // scan's incremental row updates.
+        renderActiveStrip();
+        load();
+      }
+    } catch (err) {
+      // Deliberately quiet: see the doc comment above.
+    } finally {
+      reviewStatusInFlight = false;
+      scheduleReviewStatus();
+    }
+  }
+
+  /**
+   * Copy the watcher's fresh official status onto the matching `games`
+   * entries so every consumer of `games` — ingestGame's pseudo-feed,
+   * reviewFetchPriority, hasActiveReviewSignal, renderActiveStrip — sees the
+   * current status without waiting for the 3s hydrated-schedule refresh.
+   * Merged field-by-field: a projected sweep must never delete a status field
+   * the hydrated schedule supplied.
+   */
+  function mergeReviewStatusIntoGames(list) {
+    const byStatus = new Map();
+    (list || []).forEach((g) => {
+      if (g && g.gamePk != null && g.status) byStatus.set(g.gamePk, g.status);
+    });
+    games.forEach((g) => {
+      if (!g || g.gamePk == null) return;
+      const fresh = byStatus.get(g.gamePk);
+      if (!fresh) return;
+      g.status = Object.assign({}, g.status || {}, fresh);
+    });
   }
 
   function syncUrl() {
@@ -2232,10 +2478,20 @@ function gameChallengeLine(counts, labels, prefix) {
       });
     }
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) load();
-      else stopPolling();
+      if (!document.hidden) {
+        load();
+        // Catch up on anything that started while the tab was hidden — one
+        // sweep now, then back to the watcher cadence.
+        pollReviewStatus();
+      } else {
+        stopPolling();
+      }
     });
     load();
+    // First sweep immediately rather than one cadence later: a page opened
+    // mid-review must show the review on the first paint, and the sweep also
+    // seeds reviewStatusCodes so later polls diff correctly.
+    pollReviewStatus();
   });
 
   /* Node test export (pure helpers only). */
@@ -2246,6 +2502,7 @@ function gameChallengeLine(counts, labels, prefix) {
       sortFeedEntries, gameTeamsLabel,
       isUsableName, officialTeamName, gameSideTeam,
       pollIntervalMs, waitAfterScan, reviewFetchPriority, mapPool,
+      isReviewStatusCode, reviewStatusFlips,
       shouldAlertForReview, visibleInAllFeed,
       runsRemovableFromReview, shouldRunRiskAlert, diffRunRiskKeys,
       normalizeChallengeCounts, challengeCountIrregularities,

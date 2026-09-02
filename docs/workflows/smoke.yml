@@ -28,5 +28,11 @@ jobs:
       - name: Validate in-review lean probe signature
         run: node tools/review-probe-test.mjs
 
+      - name: Validate official game-status review detection
+        run: node tools/review-status-test.mjs
+
+      - name: Validate the replay feed review-status watcher
+        run: node tools/review-watcher-test.mjs
+
       - name: Run smoke test against live MLB StatsAPI
         run: node tools/smoke-test.mjs

@@ -491,3 +491,145 @@ this sandbox, unchanged.)
    3× smaller payload, fail-fast fetches) and chunk-verified; absolute
    browser timings should be confirmed via DevTools Network against a live
    slate.
+
+## 16. Review-detection latency: the official game-status registry + a 250 ms status watcher (added 2026-09-02)
+
+Requirement (verbatim from the user): *"I am receiving notifications, updates,
+and alerts after the play has been completed and not as soon as the play is
+under review… I need to know when a play is under review, being challenged,
+boundary calls, runs at risk, official scoring pending reviews, etc as fast as
+possible."*
+
+That complaint is **not** only a polling-cadence problem. Two things were
+actually wrong, and both are now fixed and pinned by tests.
+
+### 16.1 The root cause: review detection read the wrong field
+
+The app decided "is a game under review?" with
+`/challenge|review/i.test(status.detailedState)` — an English word match on a
+label. It was duplicated in **six** places
+(`reviews.js` ×2, `reviews-feed.js` ×3, `scoreboard.js` ×2, `ui.js` ×1).
+
+The official registry — **`GET https://statsapi.mlb.com/api/v1/gameStatus`**,
+read in full (4 pages) on **2026-09-02** — contains a live review state whose
+`detailedState` is **`"Instant Replay"`** (`statusCode: "IH"`,
+`codedGameState: "I"`, `reason: "Review"`). That string contains neither
+"challenge" nor "review":
+
+```js
+/challenge|review/i.test('Instant Replay')   // → false
+```
+
+**So every crew-chief instant-replay review was invisible to the whole app**:
+no alert, no chime, no "Under Review" strip, no Challenges-tab count, no drop
+to the 250 ms cadence, and no synthesized "under review" feed row. It only
+became visible if the play's own `reviewDetails` happened to expose
+`inProgress:true` — and §7 of this report already records that `inProgress:true`
+was **never captured live** in this project.
+
+| Claim | Verified? | Evidence |
+| --- | --- | --- |
+| `GET /api/v1/gameStatus` is the official list of every `status` value | ✅ live 2026-09-02 | 4-page response read end to end; 200+ states |
+| The registry's review subset is exactly 47 states, all `abstractGameState:"Live"` | ✅ | `IH` (1) + `M*` (23) + `N*` (23). Enumerated in `REVIEW_STATUS_BY_CODE` (`assets/js/reviews.js`) and counted by `tools/review-status-test.mjs` §1 |
+| `codedGameState "M"` and `"N"` belong to challenge/review states and nothing else | ✅ | Every `"M"` row is "Manager challenge: …" or "Player challenge: Pitch Result"; every `"N"` row is "Umpire review: …" or "Umpire Challenge: Pitch Result". No delay/suspension/forfeit row uses M or N |
+| `statusCode "IH"` = `"Instant Replay"`, `reason "Review"` | ✅ | verbatim registry row |
+| `statusCode` is the SAME vocabulary as `reviewDetails.reviewType` | ✅ cross-check | `MA` = registry "Tag play" ↔ game 823341 *"Tigers challenged (tag play)"*; `MF` = "Close play at 1st" ↔ game 824075 *"Royals challenged (play at 1st)"*; `MJ` = "Pitch Result" (Player challenge) ↔ games 823342/823667/824075 ABS; `NH` = "Umpire review: Home run" ↔ game 824801 foul/potential-HR review |
+| The registry's `reason` is available at review start, before any play text exists | ✅ by construction | `status` is a game-level field that flips when the review is **called**; the play description this parser also reads ("…call on the field was overturned: …") is written when the review **resolves** |
+| `MJ` was already classified as ABS; `NJ` was **not** | ✅ fixed | `normalizeType('NJ', …)` fell through to the generic `"Replay Review"` label. Now `MJ`/`NJ` → ABS Challenge |
+
+**Fix.** `REVIEW_STATUS_BY_CODE` in `assets/js/reviews.js` holds all 47 rows
+verbatim (`detailedState` + `reason` + `codedGameState`). Detection is now
+`isReviewGameStatus(status)`: registry `statusCode` → `codedGameState M/N` →
+text fallback (which now includes `instant replay`). Every one of the six call
+sites was converted. `normalizeType()` resolves short codes through
+`reviewTypeForStatusCode()`, so a row built from the status and a row built
+later from `reviewDetails.reviewType` can never disagree.
+
+**Not changed, deliberately:** the review *categories* are untouched. `MH`
+("Manager challenge: Home run") and `MS`/`NS` ("Stadium boundary call") stay
+`manager`/`crew_chief`, not `boundary` — only the observed `NH` code classifies
+as a Boundary Call, exactly as §9 already decided. Reclassifying them would
+change the Boundary Calls stat and the challenges-remaining attribution, which
+is a semantics change, not a latency one. The boundary *topic* is now visible
+on every row anyway, because the official `reason` ("Home run", "Stadium
+boundary call", "Fair/foul in outfield") is carried through.
+
+### 16.2 The second cause: the fastest signal was gated behind a 3 s cache
+
+`ingestGame()` builds its pseudo-feed's `gameData.status` from the cached
+schedule (`SCHEDULE_TTL_MS = 3000`). On the 500 ms live cadence that means
+**5 polls in 6 reuse a stale status** — so even for the review states the regex
+did match, the "under review" row could sit unpublished for up to ~3 s.
+
+| Claim | Verified? | Evidence |
+| --- | --- | --- |
+| A `fields`-projected, hydration-free schedule returns gamePk + full status for the whole slate | ✅ live 2026-09-02 | `GET /api/v1/schedule?sportId=1&date=2026-09-02&fields=dates,games,gamePk,season,status,abstractGameState,codedGameState,detailedState,statusCode,reason,startTimeTBD,abstractGameCode` → all 15 games, **1 chunk** vs **8 chunks** for the hydrated schedule `getSchedule()` uses |
+| The projection preserves `reason` | ✅ live | the same response showed game 822686 as `{statusCode:"II", detailedState:"Delayed", reason:"Inclement Weather"}` — a real rain delay, and proof `reason` survives the projection |
+| A delay is not mistaken for a review | ✅ | `isReviewGameStatus({statusCode:'II', codedGameState:'I', detailedState:'Delayed'})` → false; asserted for 16 real non-review registry rows in `tools/review-status-test.mjs` §2 |
+| Per-game status is a ~150-byte projection | ✅ live | `GET /api/v1.1/game/824470/feed/live?fields=gameData,status,…` → `{"gameData":{"status":{…6 fields…}}}` and nothing else — no `players`, no `liveData` |
+
+**Fix.** `MLB.getReviewStatus(date)` + `MLB.getGameStatus(gamePk)` in
+`assets/js/api.js`, and a **review-status watcher** in `reviews-feed.js`:
+its own 250 ms timer (`REVIEW_STATUS_POLL_MS = 250`, backing off to 5 s when
+nothing is Live), which diffs the sweep (`reviewStatusFlips`), merges the fresh
+status into `games` field-by-field (`mergeReviewStatusIntoGames`, so a
+projection can never delete a field the hydrated schedule supplied), paints the
+LIVE REVIEW strip immediately, and kicks an **out-of-band** `load()` instead of
+waiting for the next tick. If a flip lands while a scan is already running,
+`reviewStatusFlipPending` makes that scan re-run on exit — costing at most one
+extra scan, because `load()` clears the flag on entry.
+
+```
+worst case before : ~3000 ms schedule cache  + up to 500 ms poll
+worst case after  : ~250 ms watcher          + one round trip
+```
+
+`game.js` gets the same treatment per game: while live and not already known to
+be in review, a ~150-byte `getGameStatus` probe is **raced** against the 1–2 MB
+full feed. When the small one wins it flips the page straight to the 250 ms
+review cadence and says so on the status line; `renderAll()` still decides
+everything from the authoritative feed, and a `loadCycle` guard makes a late
+probe a no-op.
+
+### 16.3 Tests added
+
+| Tool | What it pins |
+| --- | --- |
+| `tools/review-status-test.mjs` (new, 11 sections) | registry integrity (47 rows, verbatim `detailedState`/`reason`, M↔N reason agreement); `isReviewGameStatus` true for all 47 and false for 16 real non-review states; **all four self-contained copies** (reviews-feed / game / scoreboard / ui) agree with `MLBReviews` over the whole registry; `normalizeType` codes; `reviewStatusInfo`; `extractReviews` synthesizing an in-progress row from status alone for MA/IH/NA/NH/MJ with the official reason; `reviewStatusFlips`; `reviewFetchPriority`; and §10, which asserts the old word match really does miss `"Instant Replay"` |
+| `tools/review-watcher-test.mjs` (new) | drives the **real boot path** with fake timers: boot sweep, status-only window (banner + strip up before any play text exists), out-of-band scan on a flip, run-at-risk from a status-only review, code-change = new event, no extra scan when nothing changed, silent failure, hidden-tab pause, and §4b (a slow game elsewhere in the slate does not hold back another game's banner) |
+| `tools/smoke-test.mjs` (+3 sections, CI/live) | re-reads `/api/v1/gameStatus` and **diffs it against the hardcoded table** (missing, stale, or drifted rows all fail); asserts the projection is ≥5× smaller than the hydrated schedule; asserts the per-game projection returns status only |
+| `docs/workflows/smoke.yml` | both new tools added to the nightly run |
+
+**Mutation-verified** (each mutation was applied, the suite run, and the file
+restored): reverting `isReviewGameStatus` to the word match fails §2 on `IH`;
+dropping `instant replay` from the reviews-feed copy fails §3; raising
+`REVIEW_STATUS_POLL_MS` above `SCHEDULE_TTL_MS` fails §11; removing the boot
+sweep, the status merge, or the out-of-band `load()` each fail
+`review-watcher-test.mjs`; removing `renderFeedUpdates()` from `ingestGame`
+fails §4b.
+
+### 16.4 Limitations (stated, not glossed)
+
+1. **No live mid-review capture yet.** The registry proves the state machine
+   (`"Manager challenge: Tag play"` is by definition an in-flight state), and
+   the two projections were verified live on 2026-09-02 — but no game happened
+   to be under review during this session, so a real `statusCode:"MA"` payload
+   was not captured. `smoke-test.mjs` will exercise the full path against a live
+   slate in CI, and §16.1's cross-check ties four registry codes to payloads
+   this repo *did* capture.
+2. **Absolute browser timings were not measured.** This sandbox has no outbound
+   network for the tools; the numbers above are structural (cache 3 s → watcher
+   250 ms) and chunk-count based, exactly as §15's caveat 6 already said.
+3. **A brand-new game is still bounded by the schedule cache.** The watcher can
+   only merge status into games the hydrated schedule has already revealed, so
+   a game that goes Live *and* straight into review before the first schedule
+   refresh is picked up ≤3 s later — unchanged from before, and unavoidable
+   because the playByPlay scan is driven off the same slate.
+4. **The watcher adds requests.** One ~2.4 KB sweep every 250 ms while any game
+   is Live (≈10 KB/s), plus one ~150 B per-game probe per cycle on `game.html`.
+   Both are ~30× smaller per byte of information than re-polling the hydrated
+   schedule they replace, and both stop when the tab is hidden.
+5. **`MJ`/`NJ` ABS challenges do trigger the watcher flip** (they are registry
+   review states, and the old regex matched `"Player challenge: Pitch Result"`
+   too, so this is not a regression). The chime still skips routine ABS via
+   `shouldAlertForReview()`; only the run-at-risk case sounds, as before.
