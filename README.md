@@ -112,6 +112,21 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
   full feed only when the review state flips), the Replay Feed every **500ms**
   (**250ms** while a review is in flight), and the scoreboard every **500ms**
   (**250ms** while a review is in flight); works on desktop and mobile.
+- **"Under review" is detected from the official game status, not from play
+  text.** The Replay Feed runs a dedicated **250ms review-status watcher**
+  (`GET /api/v1/schedule` with a `fields` projection and no hydrations — the
+  whole slate's `gamePk` + `status` in ~2.4 KB, ~1/8th the size of the schedule
+  the rest of the page uses) and the game page races a ~150-byte per-game status
+  projection against its full feed. MLB flips `status.statusCode` the instant a
+  review is **called**, while the play description is written when it
+  **resolves** — so this cuts the worst-case wait from ~3s (the schedule cache)
+  to ~250ms plus one round trip, and it surfaces the official review reason
+  ("Tag play", "Home run", "Pitch Result", …) before any play text exists.
+  Detection reads the API's own status registry (`GET /api/v1/gameStatus`:
+  `M*` manager challenge, `N*` umpire review, `IH` instant replay, `MJ`/`NJ`
+  ABS pitch challenge) instead of matching the words "challenge"/"review" —
+  which silently missed crew-chief reviews, whose official `detailedState` is
+  **"Instant Replay"**. See `docs/verification-report.md` §16.
 - No build step, no frameworks, no API keys — it runs on **GitHub Pages** (or any static
   host, or even `file://`).
 
@@ -131,6 +146,9 @@ This project does the same thing with its own front end. The API calls we make:
 | What we need | Endpoint |
 | --- | --- |
 | Games for a date (scoreboard cards, probables, live count) | `GET /api/v1/schedule?sportId=1&date=YYYY-MM-DD&hydrate=probablePitcher,linescore,decisions,review` |
+| **Review status for the whole slate** (Replay Feed's 250ms watcher) | `GET /api/v1/schedule?sportId=1&date=YYYY-MM-DD&fields=dates,games,gamePk,season,status,abstractGameState,codedGameState,detailedState,statusCode,reason,startTimeTBD,abstractGameCode` |
+| **Review status for one game** (game page's fast probe, ~150 B) | `GET /api/v1.1/game/{gamePk}/feed/live?fields=gameData,status,abstractGameState,codedGameState,detailedState,statusCode,reason,startTimeTBD,abstractGameCode` |
+| Official game-status registry (source of every review `statusCode` + `reason`) | `GET /api/v1/gameStatus` |
 | Full game state — play-by-play, current at-bat, linescore, box score, decisions, rosters | `GET /api/v1.1/game/{gamePk}/feed/live` |
 | Fallback feed (older games) | `GET /api/v1/game/{gamePk}/feed/live` |
 | Fallback bundle (if the feed 404s) | `GET /api/v1/game/{gamePk}/playByPlay` + `/boxscore` + `/linescore` |
@@ -262,6 +280,11 @@ node tools/hit-model-test.mjs             # two-sided hit forecast model
 node tools/review-test.mjs                # challenge / replay review parser (incl. real API shapes)
 node tools/reviews-feed-test.mjs          # all-games Replay Feed diff helpers
 node tools/replay-feed-render-test.mjs    # end-to-end Replay Feed render (captured live payloads)
+node tools/review-probe-test.mjs          # in-review lean-probe signature (game.js)
+node tools/review-status-test.mjs         # official gameStatus registry + review detection (all 4 copies)
+node tools/review-watcher-test.mjs        # 250ms review-status watcher, driven through the real boot path
+node tools/official-scoring-test.mjs      # official-scorer pending rulings
+node tools/api-fields-test.mjs            # playByPlay `fields` projection coverage
 ```
 
 To *see and hear* the ⚠️ Runs at Risk surfaces without waiting for a live review,

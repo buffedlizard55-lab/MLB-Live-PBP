@@ -261,5 +261,129 @@ try {
   check('teams directory fetched', false, err.message);
 }
 
+/* ============================================================ review status
+ * The latency path: reviews are detected from the OFFICIAL game status
+ * (GET /api/v1/gameStatus), not from a word match on detailedState. If MLB
+ * adds, renames or removes a review state, or drops a field from the
+ * projections the watcher and the game-page probe use, this fails CI instead
+ * of silently making reviews invisible again.
+ *
+ * tools/review-status-test.mjs is the offline half of this: it walks the
+ * registry table hardcoded in assets/js/reviews.js. This is the online half —
+ * it re-reads the registry from the API and diffs the two. */
+console.log('\n== official game-status registry (GET /api/v1/gameStatus) ==');
+try {
+  const registry = await getJSON(`${V1}/gameStatus`);
+  check('gameStatus registry fetched', Array.isArray(registry) && registry.length > 100,
+    `${Array.isArray(registry) ? registry.length : 0} states`);
+
+  // The live review states the API publishes today.
+  const liveReview = (registry || []).filter((s) =>
+    s && s.abstractGameState === 'Live' &&
+    (s.codedGameState === 'M' || s.codedGameState === 'N' || s.statusCode === 'IH'));
+  check('registry publishes live review states', liveReview.length >= 40,
+    `${liveReview.length} live review states`);
+
+  // Diff against the table hardcoded in reviews.js (loaded without a DOM).
+  const { readFileSync } = await import('node:fs');
+  const vm = (await import('node:vm')).default;
+  const ctx = {
+    console: { warn() {}, error() {}, log() {} },
+    Map, Set, Math, Number, String, Object, Array, RegExp, JSON,
+    MLB: { ordinal: (n) => `${n}` },
+    UI: { el: () => ({ appendChild() {} }), clear: (n) => n },
+    window: {},
+  };
+  vm.createContext(ctx);
+  vm.runInContext(readFileSync(new URL('../assets/js/reviews.js', import.meta.url), 'utf8'), ctx);
+  const TABLE = (ctx.MLBReviews || ctx.window.MLBReviews).REVIEW_STATUS_BY_CODE;
+
+  const missing = liveReview.filter((s) => !TABLE[s.statusCode]);
+  check('every live review state in the registry is in our table',
+    missing.length === 0,
+    missing.map((s) => `${s.statusCode} "${s.detailedState}"`).join(', '));
+
+  const stale = Object.keys(TABLE).filter((code) =>
+    !liveReview.some((s) => s.statusCode === code));
+  check('our table holds no state the registry has dropped',
+    stale.length === 0, stale.join(', '));
+
+  const drifted = liveReview.filter((s) => TABLE[s.statusCode] &&
+    (TABLE[s.statusCode].detailedState !== s.detailedState ||
+      (TABLE[s.statusCode].reason || null) !== (s.reason || null)));
+  check('detailedState + reason match the registry verbatim',
+    drifted.length === 0,
+    drifted.map((s) => `${s.statusCode}: "${TABLE[s.statusCode].detailedState}" vs "${s.detailedState}"`).join('; '));
+
+  // The crew-chief state is the specific one the old /challenge|review/i word
+  // match missed. Pin that it still exists and still does not contain either
+  // word — that is the whole reason detection is registry-based.
+  const ih = (registry || []).find((s) => s.statusCode === 'IH');
+  check('registry still has IH "Instant Replay"',
+    !!ih && ih.detailedState === 'Instant Replay' && ih.abstractGameState === 'Live',
+    ih ? `"${ih.detailedState}"` : 'absent');
+  check('"Instant Replay" still evades a challenge|review word match',
+    !!ih && !/challenge|review/i.test(ih.detailedState));
+} catch (err) {
+  check('gameStatus registry fetched', false, err.message);
+}
+
+/* review-status projection: MLB.getReviewStatus() — the 250ms all-games
+ * watcher. It must return gamePk + the full status object for every game, and
+ * it must be materially smaller than the hydrated schedule it replaces. */
+console.log('\n== review-status projection (all-games watcher) ==');
+try {
+  const FIELDS = 'dates,games,gamePk,season,status,abstractGameState,codedGameState,' +
+    'detailedState,statusCode,reason,startTimeTBD,abstractGameCode';
+  const res = await fetch(`${V1}/schedule?sportId=1&date=${date}&fields=${FIELDS}`,
+    { headers: { Accept: 'application/json' } });
+  check('projected schedule fetched', res.ok, `HTTP ${res.status}`);
+  const leanText = await res.text();
+  const lean = JSON.parse(leanText);
+  const leanGames = lean.dates && lean.dates[0] ? lean.dates[0].games : [];
+  check('projected schedule returns every game', leanGames.length === games.length,
+    `${leanGames.length} projected vs ${games.length} hydrated`);
+  check('every projected game carries statusCode + codedGameState + detailedState',
+    leanGames.every((g) => g.gamePk != null && g.status &&
+      typeof g.status.statusCode === 'string' &&
+      typeof g.status.codedGameState === 'string' &&
+      typeof g.status.detailedState === 'string'));
+  check('the projection adds no hydrations (no teams/linescore/probablePitcher)',
+    leanGames.every((g) => !g.teams && !g.linescore));
+
+  const hyd = await fetch(`${V1}/schedule?sportId=1&date=${date}` +
+    '&hydrate=probablePitcher,linescore,decisions,review,team',
+  { headers: { Accept: 'application/json' } });
+  const hydText = await hyd.text();
+  const ratio = hydText.length / Math.max(1, leanText.length);
+  check('projection is at least 5x smaller than the hydrated schedule',
+    ratio >= 5, `${leanText.length}B projected vs ${hydText.length}B hydrated (${ratio.toFixed(1)}x)`);
+  console.log(`  (${leanText.length} B projected, ${hydText.length} B hydrated — ` +
+    `${ratio.toFixed(1)}x, which is what makes the 250ms watcher affordable)`);
+} catch (err) {
+  check('review-status projection fetched', false, err.message);
+}
+
+/* per-game status projection: MLB.getGameStatus() — the game page's fast
+ * review probe, raced against the full feed. */
+console.log('\n== per-game status projection (game-page review probe) ==');
+try {
+  if (!feedPk) {
+    console.log('  (no game to probe on this date — skipped)');
+  } else {
+    const GS = 'fields=gameData,status,abstractGameState,codedGameState,' +
+      'detailedState,statusCode,reason,startTimeTBD,abstractGameCode';
+    const st = await getJSON(`${V11}/game/${feedPk}/feed/live?${GS}`);
+    const s = st && st.gameData && st.gameData.status;
+    check('gameData.status present with statusCode + codedGameState + detailedState',
+      !!s && typeof s.statusCode === 'string' && typeof s.codedGameState === 'string' &&
+      typeof s.detailedState === 'string', JSON.stringify(s || null));
+    check('the projection returns status only (no players/boxscore)',
+      !!st && !!st.gameData && !st.gameData.players && !st.liveData);
+  }
+} catch (err) {
+  check('per-game status projection fetched', false, err.message);
+}
+
 console.log(failures ? `\n${failures} check(s) FAILED\n` : '\nall checks passed\n');
 process.exit(failures ? 1 : 0);

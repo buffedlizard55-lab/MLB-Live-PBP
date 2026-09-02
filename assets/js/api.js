@@ -83,6 +83,78 @@ const MLB = (() => {
   }
 
   /**
+   * Review-status-only schedule sweep for a date — the cheapest possible
+   * "is ANY game under review right now?" request.
+   *
+   * Why it exists (verified live, statsapi.mlb.com, 2026-09-02):
+   *   - The official game status flips the instant a review is CALLED, while
+   *     the play text the parsers also read is written when the review
+   *     RESOLVES. Status is therefore the earliest signal available.
+   *   - `status.statusCode` / `codedGameState` are the registry vocabulary
+   *     from GET /api/v1/gameStatus (M* manager challenge, N* umpire review,
+   *     IH instant replay, MJ/NJ ABS pitch challenge). See
+   *     REVIEW_STATUS_BY_CODE in reviews.js.
+   *   - A `fields` projection with NO hydrations returns gamePk + status for
+   *     the whole slate in ~2.4 KB (1 response chunk) where the hydrated
+   *     schedule getSchedule() uses is ~8 chunks. That size is what makes a
+   *     250 ms watcher cadence affordable; polling the hydrated schedule at
+   *     that rate would be ~30x the bytes for the same two fields.
+   *
+   * Response shape actually observed:
+   *   { dates: [ { games: [ { gamePk, status: { abstractGameState,
+   *     codedGameState, detailedState, statusCode, startTimeTBD,
+   *     abstractGameCode } } ] } ] }
+   * `reason` is additionally whitelisted: the registry attaches it to every
+   * review state ("Tag play", "Home run", "Pitch Result", …) and it is
+   * absent otherwise, so the projection must name it or the reason is lost.
+   */
+  const REVIEW_STATUS_FIELDS = [
+    'dates', 'games', 'gamePk', 'season',
+    'status', 'abstractGameState', 'codedGameState', 'detailedState',
+    'statusCode', 'reason', 'startTimeTBD', 'abstractGameCode',
+  ];
+
+  async function getReviewStatus(dateStr, options = {}) {
+    const url = `${V1}/schedule?sportId=${SPORT_ID}&date=${dateStr}` +
+                `&fields=${REVIEW_STATUS_FIELDS.join(',')}`;
+    // Small payload, so fail fast: a stalled sweep must not hold the watcher
+    // loop. The next tick (250ms later) retries; the ordinary schedule cache
+    // keeps working meanwhile.
+    const data = await getJSON(url, { timeout: 2500, retries: 0, ...options });
+    const dates = (data && data.dates) || [];
+    return dates.length ? dates[0].games || [] : [];
+  }
+
+  /**
+   * Official status of ONE game — a ~150-byte projection of feed/live.
+   *
+   * Verified live (statsapi.mlb.com, 2026-09-02, game 824470 in progress):
+   *   GET /api/v1.1/game/824470/feed/live?fields=gameData,status,
+   *       abstractGameState,codedGameState,detailedState,statusCode,reason,
+   *       startTimeTBD,abstractGameCode
+   *   -> {"gameData":{"status":{"abstractGameState":"Live",
+   *      "codedGameState":"I","detailedState":"In Progress",
+   *      "statusCode":"I","startTimeTBD":false,"abstractGameCode":"L"}}}
+   *
+   * The game page uses this to learn that a review started WITHOUT waiting
+   * for the 1-2 MB full feed it otherwise downloads every cycle: the status
+   * is the field that flips first (see REVIEW_STATUS_BY_CODE in reviews.js),
+   * and it is the only field this projection asks for.
+   */
+  const GAME_STATUS_FIELDS = 'fields=gameData,status,abstractGameState,' +
+    'codedGameState,detailedState,statusCode,reason,startTimeTBD,abstractGameCode';
+
+  async function getGameStatus(gamePk, options = {}) {
+    const opts = { timeout: 2500, retries: 0, ...options };
+    try {
+      return await getJSON(`${V11}/game/${gamePk}/feed/live?${GAME_STATUS_FIELDS}`, opts);
+    } catch (err) {
+      if (!isLegacyFeedMiss(err)) throw err;
+      return await getJSON(`${V1}/game/${gamePk}/feed/live?${GAME_STATUS_FIELDS}`, opts);
+    }
+  }
+
+  /**
    * Full live feed for one game (the "Gameday" payload).
    * Tries v1.1 first (the version the schedule links to), falls back to v1,
    * then assembles a bundle from the older split endpoints.
@@ -360,7 +432,8 @@ const MLB = (() => {
   }
 
   return {
-    getSchedule, getLiveFeed, getPlayByPlay, getTeams, getChallengeCounts,
+    getSchedule, getReviewStatus, getGameStatus, getLiveFeed, getPlayByPlay,
+    getTeams, getChallengeCounts,
     teamLogoUrl, teamLogoFallbackUrl, headshotUrl,
     ordinal, localTime, localDate, localDateTime,
     inningLabel, inningGlyph, sides, scoreOf,

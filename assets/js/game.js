@@ -33,6 +33,38 @@
   let lastActiveReview = false;
   let activeTab = 'plays';
   let requestInFlight = false;
+  // Incremented on every load() so an out-of-band status probe from an older
+  // cycle can never write into a newer one.
+  let loadCycle = 0;
+
+  /**
+   * Is this official game `status` a review/challenge state?
+   *
+   * Registry authority: GET https://statsapi.mlb.com/api/v1/gameStatus
+   * (verified live 2026-09-02). Every review state is statusCode M*
+   * (manager/player challenge), N* (umpire review) or IH ("Instant Replay");
+   * codedGameState "M"/"N" belong to those and nothing else, while "I" alone
+   * is plain "In Progress" and must NOT match. The text test is the fallback
+   * for a payload with only detailedState, and it includes "instant replay" —
+   * the verbatim registry wording the old /challenge|review/i test missed, so
+   * crew-chief reviews previously never reached the 250ms probe cadence here.
+   *
+   * Same self-contained predicate as reviews-feed.js / scoreboard.js / ui.js
+   * (they cannot all assume reviews.js is loaded); tools/review-status-test.mjs
+   * walks the full registry and asserts every copy agrees with
+   * MLBReviews.isReviewGameStatus.
+   */
+  function statusSaysReview(status) {
+    if (window.MLBReviews && typeof window.MLBReviews.isReviewGameStatus === 'function') {
+      return window.MLBReviews.isReviewGameStatus(status);
+    }
+    if (!status || typeof status !== 'object') return false;
+    const code = String(status.statusCode || '').trim().toUpperCase();
+    if (/^[MN][A-Z]$/.test(code) || code === 'IH') return true;
+    const coded = String(status.codedGameState || '').trim().toUpperCase();
+    if (coded === 'M' || coded === 'N') return true;
+    return /challenge|review|instant replay/i.test(String(status.detailedState || ''));
+  }
 
   /* ------------------------------------------------------------------ boot */
 
@@ -105,6 +137,7 @@
     if (!gamePk || requestInFlight) return;
     requestInFlight = true;
     lastCycleStartedAt = Date.now();
+    const cycle = (loadCycle += 1);
     if (showSpinner && !feed) $('#loading').classList.add('visible');
     try {
       let data;
@@ -136,6 +169,31 @@
           scheduleNext();
           return;
         }
+      }
+      // LATENCY: while the game is live and NOT already known to be in review,
+      // race a ~150-byte status projection against the 1-2MB full feed. The
+      // official status is the field that flips first when a review is called
+      // (registry: GET /api/v1/gameStatus — statusCode M*/N*/IH), so this is
+      // how the page learns "under review" in one small round trip instead of
+      // after the whole feed has downloaded. It never replaces the full feed:
+      // renderAll() below still decides everything from the authoritative
+      // payload, and the `cycle` guard makes a late probe a no-op.
+      if (!lastActiveReview && isLive() && MLB.getGameStatus) {
+        MLB.getGameStatus(gamePk, { timeout: PROBE_TIMEOUT_MS, retries: 0 })
+          .then((statusFeed) => {
+            if (cycle !== loadCycle || !requestInFlight) return;
+            const st = statusFeed && statusFeed.gameData && statusFeed.gameData.status;
+            if (!statusSaysReview(st)) return;
+            // Flip the cadence immediately so the NEXT tick is the 250ms
+            // review probe, and say so now rather than after the feed lands.
+            lastActiveReview = true;
+            const line = $('#status-line');
+            if (line) {
+              line.textContent =
+                `🚨 ${(st.detailedState || 'Review in progress')} — loading details…`;
+            }
+          })
+          .catch(() => { /* the full feed below is the authority */ });
       }
       data = await MLB.getLiveFeed(gamePk);
       const token = feedToken(data);

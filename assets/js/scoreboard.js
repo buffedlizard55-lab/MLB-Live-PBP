@@ -77,15 +77,36 @@
     }
   }
 
+  /**
+   * Is this game under review RIGHT NOW?
+   *
+   * Single source of truth for the whole page: MLBReviews' registry lookup
+   * (official `status.statusCode` / `codedGameState` from
+   * GET /api/v1/gameStatus — M* manager challenge, N* umpire review, IH
+   * instant replay, MJ/NJ ABS pitch challenge), with the same self-contained
+   * fallback the Replay Feed uses when reviews.js has not loaded. The old
+   * `/challenge|review/i` word match missed "Instant Replay" (crew-chief
+   * review, statusCode IH) outright, so those reviews never raised the
+   * ticker, never counted in the Challenges tab, and never dropped this page
+   * to the 250ms cadence.
+   */
+  function gameIsUnderReview(game) {
+    const status = (game && game.status) || null;
+    if (!status) return false;
+    if (window.MLBReviews && typeof window.MLBReviews.isReviewGameStatus === 'function') {
+      return window.MLBReviews.isReviewGameStatus(status);
+    }
+    const code = String(status.statusCode || '').trim().toUpperCase();
+    if (/^[MN][A-Z]$/.test(code) || code === 'IH') return true;
+    const coded = String(status.codedGameState || '').trim().toUpperCase();
+    if (coded === 'M' || coded === 'N') return true;
+    return /challenge|review|instant replay/i.test(String(status.detailedState || ''));
+  }
+
   function scheduleNext(overrideMs) {
     clearTimeout(pollTimer);
     const hasLiveGame = games.some((g) => g.status.abstractGameState === 'Live');
-    const hasActiveReview = games.some((g) => {
-      const inspection = window.MLBReviews
-        ? window.MLBReviews.inspectScheduleGame(g)
-        : { hasActiveReview: false };
-      return inspection.hasActiveReview;
-    });
+    const hasActiveReview = games.some(gameIsUnderReview);
     const interval = overrideMs != null ? overrideMs
       : (hasActiveReview ? REVIEW_POLL_MS : hasLiveGame ? LIVE_POLL_MS : IDLE_POLL_MS);
     // Cadence is the gap between poll STARTS (same semantics as the game page
@@ -120,10 +141,7 @@
     games.forEach((g) => {
       const key = byState[g.status.abstractGameState] ? g.status.abstractGameState : 'Other';
       byState[key].push(g);
-      const inspection = window.MLBReviews ? window.MLBReviews.inspectScheduleGame(g) : { hasActiveReview: false };
-      if (inspection.hasActiveReview || /challenge|review/i.test((g.status && g.status.detailedState) || '')) {
-        gamesWithReviews.push(g);
-      }
+      if (gameIsUnderReview(g)) gamesWithReviews.push(g);
     });
 
     // Scoreboard Review Alert Banner if any games are currently under review/challenge
@@ -136,10 +154,7 @@
       if (filter === 'live') return g.status.abstractGameState === 'Live';
       if (filter === 'scheduled') return g.status.abstractGameState === 'Preview';
       if (filter === 'final') return g.status.abstractGameState === 'Final';
-      if (filter === 'challenges') {
-        const inspection = window.MLBReviews ? window.MLBReviews.inspectScheduleGame(g) : { hasActiveReview: false };
-        return inspection.hasActiveReview || /challenge|review/i.test((g.status && g.status.detailedState) || '');
-      }
+      if (filter === 'challenges') return gameIsUnderReview(g);
       return true;
     });
 

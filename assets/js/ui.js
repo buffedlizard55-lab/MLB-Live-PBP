@@ -109,7 +109,20 @@ const UI = (() => {
 
   function statusChip(status, labelOverride) {
     const detailed = status && status.detailedState;
-    const isReview = /challenge|review/i.test(detailed || '');
+    // Registry-based review detection (official statusCode/codedGameState via
+    // MLBReviews, self-contained fallback otherwise). "Instant Replay" — the
+    // crew-chief review state, statusCode IH — contains neither "challenge"
+    // nor "review", so the old word match rendered it as a plain grey chip
+    // with no pulse.
+    const isReview = (window.MLBReviews && typeof window.MLBReviews.isReviewGameStatus === 'function')
+      ? window.MLBReviews.isReviewGameStatus(status)
+      : (() => {
+        const code = String((status && status.statusCode) || '').trim().toUpperCase();
+        if (/^[MN][A-Z]$/.test(code) || code === 'IH') return true;
+        const coded = String((status && status.codedGameState) || '').trim().toUpperCase();
+        if (coded === 'M' || coded === 'N') return true;
+        return /challenge|review|instant replay/i.test(String(detailed || ''));
+      })();
     const meta = STATUS_META[detailed] || (isReview ? { cls: 'chip-review', label: detailed } :
                  { cls: 'chip-muted', label: detailed || (status && status.abstractGameState) });
     const label = labelOverride || meta.label;
