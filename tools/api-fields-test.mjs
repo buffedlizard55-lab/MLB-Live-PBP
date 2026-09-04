@@ -87,9 +87,12 @@ assert.match(requests[0].url, /^https:\/\/statsapi\.mlb\.com\/api\/v1\/game\/822
 assert.equal(pbp.projected, true, 'the projected response is returned as-is');
 
 /* 2. The projection must contain every field the PROJECTED playback is read
- *    by. The projected playByPlay is consumed only by:
+ *    by. The projected playByPlay is consumed by:
  *      - reviews.js extractReviews() (via reviews-feed.js ingestGame →
  *        window.MLBReviews.extractReviews) — the feed's review rows
+ *      - reviews-feed.js official-scoring-change tracker (buildScoringSnapshot
+ *        / scoringChangeSummary / scoringChangeBlock) — the ✏️ Scoring
+ *        Changes rows: classification diffs over result + runners[].movement
  *      - game.js reviewProbeState() — the 250ms in-review probe
  *    Every name below is a HARD read on that path; citations are
  *    `<file>:<line>` in the current source. */
@@ -112,8 +115,10 @@ const REQUIRED = [
   ['event', 'reviews.js:116,117,159,192,528,529,588'],
   ['eventType', 'reviews.js:116,159,528,544,588,589'],
   ['description', 'reviews.js:118,159,192,590'],
-  ['awayScore', 'reviews.js:481,484 (readScorePair(result))'],
-  ['homeScore', 'reviews.js:481,484 (readScorePair(result))'],
+  ['awayScore', 'reviews.js:481,484 (readScorePair(result)); reviews-feed.js buildScoringSnapshot awayScore'],
+  ['homeScore', 'reviews.js:481,484 (readScorePair(result)); reviews-feed.js buildScoringSnapshot homeScore'],
+  ['isOut', 'reviews-feed.js buildScoringSnapshot result.isOut + movement.isOut (scoring classification diff)'],
+  ['rbi', 'reviews-feed.js buildScoringSnapshot result.rbi (RBI-change irregularity diff)'],
   // play.matchup (reviews.js resolveChallenger / buildAbsContext)
   ['matchup', 'reviews.js:366-368'],
   ['batter', 'reviews.js:233,367,373,979'],
@@ -141,11 +146,14 @@ const REQUIRED = [
   ['challengeTeamId', 'reviews.js:355,366,380,396,400,408,433'],
   // event-level details (reviews.js description extraction; game.js probe)
   ['details', 'reviews.js:114,147,591; game.js:93,184,186,203,204'],
-  // scoring runners (reviews.js reviewedScoringRunners / deriveScoreImpact)
+  // scoring runners (reviews.js reviewedScoringRunners / deriveScoreImpact;
+  // reviews-feed.js buildScoringSnapshot movement signature)
   ['runners', 'reviews.js:515'],
-  ['movement', 'reviews.js:597 (movement.outBase)'],
-  ['outBase', 'reviews.js:597'],
-  ['runner', 'reviews.js:618 (runner.details.runner.fullName)'],
+  ['movement', 'reviews.js:597 (movement.outBase); reviews-feed.js buildScoringSnapshot movement sig'],
+  ['outBase', 'reviews.js:597; reviews-feed.js buildScoringSnapshot (OUT:<base> label)'],
+  ['originBase', 'reviews-feed.js buildScoringSnapshot movement signature (originBase leg)'],
+  ['end', 'reviews-feed.js buildScoringSnapshot movement.end endpoint leg'],
+  ['runner', 'reviews.js:618 (runner.details.runner.fullName); reviews-feed.js footer/scoring labels'],
   ['isScoringEvent', 'reviews.js:517'],
   ['playIndex', 'reviews.js:531,534,541'],
 ];
@@ -154,10 +162,10 @@ const REQUIRED = [
  * and protect against the API pruning a named container's children. These
  * are kept deliberately — they are NOT claimed as reads of the projected
  * payload (they feed the full-feed render path in game.js: batSide/pitchHand
- * at 522/583/660-661/1179-1181, details.call at 1164, rbi at 1148,
- * movement.start/end/isOut at 1230). */
-const GUARD = ['isTopInning', 'rbi', 'isOut', 'batSide', 'pitchHand',
-  'call', 'start', 'end'];
+ * at 522/583/660-661/1179-1181, details.call at 1164, movement.start at
+ * 1230). `rbi`, `isOut` and `end` were promoted to REQUIRED when the
+ * official-scoring-change tracker became a third projected-payload consumer. */
+const GUARD = ['isTopInning', 'batSide', 'pitchHand', 'call', 'start'];
 
 const fieldsParam = new URL(requests[0].url).searchParams.get('fields');
 const included = new Set(fieldsParam.split(','));

@@ -239,10 +239,14 @@ const CHALLENGE_COUNTS = {
 };
 
 const callCounts = { schedule: 0, teams: 0, pbp: 0, counts: 0 };
+// The served playByPlay payload is mutable so later sections can drive a
+// second/third poll with a changed play (the official-scoring-change test at
+// the bottom of this file). Until reassigned it is the captured fixture.
+let pbpPayload = PBP;
 const MLBStub = {
   getSchedule: async () => { callCounts.schedule += 1; return SCHEDULE_GAMES; },
   getTeams: async () => { callCounts.teams += 1; return TEAMS_DIR; },
-  getPlayByPlay: async () => { callCounts.pbp += 1; return PBP; },
+  getPlayByPlay: async () => { callCounts.pbp += 1; return pbpPayload; },
   getChallengeCounts: async () => { callCounts.counts += 1; return CHALLENGE_COUNTS; },
   // Mirrors MLB.ordinal in assets/js/api.js exactly.
   ordinal: (n) => {
@@ -622,3 +626,137 @@ assert.match(registry['#status-line'].textContent, /1 game · 3 review events ·
   'second poll does not double-count events (still 3 tracked)');
 
 console.log('Replay-feed render test passed successfully!');
+
+/* ============================================================ 9. OFFICIAL
+ * SCORING-CHANGE tracker — end-to-end through the REAL boot path. Poll A
+ * establishes a completed play's baseline classification (single); poll B
+ * serves the SAME play officially rescored to a field error — the exact
+ * real-world flow of MLB's official scoring changes (see
+ * docs/scoring-changes.md; live-verified precedents: 2026 log change #230,
+ * Vladimir Guerrero Jr. double→single on 8/30, and #232, Munetaka Muramoto
+ * single→fielder's choice + error on 8/29). The play itself is deterministic
+ * fixture data built on the verified live field vocabulary. */
+
+// A completed play with a real classification (deterministic, verified shape).
+const SCORING_PLAY_BASE = {
+  about: { atBatIndex: 21, startTime: '2026-08-19T19:10:00Z', endTime: '2026-08-19T19:12:00Z', inning: 7, halfInning: 'bottom', isTopInning: false, isComplete: true, hasReview: false },
+  count: { balls: 1, strikes: 2, outs: 1 },
+  matchup: { batter: { id: 668804, fullName: 'Bryan Reynolds' }, pitcher: { id: 695549, fullName: 'Jackson Jobe' } },
+  runners: [
+    { movement: { originBase: null, start: null, end: '1B', outBase: null, isOut: false, outNumber: null }, details: { event: 'Single', eventType: 'single', movementReason: null, runner: { fullName: 'Bryan Reynolds' }, responsiblePitcher: null, isScoringEvent: false, rbi: false, earned: false, teamUnearned: false, playIndex: 1 } },
+  ],
+};
+const PBP_BASELINE = {
+  ...PBP,
+  allPlays: [...PBP.allPlays, {
+    ...SCORING_PLAY_BASE,
+    result: { event: 'Single', eventType: 'single', description: 'Bryan Reynolds singles on a line drive to left fielder Riley Greene.', rbi: 0, awayScore: 3, homeScore: 1, isOut: false },
+  }],
+};
+const PBP_RESCORED = {
+  ...PBP,
+  allPlays: [...PBP.allPlays, {
+    ...SCORING_PLAY_BASE,
+    result: { event: 'Field Error', eventType: 'field_error', description: 'Bryan Reynolds reaches on a fielding error by third baseman Hao-Yu Lee.', rbi: 0, awayScore: 3, homeScore: 1, isOut: false },
+  }],
+};
+
+// Poll A — baseline poll: the completed play is snapshotted, NO row yet.
+pbpPayload = PBP_BASELINE;
+context.window.ReplayFeed.refresh();
+await new Promise((r) => setImmediate(r));
+await new Promise((r) => setImmediate(r));
+await new Promise((r) => setImmediate(r));
+assert.equal(callCounts.pbp, 3, 'poll A fetched the playByPlay once more');
+let allRowsA = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
+assert.equal(allRowsA.length, 2, 'a baseline observation mints no scoring-change row');
+assert.match(registry['#status-line'].textContent, /3 review events/,
+  'baselines do not enter the event feed');
+
+// Poll B — the official scorer changes the single to a field error: the row
+// appears in the ALL feed with the observed initial call and final ruling.
+pbpPayload = PBP_RESCORED;
+context.window.ReplayFeed.refresh();
+await new Promise((r) => setImmediate(r));
+await new Promise((r) => setImmediate(r));
+await new Promise((r) => setImmediate(r));
+assert.equal(callCounts.pbp, 4, 'poll B fetched the playByPlay once more');
+
+allRowsA = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
+assert.equal(allRowsA.length, 3, 'the scoring-change row renders in the All feed');
+const scoringRow = allRowsA.find((row) => row.dataset.key === '823342:scoring-21');
+assert.ok(scoringRow, `scoring row carries the stable key, got: ${allRowsA.map((r) => r.dataset.key).join(', ')}`);
+const scoringStrings = [];
+collectStrings(scoringRow, scoringStrings);
+const scoringBlob = scoringStrings.join(' | ');
+assert.ok(scoringBlob.includes('Scoring Change'), 'type chip');
+assert.ok(scoringBlob.includes('Rescored'), 'outcome pill');
+assert.ok(scoringBlob.includes('Single'), `initial call label, got: ${scoringBlob}`);
+assert.ok(scoringBlob.includes('Field Error'), `final ruling label, got: ${scoringBlob}`);
+assert.ok(scoringBlob.includes('→'), 'initial → final arrow');
+assert.ok(/Initial call \(observed .*\): Bryan Reynolds singles/.test(scoringBlob),
+  `initial call line with observation time, got: ${scoringBlob}`);
+assert.ok(scoringBlob.includes('Final ruling: Bryan Reynolds reaches on a fielding error'),
+  `final ruling line, got: ${scoringBlob}`);
+assert.ok(scoringBlob.includes('Official scoring change — no replay review observed'),
+  `attribution note, got: ${scoringBlob}`);
+assert.ok(scoringBlob.includes('Batting: PIT'), 'batting-side chip (bottom half → home)');
+assert.ok(scoringBlob.includes('Batter: Bryan Reynolds'), 'batter footer');
+assert.ok(scoringBlob.includes('Pitcher: Jackson Jobe'), 'pitcher footer');
+assert.ok(scoringBlob.includes('Detroit Tigers @ Pittsburgh Pirates'), 'official matchup');
+assert.ok(!scoringBlob.includes('undefined'), `scoring row leaked "undefined": ${scoringBlob}`);
+assert.ok(!scoringRow.cls.includes('feed-row-run-risk'),
+  'a scoring change is never flagged run-at-risk');
+assert.equal(findIn(scoringRow, '.feed-run-risk-badge'), null,
+  'no run-at-risk badge on a scoring-change row');
+assert.equal(findIn(scoringRow, '.feed-scoring-call-hit') ? 'hit' : 'none', 'hit',
+  'the initial call chip carries its category class');
+assert.ok(findIn(scoringRow, '.feed-scoring-call-error'), 'the final ruling chip carries its category class');
+
+// Stats: the Scoring Changes stat appears; Events (the All count) includes it.
+const statPairsB = {};
+registry['#feed-stats'].children.forEach((item) => {
+  const label = findIn(item, '.review-stat-label');
+  const value = findIn(item, '.review-stat-value');
+  if (label && value) statPairsB[label.text] = value.text;
+});
+assert.equal(statPairsB['Scoring Changes'], '1',
+  `Scoring Changes stat appears with its count, got: ${JSON.stringify(statPairsB)}`);
+assert.equal(statPairsB['Events'], '3', 'Events counts the All section including scoring changes');
+assert.equal(statPairsB['Scoring Pending'], '1', 'Scoring Pending unchanged');
+
+// Tabs: the ✏️ Scoring Changes tab exists, is wired, and shows the row.
+const tabStringsB = [];
+collectStrings(registry['#feed-tabs'], tabStringsB);
+assert.ok(tabStringsB.some((s) => /^✏️ Scoring Changes \(1\)$/.test(s)),
+  `Scoring Changes tab renders with its count, got: ${JSON.stringify(tabStringsB)}`);
+assert.ok(tabStringsB.some((s) => /^All \(3\)$/.test(s)),
+  `All tab counts scoring changes in, got: ${JSON.stringify(tabStringsB)}`);
+assert.ok(tabStringsB.some((s) => s === "ReplayFeed.setFilter('scoring')"),
+  "Scoring Changes tab wires ReplayFeed.setFilter('scoring')");
+context.window.ReplayFeed.setFilter('scoring');
+const scoringOnly = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
+assert.equal(scoringOnly.length, 1, 'the Scoring Changes tab shows exactly the scoring row');
+assert.equal(scoringOnly[0].dataset.key, '823342:scoring-21');
+// A scoring change is a NOT a replay: the Under Review tab shows the
+// in-progress manager challenge (fixture idx 15) but never the scoring row.
+context.window.ReplayFeed.setFilter('live');
+const liveRows = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
+assert.equal(liveRows.length, 1, 'the Under Review tab stays replay-only');
+assert.notEqual(liveRows[0].dataset.key, '823342:scoring-21',
+  'the scoring-change row never appears under Under Review');
+context.window.ReplayFeed.setFilter('all');
+assert.equal(registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row')).length, 3,
+  'All restores the scoring row');
+
+// Poll C — idempotence: the same rescored payload again must not duplicate.
+context.window.ReplayFeed.refresh();
+await new Promise((r) => setImmediate(r));
+await new Promise((r) => setImmediate(r));
+await new Promise((r) => setImmediate(r));
+const rowsAfterScoringReboot = registry['#feed-list'].children.filter((c) => c.cls.includes('feed-row'));
+assert.equal(rowsAfterScoringReboot.length, 3, 're-polling the rescored payload adds no rows');
+assert.equal(rowsAfterScoringReboot.filter((r) => r.dataset.key === '823342:scoring-21').length, 1,
+  'exactly one scoring-change row for the play');
+
+console.log('Official scoring-change render checks passed.');

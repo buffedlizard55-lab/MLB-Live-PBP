@@ -311,8 +311,9 @@ const MLB = (() => {
     // review markers (manager ABS / under-review / official-scorer pending
     // detection reads eventType/event/description on details AND result)
     'reviewDetails', 'inProgress', 'isOverturned', 'reviewType', 'challengeTeamId',
-    // scoring runners (run-at-risk model)
-    'runners', 'movement', 'start', 'end', 'outBase',
+    // scoring runners (run-at-risk model; official-scoring-change tracker's
+    // movement signature reads originBase → end / outBase)
+    'runners', 'movement', 'start', 'end', 'outBase', 'originBase',
     'runner', 'isScoringEvent', 'playIndex',
   ];
 

@@ -322,6 +322,12 @@ function mergeFeedEvents(state, gamePk, reviews, playsByAtBatIndex) {
       }
       return;
     }
+    // Official scoring changes are NOT produced by extractReviews() — they
+    // come from mergeScoringChanges() and live in feedState permanently (a
+    // tracked rescore must never vanish just because the review extractor
+    // does not emit them). Leave them untouched here; their lifecycle is
+    // owned entirely by mergeScoringChanges().
+    if (pendingReview && pendingReview.typeKey === 'scoring_change') return;
 
     seen.delete(key);
     const orderIdx = order.indexOf(key);
@@ -552,10 +558,11 @@ function gameTeamsLabel(game, teamsById) {
 /**
  * Whether a review should trigger the audio alert (gentle raindrop chime).
  * Requirement: challenges, reviews, boundary calls, official-scorer pending
- * rulings, but NOT ABS. ABS is typeKey 'abs'. Everything else (manager,
- * crew_chief, boundary, review, rules, umpire, pending_scoring) qualifies —
- * an official-scorer pending ruling is exactly what the user wants to hear
- * about immediately. Pure function — no DOM.
+ * rulings AND official scoring changes, but NOT ABS. ABS is typeKey 'abs'.
+ * Everything else (manager, crew_chief, boundary, review, rules, umpire,
+ * pending_scoring, scoring_change) qualifies — an official-scorer pending
+ * ruling is exactly what the user wants to hear about immediately, and so is
+ * a hit/error/out reclassification observed between polls. Pure — no DOM.
  */
 function shouldAlertForReview(review) {
   if (!review || typeof review.typeKey !== 'string') return false;
@@ -566,11 +573,12 @@ function shouldAlertForReview(review) {
  * Whether a feed entry belongs in the "All" section of the Replay Feed.
  *
  * Requirement: All shows manager challenges, crew-chief/umpire reviews,
- * boundary calls, "under review" status entries and run-at-risk entries —
- * but NOT ABS pitch challenges. ABS stays fully tracked (its own "ABS"
- * filter tab, the "ABS Challenges" stat, and the official challenges-
- * remaining counters) but lives in its own section, and it stays silent
- * (shouldAlertForReview() above).
+ * boundary calls, "under review" status entries, run-at-risk entries AND
+ * official scoring changes — but NOT ABS pitch challenges. ABS stays fully
+ * tracked (its own "ABS" filter tab, the "ABS Challenges" stat, and the
+ * official challenges-remaining counters) but lives in its own section, and
+ * it stays silent (shouldAlertForReview() above). Scoring changes show up in
+ * the All feed (by explicit request) and in their own "Scoring Changes" tab.
  *
  * `typeKey === 'abs'` is produced ONLY from the official StatsAPI code
  * "MJ" or explicit ABS text in the official play descriptions
@@ -824,6 +832,489 @@ function gameChallengeLine(counts, labels, prefix) {
   return `${prefix || 'Challenges left'}: ${[away, home].filter(Boolean).join(' — ')}`;
 }
 
+/* ================================================== official scoring changes
+ *
+ * OFFICIAL SCORING-CHANGE TRACKER (hit ↔ error, single ↔ double, out ↔ hit,
+ * hit → fielder's choice + error, …).
+ *
+ * HOW A SCORING CHANGE IS KNOWABLE AT ALL
+ *   The StatsAPI carries NO marker for a rescored play. A play changed by the
+ *   official scorer (or by the Elias Sports Bureau, or after a player/club
+ *   review — all are "Official Scoring changes" per MLB's own log at
+ *   https://www.mlb.com/official-information/scoring-changes) is simply
+ *   REWRITTEN in place: `result.eventType` / `result.event` /
+ *   `result.description` / `runners[]` change, and nothing flags the play as
+ *   "changed" (verified live 2026-09-04 against two REAL rescored plays:
+ *   game 822766 atBatIndex 36 — official change #230, "originally ruled a
+ *   double … changed to a single", now reads eventType "single"; game 822769
+ *   atBatIndex 59 — official change #232, "originally ruled a base hit …
+ *   changed to a fielder's choice and error", now reads eventType
+ *   "fielders_choice" plus a runners[] movement with details.eventType
+ *   "error"). The ONLY way to observe both the initial call and the final
+ *   ruling is to snapshot every completed play on each poll and diff — which
+ *   is exactly what this tracker does against the playByPlay scan this page
+ *   already runs every 250–500ms.
+ *
+ * WHAT IS COMPARED (the "scoring signature")
+ *   Only fields the official payload uses to classify the play:
+ *     result.eventType / result.isOut / count.outs
+ *     runner-level error movements (runners[].details.eventType)
+ *     runner movement endpoints (originBase → end / outBase)
+ *   Description, RBI and score are ANNOTATIONS: if they change without a
+ *   signature change (a retroactive wording/RBI/score fix) the tracker does
+ *   not mint a hit/error/out row — it flags the play as an IRREGULARITY for
+ *   review, because something official changed but not the play's
+ *   classification.
+ *
+ * WHAT IS NOT TRACKABLE (stated honestly, never invented)
+ *   - A change that landed before this page observed the play (page opened
+ *     after the change, or the change was published while the tab was
+ *     closed): there is no initial call on record, so there is no row. The
+ *     official log above remains the only source for those.
+ *   - A play whose FIRST observed result was the official-scorer PENDING
+ *     marker (os_ruling_pending_primary / os_ruling_pending_prior) or an
+ *     unclassified result: there is no initial hit/error/out call to track —
+ *     that flow is already covered by the ⚖️ Scoring Pending feature.
+ * ==========================================================================*/
+
+const SCORING_CHANGE_TYPE_KEY = 'scoring_change';
+const SCORING_CHANGE_LABEL = 'Scoring Change';
+
+/**
+ * Official StatsAPI event-type registry subsets — GET /api/v1/eventTypes
+ * (statsapi.mlb.com, fetched live 2026-09-04).
+ *
+ *   `hit: true` is set on EXACTLY these four codes (all plateAppearance):
+ *     single "Single", double "Double", triple "Triple", home_run "Home Run".
+ *   The ONLY plate-appearance error code is field_error "Field Error".
+ *   The ONLY other error code is error "Error" (baseRunningEvent: true) —
+ *     it appears in runners[].details.eventType when a runner's advance or
+ *     putout is charged as an error (verified live 2026-09-04: game 824796
+ *     atBatIndex 56, "advances to 2nd, on a throwing error …" carries a
+ *     runners[] movement with details.eventType "error").
+ *   Both os_ruling_pending_* codes mean "no official ruling yet".
+ *
+ * Everything else (field_out, force_out, strikeout, fielders_choice,
+ * sac_fly, walk, …) is classified by the payload's own result.isOut flag and
+ * labelled with the payload's own result.event text — never by paraphrase.
+ */
+const SCORING_HIT_EVENT_TYPES = new Set(['single', 'double', 'triple', 'home_run']);
+const SCORING_PA_ERROR_EVENT_TYPES = new Set(['field_error']);
+const SCORING_RUNNER_ERROR_EVENT_TYPES = new Set(['error', 'field_error']);
+// Self-contained copy of the official pending codes (see reviews.js
+// OFFICIAL_SCORER_PENDING_TYPES — registry-verified; tools/scoring-change-test.mjs
+// asserts both copies agree so they cannot drift).
+const SCORING_PENDING_EVENT_TYPES = new Set([
+  'os_ruling_pending_primary',
+  'os_ruling_pending_prior',
+]);
+
+/**
+ * One observed scoring snapshot of a COMPLETED play, read only from fields
+ * verified in the live playByPlay payload (2026-09-04):
+ *   play.about.atBatIndex / .isComplete / .hasReview / .endTime / .inning /
+ *     .halfInning, play.result.eventType / .event / .description / .isOut /
+ *     .rbi / .awayScore / .homeScore, play.count.outs, play.runners[].details
+ *     .eventType, play.runners[].movement.{originBase,end,outBase,isOut}.
+ * Returns null when the play has no official classification to diff yet:
+ * not complete, no result.eventType, or the official-scorer PENDING marker.
+ * Pure; never throws.
+ */
+function buildScoringSnapshot(play) {
+  if (!play || typeof play !== 'object') return null;
+  const about = play.about || {};
+  const result = play.result || {};
+  const idx = about.atBatIndex;
+  if (idx == null) return null;
+  if (about.isComplete !== true) return null; // at-bat still in progress
+  const eventType = typeof result.eventType === 'string' ? result.eventType : '';
+  if (!eventType) return null; // nothing officially classified yet
+  if (SCORING_PENDING_EVENT_TYPES.has(eventType)) return null; // no ruling yet
+  const runners = Array.isArray(play.runners) ? play.runners : [];
+  let errorMovements = 0;
+  const movements = [];
+  runners.forEach((runner) => {
+    if (!runner || typeof runner !== 'object') return;
+    const details = runner.details || {};
+    const movement = runner.movement || {};
+    const detType = typeof details.eventType === 'string' ? details.eventType : '';
+    // Runner-level error advances only count when the plate appearance
+    // itself is NOT the error: on a field_error play the runners carry the
+    // same field_error code for the batter and every forced advance
+    // (verified live 2026-09-04, game 824388 atBatIndex 42) — the error is
+    // already the play's classification, not an extra movement on it.
+    if (!SCORING_PA_ERROR_EVENT_TYPES.has(eventType) &&
+        SCORING_RUNNER_ERROR_EVENT_TYPES.has(detType)) {
+      errorMovements += 1;
+    }
+    const endLabel = movement.end != null
+      ? movement.end
+      : (movement.outBase != null ? `OUT:${movement.outBase}` : '-');
+    movements.push([
+      detType || '-',
+      movement.originBase != null ? movement.originBase : '-',
+      endLabel,
+      movement.isOut === true ? 'out' : 'safe',
+    ].join(':'));
+  });
+  movements.sort();
+  return {
+    atBatIndex: idx,
+    eventType,
+    event: typeof result.event === 'string' ? result.event : eventType,
+    description: typeof result.description === 'string' ? result.description : '',
+    isOut: result.isOut === true,
+    outsAfter: play.count && typeof play.count.outs === 'number' ? play.count.outs : null,
+    awayScore: typeof result.awayScore === 'number' ? result.awayScore : null,
+    homeScore: typeof result.homeScore === 'number' ? result.homeScore : null,
+    rbi: typeof result.rbi === 'number' ? result.rbi : null,
+    errorMovements,
+    movementSig: movements.join('|'),
+    hasReview: about.hasReview === true,
+    endTime: about.endTime || null,
+    inning: typeof about.inning === 'number' ? about.inning : null,
+    halfInning: typeof about.halfInning === 'string' ? about.halfInning : null,
+  };
+}
+
+/** The diffed classification signature of one snapshot (annotations excluded). */
+function scoringSnapshotSignature(snapshot) {
+  if (!snapshot) return '';
+  return [
+    snapshot.eventType || '-',
+    snapshot.isOut ? 'out' : 'safe',
+    snapshot.outsAfter != null ? snapshot.outsAfter : '-',
+    snapshot.errorMovements,
+    snapshot.movementSig || '',
+  ].join('|');
+}
+
+/** Hit / error / out / other — from the official registry flags + result.isOut. */
+function scoringCategory(snapshot) {
+  if (!snapshot) return null;
+  if (SCORING_HIT_EVENT_TYPES.has(snapshot.eventType)) return 'hit';
+  if (SCORING_PA_ERROR_EVENT_TYPES.has(snapshot.eventType)) return 'error';
+  if (snapshot.isOut === true) return 'out';
+  return 'other';
+}
+
+/** Official label for one snapshot, e.g. "Single", "Field Error", "Single + Error". */
+function scoringEventLabel(snapshot) {
+  if (!snapshot) return null;
+  const base = isUsableName(snapshot.event) ? snapshot.event : (snapshot.eventType || 'Unknown');
+  return snapshot.errorMovements > 0 ? `${base} + Error` : base;
+}
+
+/** Self-contained inning label ("▲ Top 3") — no dependency on MLB.ordinal. */
+function scoringInningLabel(about) {
+  const inning = about && about.inning;
+  if (typeof inning !== 'number' || !Number.isFinite(inning)) return '';
+  const half = String((about && about.halfInning) || '').toLowerCase();
+  const n10 = inning % 100;
+  const suffix = (n10 >= 11 && n10 <= 13) ? 'th'
+    : (['th', 'st', 'nd', 'rd'][inning % 10] || 'th');
+  const prefix = half === 'top' ? '▲ Top' : half === 'bottom' ? '▼ Bot' : '';
+  return `${prefix} ${inning}${suffix}`.trim();
+}
+
+/**
+ * Attribution for one observed classification change, decided ONLY from
+ * observed facts (never guessed):
+ *   - the play itself carries about.hasReview, OR a replay review was ACTIVE
+ *     for this exact at-bat when the change landed → "replay review";
+ *   - the play carried an official-scorer PENDING marker that has now
+ *     resolved → "pending ruling resolved";
+ *   - otherwise there is no replay-review trace on the play → the change is
+ *     an official scoring change (scorer / Elias / player-club review —
+ *     MLB's official log lists all three).
+ */
+function scoringMechanism(play, ctx) {
+  const about = (play && play.about) || {};
+  const idx = about.atBatIndex;
+  const active = ctx && ctx.activeReviewIndexes instanceof Set ? ctx.activeReviewIndexes : null;
+  if (about.hasReview === true || (idx != null && active && active.has(idx))) {
+    return { key: 'replay_review', label: 'Change coincides with a replay review' };
+  }
+  const pending = ctx && ctx.pendingScoringIndexes instanceof Set ? ctx.pendingScoringIndexes : null;
+  if (idx != null && pending && pending.has(idx)) {
+    return { key: 'pending_ruling', label: 'Official-scorer pending ruling resolved' };
+  }
+  return { key: 'scorer', label: 'Official scoring change — no replay review observed' };
+}
+
+/**
+ * One observed change on one play (the row's history entry).
+ * summary is scoringChangeSummary()'s output shape.
+ */
+function scoringChangeSummary(previousSnapshot, nextSnapshot) {
+  return {
+    initial: {
+      eventType: previousSnapshot.eventType,
+      event: previousSnapshot.event,
+      label: scoringEventLabel(previousSnapshot),
+      category: scoringCategory(previousSnapshot),
+      isOut: previousSnapshot.isOut,
+      errorMovements: previousSnapshot.errorMovements,
+    },
+    final: {
+      eventType: nextSnapshot.eventType,
+      event: nextSnapshot.event,
+      label: scoringEventLabel(nextSnapshot),
+      category: scoringCategory(nextSnapshot),
+      isOut: nextSnapshot.isOut,
+      errorMovements: nextSnapshot.errorMovements,
+    },
+    headline: `${scoringEventLabel(previousSnapshot)} → ${scoringEventLabel(nextSnapshot)}`,
+  };
+}
+
+/**
+ * Diff one game's freshly polled playByPlay against the tracked snapshots.
+ *
+ *   plays      — every play object from the current payload (allPlays +
+ *                currentPlay; duplicates by atBatIndex are harmless)
+ *   prevMap    — Map<atBatIndex(String), tracked> from the previous polls
+ *                (tracked = { snapshot, signature, firstObservedAt,
+ *                lastObservedAt, history, rowCreated }); a Map not seen
+ *                before starts a fresh baseline
+ *   now        — observation timestamp (ms)
+ *   ctx        — { activeReviewIndexes, pendingScoringIndexes,
+ *                  reviewedPlays, teamLabels: {away:{id,name,abbrev},
+ *                  home:{…}} }
+ *
+ * Returns { snapshots, added, updated, irregularities }:
+ *   snapshots      — the Map to store for the next poll
+ *   added/updated  — feed-entry-shaped { gamePk, review, firstSeen, lastSeen }
+ *                    for NEW scoring changes and CHANGED ones (a play that
+ *                    changes twice updates its row and is flagged)
+ *   irregularities — human-readable flags for review: annotation-only edits
+ *                    (description / RBI / score moved without a
+ *                    reclassification) and plays that vanished from the
+ *                    payload. Never silently corrected, never hidden.
+ *
+ * A row is minted ONLY when two REAL classifications were observed on the
+ * same at-bat: the initial call (a previous poll's snapshot) and the final
+ * one. When the change coincides with a replay review that this feed already
+ * tracks for the same play (ctx.reviewedPlays), no second row is minted —
+ * the review's own row carries the rescore.
+ */
+function mergeScoringChanges(gamePk, plays, prevMap, now, ctx) {
+  const prev = prevMap instanceof Map ? prevMap : new Map();
+  const snapshots = new Map();
+  const added = [];
+  const updated = [];
+  const irregularities = [];
+  const context = ctx || {};
+  const teamLabels = context.teamLabels || {};
+  const seenIdx = new Set();
+
+  // An empty play list (a pre-game glitch or a truncated response) is a blip,
+  // not a mass deletion: carry the previous snapshots through untouched.
+  const list = Array.isArray(plays) ? plays : [];
+  if (!list.length) {
+    prev.forEach((tracked, key) => snapshots.set(key, tracked));
+    return { snapshots, added, updated, irregularities };
+  }
+
+  list.forEach((play) => {
+    const snapshot = buildScoringSnapshot(play);
+    if (!snapshot) return;
+    const idx = snapshot.atBatIndex;
+    if (seenIdx.has(idx)) return; // currentPlay twin of an allPlays entry
+    seenIdx.add(String(idx));
+    seenIdx.add(idx);
+    const signature = scoringSnapshotSignature(snapshot);
+    const tracked = prev.get(String(idx)) || prev.get(idx);
+
+    if (!tracked) {
+      // First observation of this completed play — the baseline call. No row:
+      // a scoring change needs an observed BEFORE and AFTER.
+      snapshots.set(String(idx), {
+        snapshot,
+        signature,
+        firstObservedAt: now,
+        lastObservedAt: now,
+        history: [],
+        rowCreated: false,
+      });
+      return;
+    }
+
+    if (tracked.signature === signature) {
+      // Classification unchanged. Annotation-only edits are irregularities
+      // for review, not scoring-change rows.
+      const notes = [];
+      if (tracked.snapshot.description !== snapshot.description) {
+        notes.push(`play ${idx}: official description edited without a hit/error/out ` +
+          `reclassification ("${String(tracked.snapshot.description).slice(0, 90)}" → ` +
+          `"${String(snapshot.description).slice(0, 90)}")`);
+      }
+      if (tracked.snapshot.rbi !== snapshot.rbi && snapshot.rbi != null) {
+        notes.push(`play ${idx}: RBI ${tracked.snapshot.rbi} → ${snapshot.rbi} without a ` +
+          'hit/error/out reclassification');
+      }
+      if ((tracked.snapshot.awayScore !== snapshot.awayScore ||
+           tracked.snapshot.homeScore !== snapshot.homeScore) &&
+          snapshot.awayScore != null && snapshot.homeScore != null) {
+        notes.push(`play ${idx}: score after play ` +
+          `${tracked.snapshot.awayScore}-${tracked.snapshot.homeScore} → ` +
+          `${snapshot.awayScore}-${snapshot.homeScore} without a hit/error/out ` +
+          'reclassification');
+      }
+      notes.forEach((note) => { if (!irregularities.includes(note)) irregularities.push(note); });
+      snapshots.set(String(idx), { ...tracked, snapshot, lastObservedAt: now });
+      return;
+    }
+
+    // A real classification change: the initial call is the FIRST observed
+    // baseline (or history[0].from when this play has already changed), the
+    // final is the fresh snapshot. Each history entry is one CHAIN step
+    // (previous ruling → this ruling), so a multi-ruling play keeps its full
+    // observed sequence.
+    const history = Array.isArray(tracked.history) ? [...tracked.history] : [];
+    const initialSnapshot = history.length ? history[0].from : tracked.snapshot;
+    const previousSnapshot = history.length ? history[history.length - 1].to : tracked.snapshot;
+    const summary = scoringChangeSummary(previousSnapshot, snapshot);
+    history.push({ at: now, from: initialSnapshot, to: snapshot, summary });
+    const mechanism = scoringMechanism(play, context);
+
+    snapshots.set(String(idx), {
+      snapshot,
+      signature,
+      firstObservedAt: tracked.firstObservedAt,
+      lastObservedAt: now,
+      history,
+      rowCreated: tracked.rowCreated,
+    });
+
+    const reviewedBefore = context.reviewedPlays instanceof Set &&
+      (context.reviewedPlays.has(String(idx)) || context.reviewedPlays.has(idx));
+    if (mechanism.key === 'replay_review') {
+      // This feed already carries a replay-review row for this exact play
+      // (manager challenge / crew chief / boundary / ABS): the rescore is the
+      // review's outcome and lives on that row — minting a second row would
+      // double-count one fact. When NO review row for the play was ever
+      // observed (e.g. the page opened mid-review), the change IS surfaced
+      // here, honestly labelled as review-attributed.
+      if (reviewedBefore || activeHasIdx(context, idx)) return;
+    }
+
+    const about = (play && play.about) || {};
+    const matchup = (play && play.matchup) || {};
+    const half = String(about.halfInning || '').toLowerCase();
+    const battingSide = half === 'top' ? 'away' : half === 'bottom' ? 'home' : null;
+    const battingTeam = battingSide ? teamLabels[battingSide] : null;
+    const flags = [];
+    if (history.length > 1) {
+      flags.push(`Multiple scoring changes observed on one play (${history.length} rulings) — flagged for review`);
+    }
+    const prior = history.length > 1 ? history[history.length - 2].summary : null;
+    // The ROW always reads initial call → latest ruling (baseline → now);
+    // the chain steps live in history / previousHeadline.
+    const rowSummary = scoringChangeSummary(initialSnapshot, snapshot);
+    const review = {
+      id: `scoring-${idx}`,
+      atBatIndex: idx,
+      inning: typeof about.inning === 'number' ? about.inning : (initialSnapshot.inning || 1),
+      halfInning: half || initialSnapshot.halfInning || 'top',
+      inningLabel: scoringInningLabel(about) || '',
+      reviewType: SCORING_CHANGE_LABEL,
+      typeKey: SCORING_CHANGE_TYPE_KEY,
+      battingSide,
+      battingTeamId: battingTeam && battingTeam.id != null ? battingTeam.id : null,
+      battingTeamName: battingTeam && isUsableName(battingTeam.name) ? battingTeam.name : null,
+      battingTeamAbbrev: battingTeam && isUsableName(battingTeam.abbrev) ? battingTeam.abbrev : null,
+      inProgress: false,
+      isOverturned: null,
+      outcome: 'changed',
+      outcomeLabel: 'Rescored',
+      reason: rowSummary.headline,
+      description: snapshot.description || snapshot.event,
+      initialDescription: initialSnapshot.description || initialSnapshot.event || null,
+      initial: rowSummary.initial,
+      final: rowSummary.final,
+      changeCount: history.length,
+      changes: history.map((h) => ({ at: h.at, headline: h.summary.headline })),
+      previousHeadline: prior ? prior.headline : null,
+      mechanism,
+      flags,
+      // The scores printed are the official result.awayScore/homeScore that
+      // came with each snapshot — observed, never derived.
+      initialScoreAfter: initialSnapshot.awayScore != null && initialSnapshot.homeScore != null
+        ? { away: initialSnapshot.awayScore, home: initialSnapshot.homeScore }
+        : null,
+      scoreAfter: snapshot.awayScore != null && snapshot.homeScore != null
+        ? { away: snapshot.awayScore, home: snapshot.homeScore }
+        : null,
+      timestamp: new Date(now).toISOString(),
+      // When the INITIAL call was first observed (the baseline snapshot) —
+      // shown next to the initial description on the row.
+      initialObservedAt: typeof tracked.firstObservedAt === 'number'
+        ? new Date(tracked.firstObservedAt).toISOString()
+        : null,
+      isPitch: false,
+      pitchVelo: null,
+      batter: matchup.batter ? { id: matchup.batter.id, fullName: matchup.batter.fullName } : null,
+      pitcher: matchup.pitcher ? { id: matchup.pitcher.id, fullName: matchup.pitcher.fullName } : null,
+      countBefore: null,
+      countAfter: null,
+      atBatCount: null,
+      challenger: null,
+      scoreImpact: null,
+    };
+    const entry = { gamePk, review, firstSeen: now, lastSeen: now };
+    if (tracked.rowCreated) updated.push(entry);
+    else added.push(entry);
+    snapshots.set(String(idx), { ...snapshots.get(String(idx)), rowCreated: true });
+  });
+
+  // A tracked play that vanished from the payload is an irregularity, not a
+  // silent deletion: its snapshot is kept so that if it reappears (payload
+  // restructure) the diff still runs against what was last observed — and if
+  // it never comes back, the row and its history simply remain.
+  if (seenIdx.size) {
+    prev.forEach((tracked, key) => {
+      const idx = String(key);
+      if (seenIdx.has(idx)) return;
+      irregularities.push(`play ${idx} disappeared from the official play-by-play payload ` +
+        '(was: ' + scoringEventLabel(tracked.snapshot) + ') — flagged for review');
+      snapshots.set(idx, tracked);
+    });
+  }
+
+  return { snapshots, added, updated, irregularities };
+}
+
+function activeHasIdx(ctx, idx) {
+  const active = ctx && ctx.activeReviewIndexes instanceof Set ? ctx.activeReviewIndexes : null;
+  if (!active) return false;
+  return active.has(String(idx)) || active.has(idx);
+}
+
+/**
+ * Should a game that has gone Final be fetched again for scoring changes?
+ *
+ * MLB's own scoring-changes log states changes occur "following the
+ * conclusion of the listed games" — i.e. AFTER Final, which the ordinary
+ * replay feed never re-fetches (finals are scanned once). This helper bounds
+ * the extra polling: for SCORING_CHANGE_GRACE_MS after the page first sees
+ * the game as Final, re-scan it no more often than SCORING_FINAL_RESCAN_MS.
+ * Pure so the policy is directly testable; the IIFE owns the constants.
+ *
+ * Returns 'scan' (fetch it) or 'skip' (settled beyond the grace window, or
+ * not due yet). grace = { firstFinalObservedAt, lastScanAt }.
+ */
+function finalScanDecision(grace, settled, now, graceMs, rescanMs) {
+  if (!settled) return 'scan'; // live game: the ordinary cadence owns it
+  if (!grace || typeof grace.firstFinalObservedAt !== 'number') {
+    // Never seen as Final before: this poll IS its first Final observation.
+    return 'scan';
+  }
+  if (now - grace.firstFinalObservedAt > graceMs) return 'skip';
+  if (typeof grace.lastScanAt === 'number' && now - grace.lastScanAt < rescanMs) return 'skip';
+  return 'scan';
+}
+
 /* ------------------------------------------------------------ page logic */
 
 (() => {
@@ -889,6 +1380,14 @@ function gameChallengeLine(counts, labels, prefix) {
   const REVIEW_STATUS_IDLE_MS = 5000;
   const REVIEW_STATUS_TIMEOUT_MS = 2500;
 
+  // Official scoring changes often land AFTER a game goes Final (MLB's own
+  // log says changes occur "following the conclusion of the listed games").
+  // Finals are re-scanned for scoring changes for this long after the page
+  // first sees them as Final, at most once per rescan gap, so a late scorer
+  // ruling is still caught live without re-polling yesterday's slate forever.
+  const SCORING_CHANGE_GRACE_MS = 30 * 60 * 1000;  // 30 minutes after Final
+  const SCORING_FINAL_RESCAN_MS = 30 * 1000;       // ≥30s between final re-scans
+
   let dateStr = todayStr();
   let games = [];
   let teamsById = {};              // teamId -> official {name, abbreviation, ...}
@@ -922,6 +1421,16 @@ function gameChallengeLine(counts, labels, prefix) {
   // for every game that has at least one feed event. Counters are read from
   // the payloads only — never derived by counting feed rows ourselves.
   const challengeCounts = new Map();
+  // Official scoring-change tracker state:
+  //   gamePk -> Map<atBatIndex(String), tracked>  — the observed classification
+  //   snapshot of every completed play, so the next poll can diff against it.
+  const scoringSnapshots = new Map();
+  //   gamePk -> { firstFinalObservedAt, lastScanAt } — the bounded post-Final
+  //   re-scan window that catches scorer rulings published after the game ends.
+  const scoringGraceFinals = new Map();
+  //   gamePk -> [notes] — irregularities flagged for review (annotation-only
+  //   edits, vanished plays). Kept and displayed, never silently corrected.
+  const scoringIrregularities = new Map();
 
   // --- Audio alert state (gentle raindrop chime for challenges/reviews/boundary, not ABS) ---
   let isFirstLoad = true;
@@ -978,6 +1487,9 @@ function gameChallengeLine(counts, labels, prefix) {
     feedState.order.length = 0;
     settledGames = new Set();
     challengeCounts.clear();
+    scoringSnapshots.clear();
+    scoringGraceFinals.clear();
+    scoringIrregularities.clear();
     isFirstLoad = true;
     pendingAlertableCount = 0;
     alertedRunRiskKeys.clear();
@@ -1211,12 +1723,12 @@ function gameChallengeLine(counts, labels, prefix) {
       btn.textContent = '🔔 Sound On';
       btn.classList.add('btn-sound-on');
       btn.classList.remove('btn-ghost');
-      btn.title = 'Alert sound ON — gentle raindrop chime for new challenges/reviews/boundary calls and official-scorer pending rulings (not ABS), and the same chime whenever an active review could take a run OFF the scoreboard (any review type, ABS included). Click to mute.';
+      btn.title = 'Alert sound ON — gentle raindrop chime for new challenges/reviews/boundary calls, official-scorer pending rulings and official scoring changes (not ABS), and the same chime whenever an active review could take a run OFF the scoreboard (any review type, ABS included). Click to mute.';
     } else {
       btn.textContent = '🔇 Sound Off';
       btn.classList.remove('btn-sound-on');
       btn.classList.add('btn-ghost');
-      btn.title = 'Alert sound OFF — click to enable the gentle raindrop chime for new challenges/reviews/boundary calls, official-scorer pending rulings, and run-at-risk reviews';
+      btn.title = 'Alert sound OFF — click to enable the gentle raindrop chime for new challenges/reviews/boundary calls, official-scorer pending rulings, official scoring changes, and run-at-risk reviews';
     }
   }
 
@@ -1583,10 +2095,103 @@ function gameChallengeLine(counts, labels, prefix) {
    * Fetch + extract one game. Returns true on success (including a settled
    * Final that was correctly skipped), false when the playByPlay fetch failed.
    */
+  /**
+   * Attribution + team-label context for one game's scoring-change diff,
+   * read entirely from the feed's own observed state:
+   *   reviewedPlays        — at-bats that EVER had a replay-review entry in
+   *                          this feed (the change likely belongs to that
+   *                          review, whose row already exists)
+   *   activeReviewIndexes  — at-bats with a review IN PROGRESS right now
+   *   pendingScoringIndexes — at-bats carrying an official-scorer PENDING
+   *                          marker right now (the change is the ruling)
+   *   teamLabels           — official away/home {id, name, abbrev} for the
+   *                          batting-team chip (schedule + /teams directory).
+   */
+  function scoringContextFor(game, gamePk) {
+    const activeReviewIndexes = new Set();
+    const pendingScoringIndexes = new Set();
+    const reviewedPlays = new Set();
+    feedState.seen.forEach((entry) => {
+      if (!entry || entry.gamePk !== gamePk || !entry.review) return;
+      const r = entry.review;
+      if (r.atBatIndex == null || r.typeKey === SCORING_CHANGE_TYPE_KEY) return;
+      if (r.typeKey === 'pending_scoring') {
+        if (r.inProgress) pendingScoringIndexes.add(r.atBatIndex);
+        return;
+      }
+      // Any replay-review entry ever observed for this at-bat (active or
+      // resolved): a classification change on the same play is attributed
+      // to that review rather than double-tracked as a scorer change.
+      reviewedPlays.add(r.atBatIndex);
+      if (r.inProgress) activeReviewIndexes.add(r.atBatIndex);
+    });
+    const label = (side) => {
+      const t = gameSideTeam(game, side);
+      if (!t) return null;
+      const dir = t.id != null ? teamsById[t.id] : null;
+      return {
+        id: t.id != null ? t.id : null,
+        name: officialTeamName(t, teamsById, null),
+        abbrev: (dir && dir.abbreviation) || (isUsableName(t.abbreviation) ? t.abbreviation : null),
+      };
+    };
+    return {
+      activeReviewIndexes,
+      pendingScoringIndexes,
+      reviewedPlays,
+      teamLabels: { away: label('away'), home: label('home') },
+    };
+  }
+
+  /**
+   * Insert/refresh the scoring-change rows this poll produced into the
+   * shared feedState (same store the review feed renders from). Keys are
+   * stable (`<gamePk>:scoring-<atBatIndex>`), so a play that changes twice
+   * UPDATES its row (and is flagged) instead of spawning a second one.
+   */
+  function admitScoringEntries(entries, game) {
+    const added = [];
+    const updated = [];
+    const now = Date.now();
+    const matchupLabel = gameTeamsLabel(game, teamsById);
+    (entries || []).forEach(({ gamePk, review }) => {
+      const key = `${gamePk}:${review.id}`;
+      const existing = feedState.seen.get(key);
+      if (!existing) {
+        const entry = { gamePk, review, firstSeen: now, lastSeen: now, matchupLabel };
+        feedState.seen.set(key, entry);
+        feedState.order.push(key);
+        added.push(entry);
+        return;
+      }
+      existing.review = review;
+      existing.lastSeen = now;
+      existing.matchupLabel = matchupLabel;
+      updated.push(existing);
+    });
+    return { added, updated };
+  }
+
   async function ingestGame(game) {
     const gamePk = game.gamePk;
     const state = game.status && game.status.abstractGameState;
-    if (state === 'Final' && settledGames.has(gamePk)) return true;
+    // Finals are ordinarily scanned ONCE (settledGames), but official scoring
+    // changes frequently land AFTER the game ends — MLB's own log states
+    // changes occur "following the conclusion of the listed games". Within
+    // the bounded grace window (and at most once per rescan gap) a Final is
+    // still fetched so a late hit/error reclassification is caught live;
+    // beyond the window it is settled for good, exactly like before.
+    const isFinal = state === 'Final';
+    if (isFinal) {
+      const decision = finalScanDecision(
+        scoringGraceFinals.get(gamePk) || null,
+        settledGames.has(gamePk),
+        Date.now(),
+        SCORING_CHANGE_GRACE_MS,
+        SCORING_FINAL_RESCAN_MS,
+      );
+      if (decision === 'skip') return true;
+    }
 
     let pbp;
     try {
@@ -1598,7 +2203,18 @@ function gameChallengeLine(counts, labels, prefix) {
       // A game that just started may not have a playByPlay yet; skip quietly.
       return false;
     }
-    if (state === 'Final') settledGames.add(gamePk);
+    if (isFinal) {
+      settledGames.add(gamePk);
+      // The grace window starts when the page FIRST observes the Final, so a
+      // page opened hours after the game still gets one bounded watch window
+      // rather than an unbounded one. lastScanAt throttles the re-scans.
+      const grace = scoringGraceFinals.get(gamePk) || {
+        firstFinalObservedAt: Date.now(),
+        lastScanAt: 0,
+      };
+      grace.lastScanAt = Date.now();
+      scoringGraceFinals.set(gamePk, grace);
+    }
 
     // Schedule team objects carry only { id, name, link } (verified live
     // 2026-08-19). The official abbreviation comes from the /teams directory;
@@ -1631,6 +2247,38 @@ function gameChallengeLine(counts, labels, prefix) {
       : { reviews: [], activeReview: null };
     const result = mergeFeedEvents(feedState, gamePk, reviewData.reviews, reviewData.playsByAtBatIndex);
 
+    // Official scoring-change tracker: diff every completed play's official
+    // classification (hit / error / out / bases / runner error movements)
+    // against what previous polls observed. A diff that survives the
+    // signature comparison becomes a permanent feed row ("Single → Field
+    // Error", "Double → Single", …) shown in the All feed and the ✏️ Scoring
+    // Changes tab. Annotation-only edits (description / RBI / score without a
+    // reclassification) are flagged as irregularities for review instead.
+    const scoring = mergeScoringChanges(
+      gamePk,
+      [...(Array.isArray(pbp.allPlays) ? pbp.allPlays : []), pbp.currentPlay],
+      scoringSnapshots.get(gamePk) || new Map(),
+      Date.now(),
+      scoringContextFor(game, gamePk),
+    );
+    scoringSnapshots.set(gamePk, scoring.snapshots);
+    if (scoring.irregularities.length) {
+      const list = scoringIrregularities.get(gamePk) || [];
+      scoring.irregularities.forEach((note) => { if (!list.includes(note)) list.push(note); });
+      scoringIrregularities.set(gamePk, list.slice(-30));
+      console.warn(`official-scoring irregularity (game ${gamePk}) — flagged for review:`,
+        scoring.irregularities);
+    }
+    // mergeScoringChanges() returns the minted rows split into added/updated
+    // ({gamePk, review} pairs); admit merges them into feedState idempotently
+    // by stable key.
+    const scoringResult = admitScoringEntries([...scoring.added, ...scoring.updated], game);
+    const combined = {
+      added: [...result.added, ...scoringResult.added],
+      updated: [...result.updated, ...scoringResult.updated],
+      ended: result.ended,
+    };
+
     // Official challenges-remaining counters. The schedule already supplied
     // the manager `review` half; the ABS half only lives in feed/live's
     // gameData.absChallenges (verified 2026-08-28: absent from the schedule,
@@ -1641,13 +2289,14 @@ function gameChallengeLine(counts, labels, prefix) {
     // so re-fetch only when this game's events changed or counters were never
     // captured; the 1–2s live cadence is not doubled for a quiet game.
     const hasEntries = [...feedState.seen.values()].some((e) => e.gamePk === gamePk);
-    const eventsChanged = result.added.length || result.updated.length || result.ended.length;
+    const eventsChanged = combined.added.length || combined.updated.length || combined.ended.length;
     const tracked = challengeCounts.get(gamePk);
     const needsCounts = hasEntries &&
       (eventsChanged || !tracked || !tracked.absAttempted);
-    // Count new alertable events for the chime (challenges/reviews/boundary, not ABS)
-    if (result.added && result.added.length) {
-      const alertable = result.added.filter((e) => {
+    // Count new alertable events for the chime (challenges/reviews/boundary,
+    // official scoring changes — not ABS)
+    if (combined.added && combined.added.length) {
+      const alertable = combined.added.filter((e) => {
         try {
           // Use the pure helper defined outside the IIFE
           return typeof shouldAlertForReview === 'function'
@@ -1671,7 +2320,7 @@ function gameChallengeLine(counts, labels, prefix) {
     // earlier would cost one extra request round-trip on exactly the poll
     // where the outcome flipped. The tracker merges as soon as the response
     // lands; the next cycle re-renders the row with fresh counters.
-    if (result.added.length || result.updated.length || result.ended.length) {
+    if (combined.added.length || combined.updated.length || combined.ended.length) {
       // renderFeedUpdates() already repaints the header stats, the LIVE REVIEW
       // strip and the ⚠️ RUNS AT RISK banner (it calls renderStats /
       // renderActiveStrip / renderTabs after rebuilding the rows), so all of
@@ -1679,7 +2328,7 @@ function gameChallengeLine(counts, labels, prefix) {
       // slowest game in the wave. Verified by tools/review-watcher-test.mjs
       // §4b, which holds one game's playByPlay pending for 4s while a second
       // game's review banner is asserted on screen.
-      renderFeedUpdates(result);
+      renderFeedUpdates(combined);
     }
     // Alert now (chime + desktop notification) if this game's response
     // carries the first new/at-risk event of the poll — render above already
@@ -1773,6 +2422,20 @@ function gameChallengeLine(counts, labels, prefix) {
       item.title = `${osEntries.length} official-scorer ruling${osEntries.length === 1 ? '' : 's'} tracked today, ${osActive} still pending. ` +
         'A ruling decides how the play is charged (hit / error / fielder\u2019s choice) — it never removes a run from the score. ' +
         'Detected only from the official StatsAPI event types os_ruling_pending_primary / os_ruling_pending_prior ("Official Scorer Ruling Pending", GET /api/v1/eventTypes).';
+      wrap.appendChild(item);
+    }
+    // Official scoring changes (hit ↔ error, single ↔ double, out ↔ hit,
+    // …) observed by diffing the official play-by-play between polls.
+    const scEntries = entries.filter((e) => e.review.typeKey === 'scoring_change');
+    if (scEntries.length) {
+      let irregularTotal = 0;
+      scoringIrregularities.forEach((notes) => { irregularTotal += notes.length; });
+      const item = stat('Scoring Changes', scEntries.length, 'stat-scoring-change');
+      item.title = `${scEntries.length} official scoring change${scEntries.length === 1 ? '' : 's'} tracked today — plays whose official hit/error/out ` +
+        'classification changed between polls (initial call and final ruling both observed). ' +
+        'Detected only by diffing the official play-by-play payload; the API carries no scoring-change marker. ' +
+        `Official log: mlb.com/official-information/scoring-changes.` +
+        (irregularTotal ? ` ${irregularTotal} irregularit${irregularTotal === 1 ? 'y' : 'ies'} flagged for review (see the Scoring Changes tab).` : '');
       wrap.appendChild(item);
     }
     wrap.appendChild(stat('Overturned', entries.filter((e) => e.review.outcome === 'overturned').length, 'stat-overturned'));
@@ -1986,9 +2649,11 @@ function gameChallengeLine(counts, labels, prefix) {
       live: entries.filter((e) => e.review.inProgress && e.review.typeKey !== 'pending_scoring').length,
       runrisk: entries.filter((e) => runsRemovableFromReview(e.review) > 0).length,
       pending_scoring: entries.filter((e) => e.review.typeKey === 'pending_scoring').length,
+      scoring: entries.filter((e) => e.review.typeKey === 'scoring_change').length,
     };
     const tabs = [
       ['all', `All (${counts.all})`],
+      ['scoring', `✏️ Scoring Changes (${counts.scoring})`],
       ['pending_scoring', `⚖️ Scoring Pending (${counts.pending_scoring})`],
       ['abs', `ABS (${counts.abs})`],
       ['manager', `Challenges (${counts.manager})`],
@@ -2012,17 +2677,53 @@ function gameChallengeLine(counts, labels, prefix) {
     const entries = [...feedState.seen.values()].filter(matchesFilter);
     if (!entries.length) {
       wrap.appendChild(el('div', 'empty',
-        games.length
-          ? 'No challenges or replay reviews in this category yet — events will appear here live.'
-          : 'No games scheduled for this date.'));
+        !games.length
+          ? 'No games scheduled for this date.'
+          : filter === 'scoring'
+            ? 'No official scoring changes observed yet — the tracker snapshots every completed play and diffs each poll; when the official scorer changes a hit/error/out ruling, the initial call and final ruling appear here.'
+            : 'No challenges or replay reviews in this category yet — events will appear here live.'));
       return;
     }
+    if (filter === 'scoring') renderScoringIrregularities(wrap);
     sortFeedEntries(entries).forEach((entry) => wrap.appendChild(feedRow(entry)));
+  }
+
+  /**
+   * Irregularities flagged for review, shown at the top of the ✏️ Scoring
+   * Changes tab: official payload changes observed WITHOUT a hit/error/out
+   * reclassification (description / RBI / score edits), or tracked plays
+   * that vanished from the payload. Displayed exactly as observed — never
+   * corrected, never hidden.
+   */
+  function renderScoringIrregularities(wrap) {
+    const all = [];
+    scoringIrregularities.forEach((notes, gamePk) => {
+      const g = games.find((x) => x.gamePk === gamePk) || null;
+      const label = g ? gameTeamsLabel(g, teamsById) : `Game ${gamePk}`;
+      (notes || []).forEach((note) => all.push({ label, note }));
+    });
+    if (!all.length) return;
+    const flag = el('div', 'scoring-irregularities');
+    const head = el('div', 'scoring-irregularities-head',
+      `⚑ ${all.length} irregularit${all.length === 1 ? 'y' : 'ies'} flagged for review`);
+    head.title = 'Official payload changes observed WITHOUT a hit/error/out reclassification ' +
+      '(description / RBI / score edits), or tracked plays that vanished from the payload. ' +
+      'Shown exactly as observed — never corrected or hidden.';
+    flag.appendChild(head);
+    all.slice(0, 8).forEach(({ label, note }) => {
+      flag.appendChild(el('div', 'scoring-irregularity', `${label} — ${note}`));
+    });
+    if (all.length > 8) {
+      flag.appendChild(el('div', 'scoring-irregularity',
+        `…and ${all.length - 8} more (full list in the browser console)`));
+    }
+    wrap.appendChild(flag);
   }
 
   function matchesFilter(entry) {
     // The All section shows every category EXCEPT ABS pitch challenges:
-    // challenges, reviews, boundary calls, under review, runs at risk.
+    // challenges, reviews, boundary calls, under review, runs at risk, and
+    // official scoring changes (which also have their own ✏️ tab below).
     // ABS entries stay tracked in the feed state — they render under the
     // "ABS" tab (and wherever else their category applies: the Under
     // Review tab, active strip, run-at-risk surfaces).
@@ -2030,6 +2731,7 @@ function gameChallengeLine(counts, labels, prefix) {
     if (filter === 'live') return entry.review.inProgress && entry.review.typeKey !== 'pending_scoring';
     if (filter === 'runrisk') return runsRemovableFromReview(entry.review) > 0;
     if (filter === 'pending_scoring') return entry.review.typeKey === 'pending_scoring';
+    if (filter === 'scoring') return entry.review.typeKey === 'scoring_change';
     return entry.review.typeKey === filter;
   }
 
@@ -2099,9 +2801,11 @@ function gameChallengeLine(counts, labels, prefix) {
       if (teamFullName) chip.title = teamFullName;
       head.appendChild(chip);
     }
-    // Official-scorer pending: the batting side (from halfInning + official
-    // team ids) is context, not a "challenging team" — no challenge counter.
-    if (r.typeKey === 'pending_scoring' && (r.battingTeamAbbrev || r.battingTeamName)) {
+    // Official-scorer pending / scoring-change rows: the batting side (from
+    // halfInning + official team ids) is context, not a "challenging team" —
+    // no challenge counter.
+    if ((r.typeKey === 'pending_scoring' || r.typeKey === 'scoring_change') &&
+        (r.battingTeamAbbrev || r.battingTeamName)) {
       const bat = el('span', 'feed-batting',
         `Batting: ${r.battingTeamAbbrev || r.battingTeamName}`);
       if (r.battingTeamName) bat.title = r.battingTeamName;
@@ -2118,23 +2822,30 @@ function gameChallengeLine(counts, labels, prefix) {
     }
     body.appendChild(head);
 
-    const title = el('div', 'feed-reason', r.reason);
-    body.appendChild(title);
+    if (r.typeKey === 'scoring_change') {
+      // Official scoring change: the initial call → final ruling block
+      // replaces the generic reason/description lines (which would only
+      // duplicate the final ruling).
+      body.appendChild(scoringChangeBlock(r));
+    } else {
+      const title = el('div', 'feed-reason', r.reason);
+      body.appendChild(title);
 
-    if (window.MLBReviews && window.MLBReviews.renderScoreImpact) {
-      const scoreImpact = window.MLBReviews.renderScoreImpact(r, 'feed');
-      if (scoreImpact) body.appendChild(scoreImpact);
-    }
+      if (window.MLBReviews && window.MLBReviews.renderScoreImpact) {
+        const scoreImpact = window.MLBReviews.renderScoreImpact(r, 'feed');
+        if (scoreImpact) body.appendChild(scoreImpact);
+      }
 
-    const desc = el('div', 'feed-desc', r.description);
-    body.appendChild(desc);
+      const desc = el('div', 'feed-desc', r.description);
+      body.appendChild(desc);
 
-    // Official-scorer pending rulings: show both the pending description and
-    // the resolved ruling (hit/error/fielder's choice) when available.
-    if (r.typeKey === 'pending_scoring' && r.resolvedDescription) {
-      const resolved = el('div', 'feed-resolved', `Resolved as: ${r.resolvedDescription}`);
-      resolved.title = 'Official scorer ruling: the play was charged as shown above.';
-      body.appendChild(resolved);
+      // Official-scorer pending rulings: show both the pending description and
+      // the resolved ruling (hit/error/fielder's choice) when available.
+      if (r.typeKey === 'pending_scoring' && r.resolvedDescription) {
+        const resolved = el('div', 'feed-resolved', `Resolved as: ${r.resolvedDescription}`);
+        resolved.title = 'Official scorer ruling: the play was charged as shown above.';
+        body.appendChild(resolved);
+      }
     }
 
     if (window.MLBReviews && window.MLBReviews.absContextLines) {
@@ -2193,11 +2904,77 @@ function gameChallengeLine(counts, labels, prefix) {
     const cls = r.inProgress ? 'outcome-in-progress' :
       r.outcome === 'overturned' ? 'outcome-overturned' :
       r.outcome === 'confirmed' ? 'outcome-confirmed' :
-      r.outcome === 'resolved' ? 'outcome-resolved' : 'outcome-stands';
+      r.outcome === 'resolved' ? 'outcome-resolved' :
+      r.outcome === 'changed' ? 'outcome-changed' : 'outcome-stands';
     const icon = r.inProgress ? '⚡ ' :
       r.outcome === 'resolved' ? '✓ ' :
-      r.outcome === 'overturned' ? '✓ ' : '✗ ';
+      r.outcome === 'overturned' ? '✓ ' :
+      r.outcome === 'changed' ? '✏️ ' : '✗ ';
     return el('span', `review-outcome-pill ${cls}`, `${icon}${r.outcomeLabel}`);
+  }
+
+  /**
+   * The initial-call → final-ruling block of one official scoring-change row
+   * (the row head — matchup, chip, batting side, inning, pill — and the
+   * batter/pitcher footer are rendered by feedRow like every other row).
+   * Everything here is observed data: labels are the payload's own
+   * result.event text, timestamps are the polls that observed each ruling,
+   * and the scores are the payload's own result.awayScore/homeScore.
+   */
+  function scoringChangeBlock(r) {
+    const block = el('div', 'feed-scoring');
+    const headline = el('div', 'feed-scoring-headline');
+    headline.appendChild(el('span', `feed-scoring-call feed-scoring-call-${r.initial.category}`, r.initial.label));
+    headline.appendChild(el('span', 'feed-scoring-arrow', '→'));
+    headline.appendChild(el('span', `feed-scoring-call feed-scoring-call-${r.final.category}`, r.final.label));
+    if (r.changeCount > 1) {
+      const multi = el('span', 'feed-scoring-multiple', `${r.changeCount} rulings observed`);
+      multi.title = r.previousHeadline
+        ? `Ruling history: ${r.previousHeadline}, then ${r.reason}. Flagged for review — multiple official rulings on one play are rare.`
+        : 'Flagged for review — multiple official rulings on one play are rare.';
+      headline.appendChild(multi);
+    }
+    block.appendChild(headline);
+
+    const obsTime = (iso) => {
+      const t = iso ? new Date(iso) : null;
+      return t && !Number.isNaN(t.getTime())
+        ? t.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+        : null;
+    };
+    const initialWhen = obsTime(r.initialObservedAt);
+    if (r.initialDescription) {
+      const initLine = el('div', 'feed-scoring-line feed-scoring-initial',
+        `Initial call${initialWhen ? ` (observed ${initialWhen})` : ''}: ${r.initialDescription}`);
+      initLine.title = 'The official classification this play carried when this page first observed it — ' +
+        'read from the official play-by-play payload on an earlier poll.';
+      block.appendChild(initLine);
+    }
+    if (r.description && r.description !== r.initialDescription) {
+      block.appendChild(el('div', 'feed-scoring-line feed-scoring-final', `Final ruling: ${r.description}`));
+    }
+    if (r.scoreAfter) {
+      const changedScore = r.initialScoreAfter &&
+        (r.initialScoreAfter.away !== r.scoreAfter.away || r.initialScoreAfter.home !== r.scoreAfter.home);
+      block.appendChild(el('div', 'feed-scoring-line feed-scoring-score',
+        `Official score after play: ${r.scoreAfter.away}–${r.scoreAfter.home}` +
+        (changedScore ? ` (was ${r.initialScoreAfter.away}–${r.initialScoreAfter.home} on the initial call)` : '')));
+    }
+    if (r.mechanism && isUsableName(r.mechanism.label)) {
+      const mech = el('div', 'feed-scoring-line feed-scoring-mechanism', r.mechanism.label);
+      mech.title = r.mechanism.key === 'replay_review'
+        ? 'The play carries the official replay-review flag (about.hasReview) or a review was active for this at-bat when the change landed. The outcome is tracked on its replay-review row in this feed.'
+        : r.mechanism.key === 'pending_ruling'
+          ? 'The play carried the official "Official Scorer Ruling Pending" marker before this change — also tracked on its ⚖️ Scoring Pending row.'
+          : 'No replay review was observed for this play. Per MLB\u2019s official log, scoring changes are made by the Official Scorer, the Elias Sports Bureau, or after a player/club review: mlb.com/official-information/scoring-changes.';
+      block.appendChild(mech);
+    }
+    if (Array.isArray(r.flags) && r.flags.length) {
+      const flag = el('div', 'feed-challenges feed-challenges-flag', `⚠️ ${r.flags.join('; ')}`);
+      flag.title = 'Flagged for review — shown exactly as observed, never corrected or guessed.';
+      block.appendChild(flag);
+    }
+    return block;
   }
 
   /**
@@ -2507,6 +3284,13 @@ function gameChallengeLine(counts, labels, prefix) {
       runsRemovableFromReview, shouldRunRiskAlert, diffRunRiskKeys,
       normalizeChallengeCounts, challengeCountIrregularities,
       teamSideInGame, teamChallengeLine, gameChallengeLine,
+      // Official scoring-change tracker (pure layer)
+      SCORING_CHANGE_TYPE_KEY, SCORING_CHANGE_LABEL,
+      SCORING_HIT_EVENT_TYPES, SCORING_PA_ERROR_EVENT_TYPES,
+      SCORING_RUNNER_ERROR_EVENT_TYPES, SCORING_PENDING_EVENT_TYPES,
+      buildScoringSnapshot, scoringSnapshotSignature, scoringCategory,
+      scoringEventLabel, scoringInningLabel, scoringMechanism,
+      scoringChangeSummary, mergeScoringChanges, finalScanDecision,
     };
   }
 })();
