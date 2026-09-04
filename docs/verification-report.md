@@ -633,3 +633,49 @@ fails §4b.
    review states, and the old regex matched `"Player challenge: Pitch Result"`
    too, so this is not a regression). The chime still skips routine ABS via
    `shouldAlertForReview()`; only the run-at-risk case sounds, as before.
+
+## 17. Post-Final scoring-change latency: recency-tiered re-scan (added 2026-09-04)
+
+Goal: lower the worst-case wait for an **official scoring change that lands AFTER a game is
+Final** (hit ↔ error / single ↔ double / out ↔ hit reclassifications). Those are the only review
+updates this repo delivers on a multi-second cadence — the rest (challenges/reviews/boundary/
+under-review via the 250 ms status watcher in §16; runs-at-risk and official-scorer-pending via
+the playByPlay scan) are already at the pull-API floor.
+
+### Before
+
+`finalScanDecision()` returned `'scan'` at most once per a flat `SCORING_FINAL_RESCAN_MS = 30 s`
+within a 30-minute `SCORING_CHANGE_GRACE_MS`. A scorer ruling published after Final could therefore
+sit unseen for up to ~30 s regardless of when it landed.
+
+### Change (assets/js/reviews-feed.js)
+
+`finalScanDecision` now takes two optional params (`fastRescanMs`, `fastWindowMs`). When both are
+finite, a Final whose age (`now - grace.firstFinalObservedAt`) is within `fastWindowMs` is re-scanned
+at the fast gap; beyond that (still inside `graceMs`) the base `rescanMs` applies. The last branch —
+a Final older than `graceMs` → `'skip'` forever — is unchanged, so polling stays bounded.
+
+Production constants (the IIFE owns them):
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `SCORING_CHANGE_GRACE_MS` | `30 * 60 * 1000` | unchanged — 30 min cap; never polled beyond |
+| `SCORING_RECENT_RESCAN_MS` | `5 * 1000` | fast gap while the game is recently Final |
+| `SCORING_RECENT_FINAL_WINDOW_MS` | `5 * 60 * 1000` | "recently Final" = first 5 minutes after Final |
+| `SCORING_FINAL_RESCAN_MS` | `15 * 1000` | base gap once the fast window passes |
+
+### Verification (line by line, no guesses)
+
+- Semantics unchanged for uniform-gap callers: both new params are optional and `Number.isFinite`
+  defaults to "no fast phase", so a 5-argument call behaves exactly as before. The pre-existing
+  uniform-gap assertions in `tools/scoring-change-test.mjs` §10 pass unmodified.
+- New deterministic cases pin: recently-Final → scanned ~6× sooner (5 s gap); past the fast window →
+  base 15 s gap; and the tiers **never** extend polling beyond the 30-minute grace (a game older
+  than grace is `'skip'` even at the fast gap).
+- The feed's only post-Final polling gate is this one decision; the 30-minute grace still caps total
+  per-game post-Final request volume (~a handful per game), so no unbounded API load is introduced
+  — consistent with the repo's "good citizen" guidance in the README.
+- Full deterministic suite green after the change: `review,reviews-feed,replay-feed-render,
+  review-probe,review-status,review-watcher,official-scoring,scoring-change,api-fields,hit-model`.
+- Net effect: worst-case post-Final scoring-change wait drops from ~30 s to **~5 s in the first
+  5 minutes** after Final and **~15 s** thereafter. Cross-referenced in `docs/latency-audit.md`.

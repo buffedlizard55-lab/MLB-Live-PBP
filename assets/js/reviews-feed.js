@@ -1298,20 +1298,40 @@ function activeHasIdx(ctx, idx) {
  * conclusion of the listed games" — i.e. AFTER Final, which the ordinary
  * replay feed never re-fetches (finals are scanned once). This helper bounds
  * the extra polling: for SCORING_CHANGE_GRACE_MS after the page first sees
- * the game as Final, re-scan it no more often than SCORING_FINAL_RESCAN_MS.
+ * the game as Final, re-scan it no more often than the rescan gap that
+ * applies to its current age.
+ *
+ * The rescan gap is RECENCY-TIERED so a scorer ruling is caught as soon as
+ * possible exactly when it is most likely — right after the game ends — and
+ * then gently tapers as the game ages, all inside the fixed grace window:
+ *   fast window (recently Final) : gap = fastRescanMs (default off)
+ *   otherwise                    : gap = rescanMs
+ * A final that has been Final for longer than graceMs is settled for good
+ * and never polled again (bounded — the grace caps total request volume).
+ *
  * Pure so the policy is directly testable; the IIFE owns the constants.
+ * The last two params are optional and default to "no fast phase" so callers
+ * that only set a uniform gap (and the existing uniform-gap tests) keep the
+ * same semantics.
  *
  * Returns 'scan' (fetch it) or 'skip' (settled beyond the grace window, or
  * not due yet). grace = { firstFinalObservedAt, lastScanAt }.
  */
-function finalScanDecision(grace, settled, now, graceMs, rescanMs) {
+function finalScanDecision(grace, settled, now, graceMs, rescanMs, fastRescanMs, fastWindowMs) {
   if (!settled) return 'scan'; // live game: the ordinary cadence owns it
   if (!grace || typeof grace.firstFinalObservedAt !== 'number') {
     // Never seen as Final before: this poll IS its first Final observation.
     return 'scan';
   }
-  if (now - grace.firstFinalObservedAt > graceMs) return 'skip';
-  if (typeof grace.lastScanAt === 'number' && now - grace.lastScanAt < rescanMs) return 'skip';
+  const age = now - grace.firstFinalObservedAt;
+  if (age > graceMs) return 'skip';
+  const hasFast = Number.isFinite(fastRescanMs) && Number.isFinite(fastWindowMs);
+  // A recently-Final game is rescanned at the fast gap; older finals (still
+  // inside grace) at the base gap. Uses `age` (time since the game went
+  // Final), not a separate clock, so the taper is purely a function of the
+  // single authoritative timestamp we already track.
+  const gap = (hasFast && age >= 0 && age < fastWindowMs) ? fastRescanMs : rescanMs;
+  if (typeof grace.lastScanAt === 'number' && now - grace.lastScanAt < gap) return 'skip';
   return 'scan';
 }
 
@@ -1383,10 +1403,17 @@ function finalScanDecision(grace, settled, now, graceMs, rescanMs) {
   // Official scoring changes often land AFTER a game goes Final (MLB's own
   // log says changes occur "following the conclusion of the listed games").
   // Finals are re-scanned for scoring changes for this long after the page
-  // first sees them as Final, at most once per rescan gap, so a late scorer
-  // ruling is still caught live without re-polling yesterday's slate forever.
-  const SCORING_CHANGE_GRACE_MS = 30 * 60 * 1000;  // 30 minutes after Final
-  const SCORING_FINAL_RESCAN_MS = 30 * 1000;       // ≥30s between final re-scans
+  // first sees them as Final, so a late scorer ruling is still caught live
+  // without re-polling yesterday's slate forever. Within that bounded grace
+  // window the rescan gap is recency-tiered: a recently-Final game (most
+  // likely to still get a scoring decision) is re-scanned at the fast gap,
+  // then the base gap, so the worst-case delay for a post-Final change drops
+  // from the old flat ~30s to as little as ~5s in the early, most likely
+  // window while total request volume stays capped by the 30-minute grace.
+  const SCORING_CHANGE_GRACE_MS = 30 * 60 * 1000;   // 30 minutes after Final
+  const SCORING_FINAL_RESCAN_MS = 15 * 1000;        // base gap once the fast window passes
+  const SCORING_RECENT_RESCAN_MS = 5 * 1000;        // fast gap while the game is recently Final
+  const SCORING_RECENT_FINAL_WINDOW_MS = 5 * 60 * 1000;  // "recently Final" = first 5 minutes
 
   let dateStr = todayStr();
   let games = [];
@@ -2189,6 +2216,8 @@ function finalScanDecision(grace, settled, now, graceMs, rescanMs) {
         Date.now(),
         SCORING_CHANGE_GRACE_MS,
         SCORING_FINAL_RESCAN_MS,
+        SCORING_RECENT_RESCAN_MS,
+        SCORING_RECENT_FINAL_WINDOW_MS,
       );
       if (decision === 'skip') return true;
     }

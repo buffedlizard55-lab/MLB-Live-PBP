@@ -570,6 +570,24 @@ assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: 0 }, true,
 assert.equal(finalScanDecision({ firstFinalObservedAt: 0 }, true, 1000, GRACE_MS, RESCAN_MS), 'scan',
   'grace entry without a scan stamp yet → scan');
 
+/* ----- recency-tiered fast window (default off when not supplied) ----- */
+const FAST_MS = 5 * 1000;
+const FAST_WINDOW = 5 * 60 * 1000;
+// Uniform-gap callers (no fast params) are untouched.
+assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: 30000 }, true, 31000, GRACE_MS, RESCAN_MS, FAST_MS, FAST_WINDOW), 'skip',
+  'recently Final: a rescan 30s ago is still inside the 5s fast gap → skip');
+assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: 0 }, true, FAST_MS + 1, GRACE_MS, RESCAN_MS, FAST_MS, FAST_WINDOW), 'scan',
+  'recently Final: past the 5s fast gap → scan (post-Final ruling caught ~6x sooner)');
+// Once past the fast window, the explicit base gap applies again.
+const BASE_MS = 15 * 1000;
+const mid = FAST_WINDOW + 20000;
+assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: mid - 14000 }, true, mid, GRACE_MS, BASE_MS, FAST_MS, FAST_WINDOW), 'skip',
+  'older Final: 14s since last scan is inside the 15s base gap → skip');
+assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: mid - 16000 }, true, mid, GRACE_MS, BASE_MS, FAST_MS, FAST_WINDOW), 'scan',
+  'older Final: past the 15s base gap → scan');
+assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: 0 }, true, GRACE_MS + 1, GRACE_MS, BASE_MS, FAST_MS, FAST_WINDOW), 'skip',
+  'recency tiers never extend polling past the grace window');
+
 /* ===================== 11. Feed integration contracts (All feed, alerts) == */
 
 const scoringReview = r3.added[0].review;
