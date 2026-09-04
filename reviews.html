@@ -24,7 +24,7 @@
     </div>
     <div id="date-label" class="date-label"></div>
     <div class="feed-controls">
-      <button id="sound-toggle-btn" class="btn btn-ghost" title="Toggle alert sound — a gentle raindrop chime for new challenges/reviews/boundary calls and official-scorer pending rulings (not ABS), and the same chime whenever an active review could remove a run already on the scoreboard">🔇 Sound Off</button>
+      <button id="sound-toggle-btn" class="btn btn-ghost" title="Toggle alert sound — a gentle raindrop chime for new challenges/reviews/boundary calls, official-scorer pending rulings and official scoring changes (not ABS), and the same chime whenever an active review could remove a run already on the scoreboard">🔇 Sound Off</button>
       <button id="notify-toggle-btn" class="btn btn-ghost" title="Toggle desktop notifications for run-at-risk reviews — a popup the moment an active review could take a run off the scoreboard">⚪ Run Alerts Off</button>
       <button id="refresh-btn" class="btn">Refresh</button>
       <span class="countdown" id="countdown" title="Seconds until the next poll"></span>
@@ -72,6 +72,24 @@
       more scoring movements to the very event under review, so an overturn could take those runs
       back off the scoreboard. Unrelated runs from earlier in the same plate appearance (a steal of
       home, a wild pitch) are excluded, and whether replay actually removes a run is never predicted.
+      <strong>Official scoring changes</strong> (a hit reclassified as an error or vice versa, a
+      single changed to a double or back, a base hit changed to a fielder's choice + error, an out
+      changed to a hit, and so on) are tracked in the ✏️ Scoring Changes tab and in the All feed by
+      snapshotting every completed play's official classification (<code>result.eventType</code> /
+      <code>result.isOut</code> / <code>count.outs</code> / error movements in <code>runners[]</code>)
+      on every poll and diffing it against the previous polls — the StatsAPI payload carries no
+      scoring-change marker, so the initial call and the final ruling are known only from
+      consecutive observations. Each row shows the observed initial call and the final ruling, the
+      official score after the play, and an attribution note. Changes that coincide with a replay
+      review stay on that review's row; everything else is attributed as an official scoring change
+      (per MLB's own log, changes are made by the Official Scorer, the Elias Sports Bureau, or after
+      a player/club review —
+      <a href="https://www.mlb.com/official-information/scoring-changes" target="_blank" rel="noopener">mlb.com/official-information/scoring-changes</a>).
+      A change can only be tracked when its initial call was observed before the change landed;
+      finals are re-scanned for 30 minutes after they end (at most every 30 seconds) to catch
+      rulings published after the game. Payload edits without a reclassification (description /
+      RBI / score only) and plays that vanish from the payload are flagged as irregularities for
+      review, never corrected or hidden.
       Not affiliated with MLB or MLB Advanced Media.
     </p>
   </footer>
