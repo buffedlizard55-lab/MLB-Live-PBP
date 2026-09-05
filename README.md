@@ -107,17 +107,22 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
   single number with a matchup tier (Elite → Pitcher's edge) and per-driver point
   adjustments. It appears in the live at-bat card, the Props & Matchup tab, and
   completed PBP rows.
-- Auto-refreshes every **1 second** on a live game page (while a review is in
-  flight it probes the lean play-by-play endpoint every **250ms** and pulls the
-  full feed only when the review state flips), the Replay Feed every **500ms**
-  (**250ms** while a review is in flight), and the scoreboard every **500ms**
-  (**250ms** while a review is in flight); works on desktop and mobile.
+- Auto-refreshes: on a live game page the full feed lands every **500ms**, while
+  a dedicated **250ms status watcher** catches a brand-new challenge/review the
+  instant MLB flips the official game status (and while a review is in flight
+  the page probes the lean play-by-play endpoint every **250ms**, pulling the
+  full feed only when the review state flips). The Replay Feed scans every live
+  game's play-by-play every **250ms** and sweeps the whole slate's official
+  status every **250ms**. The scoreboard keeps its 500ms hydrated-schedule poll
+  and adds the same **250ms status sweep** for the review ticker. Works on
+  desktop and mobile.
 - **"Under review" is detected from the official game status, not from play
-  text.** The Replay Feed runs a dedicated **250ms review-status watcher**
+  text.** All three surfaces run a dedicated **250ms review-status watcher**
   (`GET /api/v1/schedule` with a `fields` projection and no hydrations — the
   whole slate's `gamePk` + `status` in ~2.4 KB, ~1/8th the size of the schedule
-  the rest of the page uses) and the game page races a ~150-byte per-game status
-  projection against its full feed. MLB flips `status.statusCode` the instant a
+  the rest of the page uses); the Replay Feed and the scoreboard use it for
+  the whole slate, and the game page sweeps a ~150-byte per-game status
+  projection on the same cadence. MLB flips `status.statusCode` the instant a
   review is **called**, while the play description is written when it
   **resolves** — so this cuts the worst-case wait from ~3s (the schedule cache)
   to ~250ms plus one round trip, and it surfaces the official review reason
@@ -147,7 +152,7 @@ This project does the same thing with its own front end. The API calls we make:
 | --- | --- |
 | Games for a date (scoreboard cards, probables, live count) | `GET /api/v1/schedule?sportId=1&date=YYYY-MM-DD&hydrate=probablePitcher,linescore,decisions,review` |
 | **Review status for the whole slate** (Replay Feed's 250ms watcher) | `GET /api/v1/schedule?sportId=1&date=YYYY-MM-DD&fields=dates,games,gamePk,season,status,abstractGameState,codedGameState,detailedState,statusCode,reason,startTimeTBD,abstractGameCode` |
-| **Review status for one game** (game page's fast probe, ~150 B) | `GET /api/v1.1/game/{gamePk}/feed/live?fields=gameData,status,abstractGameState,codedGameState,detailedState,statusCode,reason,startTimeTBD,abstractGameCode` |
+| **Review status for one game** (game page's 250ms status watcher, ~150 B) | `GET /api/v1.1/game/{gamePk}/feed/live?fields=gameData,status,abstractGameState,codedGameState,detailedState,statusCode,reason,startTimeTBD,abstractGameCode` |
 | Official game-status registry (source of every review `statusCode` + `reason`) | `GET /api/v1/gameStatus` |
 | Full game state — play-by-play, current at-bat, linescore, box score, decisions, rosters | `GET /api/v1.1/game/{gamePk}/feed/live` |
 | Fallback feed (older games) | `GET /api/v1/game/{gamePk}/feed/live` |
@@ -283,6 +288,8 @@ node tools/replay-feed-render-test.mjs    # end-to-end Replay Feed render (captu
 node tools/review-probe-test.mjs          # in-review lean-probe signature (game.js)
 node tools/review-status-test.mjs         # official gameStatus registry + review detection (all 4 copies)
 node tools/review-watcher-test.mjs        # 250ms review-status watcher, driven through the real boot path
+node tools/page-status-watcher-test.mjs   # 250ms watchers on the game page + scoreboard, real boot path
+node tools/api-rate-limit-test.mjs        # HTTP-429 self-throttle (60s quiet period) in the API client
 node tools/official-scoring-test.mjs      # official-scorer pending rulings
 node tools/api-fields-test.mjs            # playByPlay `fields` projection coverage
 node tools/scoring-change-test.mjs        # official scoring-change tracker (hit ↔ error ↔ out)
@@ -350,13 +357,19 @@ GitHub Actions**.
 - The MLB StatsAPI is **unofficial and may change without notice**. The client is
   written defensively (fallbacks for every endpoint and missing fields) and the app
   degrades gracefully if a field disappears.
-- Be a good citizen: polling every 0.25–0.5s for a handful of live games is well
-  within normal usage, but avoid hammering — the code pauses when the tab is
-  hidden and uses a quieter cadence on preview/final games. The Replay Feed
-  scans live games' playByPlay (the light endpoint, no boxscore/rosters) every
-  500ms (250ms while a review is in flight), subtracts scan time from the next
-  wait, fetches in-review games first, and only re-renders when a review event
-  actually changes. The StatsAPI is
+- Be a good citizen: the app needs **no API key** (the StatsAPI is keyless and
+  open-CORS) and it self-limits — every page pauses when the tab is hidden,
+  backs off on preview/final games, bounds post-Final re-scans to a 30-minute
+  grace window, and (since 2026-09-05) the shared client self-throttles for
+  60 seconds if the API ever answers **HTTP 429**, so it can never hammer a
+  host that has asked it to slow down. The Replay Feed scans live games'
+  playByPlay (the light, `fields`-projected endpoint — no boxscore/rosters)
+  every 250ms, subtracts scan time from the next wait, fetches in-review games
+  first, and only re-renders when a review event actually changes. Worst case
+  on a full ~15-game slate that is ~60 playByPlay requests/s plus ~4 tiny
+  status sweeps/s (~64 req/s, single client) — far below "thousands of requests
+  per second", and the same cadence the page already used whenever any review
+  was in flight. The StatsAPI is
   pull-only — a shorter poll only reduces how long a landed event sits unseen.
 - Review/challenge data shapes were verified against the live API on 2026-08-19
   (schedule `hydrate=review`, `reviewDetails` codes `MJ`/`MA`/`MF`, and

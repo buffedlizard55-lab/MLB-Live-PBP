@@ -12,6 +12,20 @@
   const LIVE_POLL_MS = 500;
   const REVIEW_POLL_MS = 250;
   const IDLE_POLL_MS = 5000;
+  // Standalone review-status watcher (added 2026-09-05 — see
+  // docs/latency-audit.md addendum). While any game is live, sweep the
+  // `fields`-projected, hydration-free schedule (MLB.getReviewStatus:
+  // gamePk + status for the whole slate in ~2.4 KB / 1 chunk — verified live
+  // 2026-09-02 and again 2026-09-05) every 250ms, so the 🚨 review ticker /
+  // card badges appear the moment MLB flips a status to a review code
+  // (M*/N*/IH — the field that changes the instant a review is CALLED)
+  // instead of on the next 500ms hydrated-schedule poll. The hydrated
+  // schedule keeps its own 500ms cadence for scores/counts; only status
+  // flips ride this fast, tiny sweep. Parks at 5s (no requests) when the
+  // slate has nothing live and whenever the tab is hidden.
+  const REVIEW_STATUS_POLL_MS = 250;
+  const REVIEW_STATUS_IDLE_MS = 5000;
+  const REVIEW_STATUS_TIMEOUT_MS = 2500;
 
   let dateStr = todayStr();
   let games = [];
@@ -19,6 +33,12 @@
   let pollTimer = null;
   let requestInFlight = false;
   let lastCycleStartedAt = 0;
+  // Review-status watcher state: its own timer (never shares pollTimer), an
+  // in-flight guard so a sweep can never overlap itself, and the last
+  // observed gamePk -> status signature the diff runs against.
+  let reviewStatusTimer = null;
+  let reviewStatusInFlight = false;
+  let reviewStatusCodes = new Map();
 
   /* ------------------------------------------------------------------ state */
 
@@ -119,6 +139,141 @@
       if (!document.hidden) load();
       else scheduleNext();
     }, wait);
+  }
+
+  /* ------------------------------------------------ review-status watcher */
+
+  /**
+   * Diff one projected sweep against the last observed signatures.
+   * Pure (no closure state) so the policy is directly testable — exposed on
+   * window.Scoreboard._scheduleStatusFlips for tools/page-status-watcher-test.mjs.
+   * A signature is the tuple of every status field the scoreboard renders or
+   * branches on, so ANY meaningful official flip (review called/resolved,
+   * delayed, final) reports changed:true. Returns the fresh signature map.
+   */
+  function scheduleStatusFlips(prevCodes, list) {
+    const codes = new Map();
+    (list || []).forEach((g) => {
+      if (!g || g.gamePk == null || !g.status) return;
+      const s = g.status;
+      codes.set(g.gamePk, [
+        s.abstractGameState || '', s.codedGameState || '', s.statusCode || '',
+        s.detailedState || '', s.reason || '',
+      ].join('|'));
+    });
+    let changed = false;
+    if (prevCodes && prevCodes.size === codes.size) {
+      codes.forEach((sig, pk) => {
+        if (prevCodes.get(pk) !== sig) changed = true;
+      });
+    } else if (prevCodes && prevCodes.size !== codes.size) {
+      changed = true;
+    } else if (!prevCodes && codes.size) {
+      changed = true; // first sweep after boot: adopt, but paint nothing new
+    }
+    return { changed, codes };
+  }
+
+  /** Watcher cadence: fast only while a review is possible (a review cannot
+   *  start on a game that has not started); idle otherwise and when hidden.
+   *  Uses the last sweep's own observation too, so the cadence is correct
+   *  even before the first hydrated schedule lands (games empty at boot). */
+  let lastSweepHadLive = false;
+
+  function reviewStatusIntervalMs() {
+    if (document.hidden) return REVIEW_STATUS_IDLE_MS;
+    const canReview = lastSweepHadLive || games.some((g) => g && g.status &&
+      (g.status.abstractGameState === 'Live' || gameIsUnderReview(g)));
+    return canReview ? REVIEW_STATUS_POLL_MS : REVIEW_STATUS_IDLE_MS;
+  }
+
+  function scheduleReviewStatus(initialFast) {
+    clearTimeout(reviewStatusTimer);
+    // A hidden tab parks at the idle cadence instead of spinning at 250ms.
+    // The timer is SELF-PERPETUATING (every path — including the hidden park
+    // and pollReviewStatus's finally — re-arms it, recomputing the cadence
+    // from current state), so nothing else may re-arm it: resetting the
+    // phase from every 500ms schedule poll would stretch the 250ms sweep to
+    // ~2/s (caught by tools/page-status-watcher-test.mjs §A3). It is started
+    // exactly once per "shown" lifetime: at boot and on visibilitychange→show.
+    // `initialFast` covers the cold-boot hole: at DOMContentLoaded `games` is
+    // empty so the computed cadence would park at 5s — arming the FIRST tick
+    // at 250ms instead means a page opened mid-review adopts the slate's
+    // status immediately (one ~2.4 KB request even on an idle slate).
+    const wait = initialFast ? REVIEW_STATUS_POLL_MS : reviewStatusIntervalMs();
+    reviewStatusTimer = setTimeout(() => {
+      if (document.hidden) { scheduleReviewStatus(); return; }
+      pollReviewStatus();
+    }, wait);
+  }
+
+  function stopReviewStatus() {
+    clearTimeout(reviewStatusTimer);
+    reviewStatusTimer = null;
+  }
+
+  /**
+   * One sweep. Never throws: a failed sweep is silently retried on the next
+   * tick (fail-fast timeout, no retry) and the hydrated schedule keeps the
+   * page correct on its own cadence no matter what happens here. On a real
+   * status flip the fresh official status is merged into `games`
+   * field-by-field (a projected sweep must never delete a field the
+   * hydrated schedule supplied) and the page re-renders immediately — the
+   * 🚨 ticker, the per-card review badges and the Challenges tab then show
+   * the review ~250ms after MLB flips the status, not on the next 500ms
+   * schedule poll. scheduleNext() runs right after so the main poll also
+   * drops to its 250ms review cadence.
+   */
+  async function pollReviewStatus() {
+    // No endpoint = no feature (api.js always ships it on index.html).
+    if (!MLB.getReviewStatus) { stopReviewStatus(); return; }
+    if (reviewStatusInFlight) { scheduleReviewStatus(); return; }
+    const requestDate = dateStr;
+    reviewStatusInFlight = true;
+    try {
+      const list = await MLB.getReviewStatus(requestDate,
+        { timeout: REVIEW_STATUS_TIMEOUT_MS, retries: 0 });
+      if (requestDate === dateStr) {
+        // The sweep's own result drives the next cadence (see
+        // reviewStatusIntervalMs) — the projected slate knows what is live
+        // even before the hydrated schedule lands.
+        lastSweepHadLive = (list || []).some((g) => g && g.status &&
+          (g.status.abstractGameState === 'Live' || gameIsUnderReview(g)));
+        const diff = scheduleStatusFlips(reviewStatusCodes, list);
+        const firstSweep = reviewStatusCodes.size === 0 && diff.codes.size > 0;
+        reviewStatusCodes = diff.codes;
+        // games.length guard: right after a date switch the hydrated slate
+        // has not landed yet (games = []) — there is nothing to merge into
+        // or render, and load() will paint the new date correctly.
+        if (diff.changed && !firstSweep && games.length) {
+          mergeReviewStatusIntoGames(list);
+          render();
+          scheduleNext(); // re-evaluate cadence (e.g. drop to 250ms review poll)
+        }
+      }
+    } catch (err) {
+      // Deliberately quiet: see the doc comment above.
+    } finally {
+      reviewStatusInFlight = false;
+      scheduleReviewStatus();
+    }
+  }
+
+  /** Copy the watcher's fresh official status onto the matching `games`
+   *  entries so render()/scheduleNext() see it without waiting for the next
+   *  hydrated-schedule poll. Merged field-by-field (Object.assign onto a
+   *  copy), exactly like the Replay Feed's mergeReviewStatusIntoGames. */
+  function mergeReviewStatusIntoGames(list) {
+    const byStatus = new Map();
+    (list || []).forEach((g) => {
+      if (g && g.gamePk != null && g.status) byStatus.set(g.gamePk, g.status);
+    });
+    games.forEach((g) => {
+      if (!g || g.gamePk == null) return;
+      const fresh = byStatus.get(g.gamePk);
+      if (!fresh) return;
+      g.status = Object.assign({}, g.status || {}, fresh);
+    });
   }
 
   function updateDateLabel() {
@@ -357,6 +512,9 @@
 
   window.Scoreboard = {
     retry() { load(); },
+    // Test seam: the pure sweep-diff policy (no closure state), pinned by
+    // tools/page-status-watcher-test.mjs.
+    _scheduleStatusFlips: scheduleStatusFlips,
     setFilter(f) {
       filter = f;
       render();
@@ -392,8 +550,21 @@
 
     updateDateLabel();
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) load();
+      if (!document.hidden) {
+        // load() re-renders from the hydrated schedule; the watcher (stopped
+        // on hide) restarts here for its one sweep-armed lifetime.
+        scheduleReviewStatus();
+        load();
+      } else {
+        // No hidden-tab requests at all: park the fast status sweep.
+        stopReviewStatus();
+      }
     });
+    // The status watcher self-perpetuates from this single (fast) arming: it
+    // re-evaluates its own cadence every tick — fast while the slate it
+    // observes has anything live, 5s otherwise — without ever being reset by
+    // the schedule poll's phase.
+    scheduleReviewStatus(true);
     load();
   });
 })();

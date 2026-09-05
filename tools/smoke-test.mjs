@@ -364,8 +364,9 @@ try {
   check('review-status projection fetched', false, err.message);
 }
 
-/* per-game status projection: MLB.getGameStatus() — the game page's fast
- * review probe, raced against the full feed. */
+/* per-game status projection: MLB.getGameStatus() — the game page's 250ms
+ * standalone review-status watcher (2026-09-05; previously an in-cycle
+ * race against the full feed). */
 console.log('\n== per-game status projection (game-page review probe) ==');
 try {
   if (!feedPk) {

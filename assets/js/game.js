@@ -21,6 +21,27 @@
   // next tick; the next probe retries anyway (probe failure → retry in 1s).
   const PROBE_TIMEOUT_MS = 3000;
   const PROBE_RETRIES = 0;
+  // Standalone review-status watcher (added 2026-09-05 — see
+  // docs/latency-audit.md addendum). While the game is live and NOT already
+  // known to be in review, this timer sweeps the ~150-byte per-game status
+  // projection (MLB.getGameStatus — verified live 2026-09-05 to return
+  // exactly {"gameData":{"status":{…}}} in one small response) every 250ms,
+  // so a brand-new challenge/review is seen at ≤250ms instead of at the next
+  // 500ms full-feed cycle. The official status is the field MLB flips the
+  // instant a review is CALLED (registry codes M*/N*/IH — see
+  // statusSaysReview below), i.e. the earliest signal that exists.
+  const STATUS_WATCH_POLL_MS = 250;
+  const STATUS_WATCH_RECHECK_MS = 1000; // in-review: timer-only check-ins (no fetch)
+  const STATUS_WATCH_IDLE_MS = 5000;    // parked when preview/final/hidden
+  const STATUS_WATCH_TIMEOUT_MS = 2500; // stalled sweep fails fast; next tick retries
+  // MLB writes the review STATUS before the feed content carries the review.
+  // For this long after a watcher flip, renderAll() must NOT clobber the
+  // watcher's lastActiveReview (and its 🚨 status line) just because the
+  // freshly downloaded feed does not show the review yet — otherwise the two
+  // writers flap at 250ms and every flap re-downloads the 1-2MB full feed.
+  // The grace is short and self-expiring; once the feed shows the review the
+  // flag is authoritative again, and a status that reverts clears naturally.
+  const STATUS_LEAD_GRACE_MS = 3000;
 
   let gamePk = null;
   let feed = null;
@@ -33,9 +54,16 @@
   let lastActiveReview = false;
   let activeTab = 'plays';
   let requestInFlight = false;
-  // Incremented on every load() so an out-of-band status probe from an older
-  // cycle can never write into a newer one.
-  let loadCycle = 0;
+  // Review-status watcher state: its own timer (never shares the poll timer)
+  // and an in-flight guard so a sweep can never overlap itself and stack
+  // requests on a slow network.
+  let statusWatchTimer = null;
+  let statusWatchInFlight = false;
+  // When the watcher last saw the official status enter a review state, plus
+  // the official label to show while the full feed catches up (see
+  // STATUS_LEAD_GRACE_MS above).
+  let statusReviewObservedAt = 0;
+  let statusLeadLabel = '';
 
   /**
    * Is this official game `status` a review/challenge state?
@@ -82,12 +110,18 @@
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
         // load() already calls scheduleNext() on success/failure.
-        // There is no startPolling() in this file (verified).
+        // There is no startPolling() in this file (verified). The status
+        // watcher (stopped on hide) restarts here — its only re-arming
+        // points are boot and "tab shown" (it self-perpetuates otherwise).
+        scheduleStatusWatch();
         load(true);
       } else {
         stopPolling();
       }
     });
+    // Arm the 250ms review-status watcher once; it re-evaluates its own
+    // cadence every tick (fast while live && !in-review, parked otherwise).
+    scheduleStatusWatch();
     load(true);
   });
 
@@ -137,7 +171,6 @@
     if (!gamePk || requestInFlight) return;
     requestInFlight = true;
     lastCycleStartedAt = Date.now();
-    const cycle = (loadCycle += 1);
     if (showSpinner && !feed) $('#loading').classList.add('visible');
     try {
       let data;
@@ -170,31 +203,13 @@
           return;
         }
       }
-      // LATENCY: while the game is live and NOT already known to be in review,
-      // race a ~150-byte status projection against the 1-2MB full feed. The
-      // official status is the field that flips first when a review is called
-      // (registry: GET /api/v1/gameStatus — statusCode M*/N*/IH), so this is
-      // how the page learns "under review" in one small round trip instead of
-      // after the whole feed has downloaded. It never replaces the full feed:
-      // renderAll() below still decides everything from the authoritative
-      // payload, and the `cycle` guard makes a late probe a no-op.
-      if (!lastActiveReview && isLive() && MLB.getGameStatus) {
-        MLB.getGameStatus(gamePk, { timeout: PROBE_TIMEOUT_MS, retries: 0 })
-          .then((statusFeed) => {
-            if (cycle !== loadCycle || !requestInFlight) return;
-            const st = statusFeed && statusFeed.gameData && statusFeed.gameData.status;
-            if (!statusSaysReview(st)) return;
-            // Flip the cadence immediately so the NEXT tick is the 250ms
-            // review probe, and say so now rather than after the feed lands.
-            lastActiveReview = true;
-            const line = $('#status-line');
-            if (line) {
-              line.textContent =
-                `🚨 ${(st.detailedState || 'Review in progress')} — loading details…`;
-            }
-          })
-          .catch(() => { /* the full feed below is the authority */ });
-      }
+      // NOTE (2026-09-05): a brand-new review is no longer detected by racing
+      // a ~150-byte status projection inside this 500ms cycle — the dedicated
+      // 250ms status watcher below (scheduleStatusWatch / pollGameStatus)
+      // sees the official status flip at ≤250ms BETWEEN cycles and kicks an
+      // out-of-band load() immediately, so the banner lands one feed round
+      // trip after the flip instead of up to a full cycle later. renderAll()
+      // below still decides everything from the authoritative full payload.
       data = await MLB.getLiveFeed(gamePk);
       const token = feedToken(data);
       const changed = token !== lastToken || !feed;
@@ -205,6 +220,16 @@
       if (changed) {
         renderAll();
       } else {
+        // Recompute review-ness even when nothing else changed: right after a
+        // review resolves — before any further play — the token is stable, and
+        // the flag must not stay stuck on (the status watcher re-arms off it;
+        // caught by tools/page-status-watcher-test.mjs §B4). A status-only
+        // review still goes through renderAll: its detailedState is part of
+        // the token, so a status flip always counts as a change.
+        const reviewData = window.MLBReviews
+          ? window.MLBReviews.extractReviews(data)
+          : { reviews: [], activeReview: null, summary: {} };
+        lastActiveReview = !!(reviewData && reviewData.activeReview) || statusLeadGraceActive();
         renderStatusLine();
       }
       $('#loading').classList.remove('visible');
@@ -296,6 +321,113 @@
     clearTimeout(pollTimer);
     clearInterval(countdownTimer);
     $('#countdown').textContent = '';
+    // The watcher has its own timer; a hidden tab must stop sweeping too.
+    stopStatusWatch();
+  }
+
+  /* ------------------------------------------- standalone review-status watch
+   * The LATENCY FIX for "a play is being challenged / is under review" on
+   * this page (2026-09-05; previously bounded by the 500ms live cycle):
+   *
+   *   worst case before : ~500ms (next full-feed cycle) + one feed RTT
+   *   worst case after  : ~250ms (watcher) + one feed RTT
+   *
+   * MLB flips the official game status the instant a review is CALLED,
+   * before any play text exists (verified finding, verification-report
+   * §16). While the game is live and not already known to be in review,
+   * pollGameStatus() sweeps MLB.getGameStatus — the ~150-byte `fields`
+   * projection of feed/live carrying ONLY gameData.status (verified live
+   * 2026-09-05, game 823256: exactly {"gameData":{"status":{…}}}) — every
+   * 250ms on its own timer. On a review flip it:
+   *   1. flips lastActiveReview so the very next tick is the 250ms lean
+   *      review probe (not a 500ms full-feed cycle),
+   *   2. paints "🚨 <official detailedState> — loading details…" from the
+   *      status alone, and
+   *   3. kicks an OUT-OF-BAND load() so the banner + review tab render from
+   *      the authoritative full feed right now, not on the next tick.
+   *
+   * It parks (5s, no requests; 1s timer-only check-ins once a review is
+   * known) when the game is preview/final or the tab is hidden, and is armed
+   * exactly twice per shown-tab lifetime (boot + tab-show) — see the
+   * self-perpetuation note inside scheduleStatusWatch. Cost while live:
+   * four ~150-byte requests per second — the same projection the old
+   * in-cycle race fetched twice per second, now on a faster clock.
+   */
+  function statusWatchIntervalMs() {
+    if (document.hidden) return STATUS_WATCH_IDLE_MS;
+    // Before the first feed lands there is nothing to sweep yet — re-park at
+    // the fast cadence WITHOUT fetching (pure timer tick, zero requests) so
+    // the watcher is hot the moment the first feed says the game is live.
+    if (!feed) return STATUS_WATCH_POLL_MS;
+    if (!isLive()) return STATUS_WATCH_IDLE_MS; // preview/final: nothing to watch
+    if (lastActiveReview) {
+      // A review is known: the 250ms lean probe owns updates, so no sweeps —
+      // but check in every second (timer-only, zero requests) so the watcher
+      // resumes its fast sweep within ~1s of the review resolving, instead of
+      // staying parked at the 5s idle cadence (a back-to-back status-only
+      // challenge must not wait 5s — the old in-cycle race caught it in 500ms).
+      return STATUS_WATCH_RECHECK_MS;
+    }
+    return STATUS_WATCH_POLL_MS;
+  }
+
+  function scheduleStatusWatch() {
+    clearTimeout(statusWatchTimer);
+    // The timer is SELF-PERPETUATING (every path — including the hidden park
+    // and pollGameStatus's finally — re-arms it, recomputing the cadence from
+    // current state), so nothing else may re-arm it: resetting the phase from
+    // every 500ms poll cycle would stretch the 250ms sweep to ~2/s (caught by
+    // tools/page-status-watcher-test.mjs §B1). It is armed exactly once per
+    // "shown" lifetime: at boot and on visibilitychange→show.
+    statusWatchTimer = setTimeout(() => {
+      if (document.hidden) { scheduleStatusWatch(); return; }
+      pollGameStatus();
+    }, statusWatchIntervalMs());
+  }
+
+  function stopStatusWatch() {
+    clearTimeout(statusWatchTimer);
+    statusWatchTimer = null;
+  }
+
+  /**
+   * One sweep. Never throws: a failed sweep is silently retried on the next
+   * tick (fail-fast timeout, no retry), and the full feed remains the
+   * authority for everything rendered. A sweep must never overlap itself.
+   */
+  async function pollGameStatus() {
+    if (!gamePk || statusWatchInFlight) { scheduleStatusWatch(); return; }
+    // Nothing to sweep until the first feed lands (boot phase): re-park at
+    // the fast cadence without fetching (see statusWatchIntervalMs).
+    if (!feed) { scheduleStatusWatch(); return; }
+    // Only sweep while the sweep can learn something: a review can only be
+    // CALLED on a live game, and once lastActiveReview is true the 250ms
+    // lean probe (reviewProbeState) owns every in-review update.
+    if (!isLive() || lastActiveReview) { scheduleStatusWatch(); return; }
+    statusWatchInFlight = true;
+    try {
+      const payload = await MLB.getGameStatus(gamePk,
+        { timeout: STATUS_WATCH_TIMEOUT_MS, retries: 0 });
+      const st = payload && payload.gameData && payload.gameData.status;
+      if (st && statusSaysReview(st) && !lastActiveReview) {
+        lastActiveReview = true;
+        statusReviewObservedAt = Date.now();
+        statusLeadLabel = st.detailedState || 'Review in progress';
+        const line = $('#status-line');
+        if (line) {
+          line.textContent = `🚨 ${statusLeadLabel} — loading details…`;
+        }
+        // Out-of-band full feed: renders the banner + review tab now. If a
+        // cycle is already in flight its own full feed carries the review;
+        // the requestInFlight guard makes the redundant call a no-op.
+        load(false);
+      }
+    } catch (err) {
+      // Deliberately quiet — see the doc comment above.
+    } finally {
+      statusWatchInFlight = false;
+      scheduleStatusWatch();
+    }
   }
 
   function startCountdown(interval) {
@@ -356,10 +488,22 @@
 
   /* ------------------------------------------------------------- rendering */
 
+  /** Within STATUS_LEAD_GRACE_MS of a watcher flip the official status is
+   *  trusted over the (lagging) feed — see STATUS_LEAD_GRACE_MS. */
+  function statusLeadGraceActive() {
+    return isLive() && lastActiveReview && statusReviewObservedAt > 0 &&
+      (Date.now() - statusReviewObservedAt) < STATUS_LEAD_GRACE_MS;
+  }
+
   function renderAll() {
     document.title = pageTitle();
     const reviewData = window.MLBReviews ? window.MLBReviews.extractReviews(feed) : { reviews: [], activeReview: null, summary: {} };
-    lastActiveReview = !!(reviewData && reviewData.activeReview);
+    // The feed is authoritative EXCEPT during the status-lead grace window,
+    // when MLB has flipped the official status to a review state but has not
+    // written the review into the feed yet (verified finding, verification-
+    // report §16). Without the grace the two writers flap and each flap
+    // re-downloads the full feed.
+    lastActiveReview = !!(reviewData && reviewData.activeReview) || statusLeadGraceActive();
     renderLiveReviewAlert(reviewData.activeReview);
     renderReviewTabBadge(reviewData.reviews.length);
     renderHeader();
@@ -1377,6 +1521,12 @@
     if (isLive()) {
       const interval = currentInterval() / 1000;
       bits.push(`refreshing every ${interval}s`);
+    }
+    // While the official status says review but the feed has not caught up
+    // (the status-lead grace), keep the 🚨 label on screen instead of letting
+    // the ordinary "Updated …" line erase it.
+    if (statusLeadGraceActive()) {
+      bits.unshift(`🚨 ${statusLeadLabel} — loading details…`);
     }
     line.textContent = bits.join(' · ');
   }

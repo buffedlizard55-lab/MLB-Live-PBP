@@ -450,13 +450,23 @@ assert.equal(context.window.ReplayFeed.getRunsAtRisk(), 0, 'nothing at risk befo
   assert.ok(calls.reviewStatus > before, 'becoming visible sweeps immediately');
 }
 
-/* 8. The watcher really is faster than the schedule cache it replaced. */
+/* 8. The watcher really is faster than the schedule cache it replaced, and
+ * the 2026-09-05 cadence tightening is pinned: the live playByPlay scan runs
+ * at 250ms (was 500ms — see docs/latency-audit.md addendum) and the
+ * post-Final fast rescan gap is 2.5s (was 5s). */
 {
   const src = readFileSync(new URL('../assets/js/reviews-feed.js', import.meta.url), 'utf8');
   const watcherMs = Number(/REVIEW_STATUS_POLL_MS\s*=\s*(\d+)/.exec(src)[1]);
   const ttl = Number(/SCHEDULE_TTL_MS\s*=\s*(\d+)/.exec(src)[1]);
   assert.equal(watcherMs, 250, 'the watcher cadence is 250ms');
   assert.ok(watcherMs < ttl, `watcher ${watcherMs}ms < schedule cache ${ttl}ms`);
+  const liveMs = Number(/LIVE_POLL_MS\s*=\s*(\d+)/.exec(src)[1]);
+  const reviewMs = Number(/REVIEW_POLL_MS\s*=\s*(\d+)/.exec(src)[1]);
+  assert.equal(liveMs, 250, 'the live playByPlay scan cadence is 250ms (2026-09-05)');
+  assert.equal(reviewMs, 250, 'the in-review cadence is 250ms');
+  const recentMs = Number(/SCORING_RECENT_RESCAN_MS\s*=\s*([\d.]+\s*\*\s*1000|\d+)/.exec(src)[1]
+    .replace(/\s*\*\s*1000/, ''));
+  assert.equal(recentMs, 2.5, 'the post-Final fast rescan gap is 2.5s (2026-09-05)');
 }
 
 console.log('Review-status watcher integration test passed successfully!');
