@@ -28,10 +28,36 @@ const MLB = (() => {
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  /* ------------------------------------------------------------------ rate
+   * The StatsAPI publishes no rate limit and needs no key, but it CAN answer
+   * HTTP 429 ("Too Many Requests") — the service's own "slow down" signal.
+   * Honoring it is part of being a good citizen: after ANY 429, every
+   * endpoint funneled through getJSON() waits out the remainder of a 60s
+   * quiet period before issuing its next request, so a page that polls at
+   * 250ms automatically throttles itself to ~1 request per minute per
+   * outstanding call until the window clears. The flag is process-wide (all
+   * endpoints share one host and one budget). Normal 2xx/4xx/5xx traffic
+   * never trips it.
+   */
+  const RATE_LIMIT_BACKOFF_MS = 60 * 1000;
+  let lastRateLimitedAt = 0;
+
+  /** Milliseconds remaining in the current 429 quiet period (0 = none). */
+  function rateLimitedForMs() {
+    return lastRateLimitedAt
+      ? Math.max(0, lastRateLimitedAt + RATE_LIMIT_BACKOFF_MS - Date.now())
+      : 0;
+  }
+
   /** Fetch JSON with a timeout + simple exponential retry. */
   async function getJSON(url, { timeout = 8000, retries = 1, signal, cache = 'no-store' } = {}) {
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt += 1) {
+      // Honor a prior 429 before spending another request. This delays the
+      // call itself (rather than throwing) so callers keep their ordinary
+      // error handling; the timeout budget below still applies to the fetch.
+      const quiet = rateLimitedForMs();
+      if (quiet > 0) await sleep(quiet);
       const ctrl = new AbortController();
       const onAbort = () => ctrl.abort();
       if (signal) signal.addEventListener('abort', onAbort, { once: true });
@@ -43,6 +69,7 @@ const MLB = (() => {
           headers: { Accept: 'application/json' },
         });
         if (!res.ok) {
+          if (res.status === 429) lastRateLimitedAt = Date.now();
           const err = new Error(`HTTP ${res.status} for ${url}`);
           err.status = res.status;
           throw err;
@@ -435,6 +462,7 @@ const MLB = (() => {
   return {
     getSchedule, getReviewStatus, getGameStatus, getLiveFeed, getPlayByPlay,
     getTeams, getChallengeCounts,
+    rateLimitedForMs,
     teamLogoUrl, teamLogoFallbackUrl, headshotUrl,
     ordinal, localTime, localDate, localDateTime,
     inningLabel, inningGlyph, sides, scoreOf,

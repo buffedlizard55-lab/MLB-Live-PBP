@@ -679,3 +679,59 @@ Production constants (the IIFE owns them):
   review-probe,review-status,review-watcher,official-scoring,scoring-change,api-fields,hit-model`.
 - Net effect: worst-case post-Final scoring-change wait drops from ~30 s to **~5 s in the first
   5 minutes** after Final and **~15 s** thereafter. Cross-referenced in `docs/latency-audit.md`.
+
+## 18. Latency pass 2026-09-05: feed scan 250ms, page/scoreboard status watchers, 429 self-throttle
+
+Scope: close every remaining >250ms gap in the delivery of challenges, reviews, boundary
+calls, under-review, runs-at-risk, official-scoring-pending, all review updates and the
+scoring-change tracker — without spamming the API. Full change list, line references and the
+category-by-category before/after table live in `docs/latency-audit.md` (2026-09-05 addendum).
+This section records what was **verified live this session** and what the new tests caught.
+
+### 18.1 Live verifications made this session (2026-09-05, via this sandbox's page-fetch tool — the shell itself has no outbound network)
+
+| Claim | Result |
+|---|---|
+| Whole-slate `fields`-projected schedule (the watcher sweep) returns the full slate in ONE small chunk | ✅ live — `GET /api/v1/schedule?sportId=1&date=2026-09-04&fields=dates,games,gamePk,status,…` → 16 games (13 Final, 3 Live) in a single response chunk; the 2026-09-05 sweep returned all 15 games (all Preview) likewise |
+| Per-game status projection is exactly the documented ~150-byte shape | ✅ live — `GET /api/v1.1/game/823256/feed/live?fields=gameData,status,…` → exactly `{"gameData":{"status":{"abstractGameState":"Live","codedGameState":"I","detailedState":"In Progress","statusCode":"I","startTimeTBD":false,"abstractGameCode":"L"}}}` — no players, no liveData |
+| The projected playByPlay the 250ms scan uses is lean on a real live game | ✅ live — the exact `PBP_FIELDS` URL for live game 823256 (NYY@SD, early innings) returned 20 tool-chunks mid-game (repo-documented full-game comparison: 26 projected vs 76 unprojected chunks, §15) |
+
+### 18.2 New deterministic coverage (all network-free, all run in CI via the README list)
+
+| Suite | Pins |
+|---|---|
+| `tools/page-status-watcher-test.mjs` (new) | Boots the REAL `scoreboard.js` (Part A) and the REAL `game.js` + REAL `reviews.js` (Part B) through their DOMContentLoaded paths with fake timers and a recording DOM. A: pure `scheduleStatusFlips` diff policy (adopt/identical/review-flip/delay-reason/slate-size); boot arming; **no-change sweeps never re-render** (isolated with a parked schedule fetch); 250ms sweep cadence while live; review flip → ticker up ≤250ms + main poll drops to 250ms; resolution clears the ticker; hidden-tab park/resume; idle 5s backoff. B: 250ms watcher cadence while live; status flip → "🚨 \<registry detailedState\>" status line + OUT-OF-BAND full feed; banner renders from the authoritative feed; lean probe owns in-review ticks while the watcher parks at 1s check-ins; resolution + grace expiry re-arms the watcher; hidden-tab park/resume. |
+| `tools/api-rate-limit-test.mjs` (new) | Boots the real `api.js` with a recording setTimeout: 2xx paths never sleep; a 429 arms a ~60s quiet period and still propagates; the next request on ANY endpoint first sleeps exactly the remaining window (one deliberate sleep, one request); the window expires with time; one shared budget across endpoints; 404/500/503 never arm it. |
+| `tools/review-watcher-test.mjs` §8 (extended) | Source-pins the tightened constants: `LIVE_POLL_MS = 250`, `REVIEW_POLL_MS = 250`, `SCORING_RECENT_RESCAN_MS = 2.5s` (plus the pre-existing `REVIEW_STATUS_POLL_MS = 250 < SCHEDULE_TTL_MS`). |
+
+### 18.3 Real bugs the new tests caught in the new code (and their fixes)
+
+1. **Phase-reset degradation:** re-arming a watcher from every poll cycle (`scheduleNext`) clears
+   and re-sets its timer, stretching a nominal 250ms sweep to ~2/s whenever ordinary polls
+   complete in between — observed as exactly 2 sweeps/1000ms in §A3. Fix: the watchers are
+   self-perpetuating (every path re-arms), started only at boot and on tab-show.
+2. **Stuck review flag:** the game page recomputed `lastActiveReview` only inside `renderAll`,
+   which runs only when the feed token changes — after a review resolved with no further play,
+   the token was stable and the flag stayed `true` forever, keeping the page on the probe path
+   and the watcher parked. Fix: recompute on unchanged-token cycles too (game.js `load()`).
+3. **Writer flapping:** the watcher (status says review) and `renderAll` (feed does not yet)
+   could overwrite each other at 250ms, each flap re-downloading the 1–2MB full feed. Fix: the
+   3s `STATUS_LEAD_GRACE_MS` trusts the official status over the lagging feed, and
+   `renderStatusLine` keeps the 🚨 label during the window.
+4. **Back-to-back reviews:** parking the game-page watcher at the 5s idle cadence while a
+   review was known would delay a *status-only* re-challenge after a resolution by up to 5s
+   (the retired in-cycle race caught it in 500ms). Fix: 1s timer-only check-ins
+   (`STATUS_WATCH_RECHECK_MS`) — zero requests, ≤1s resume.
+
+### 18.4 Politeness budget (why this honors the API)
+
+- **No API keys exist** for the MLB StatsAPI — there is no key-holder ToS to violate; the
+  constraint is the host's tolerance. Worst case with a full ~15-game live slate and the
+  Replay Feed open: ~60 projected-playByPlay requests/s + ~4 whole-slate status sweeps/s
+  (~10 KB/s) ≈ **64 req/s from one browser** — the same cadence the feed already used
+  whenever any review was in flight, two-plus orders of magnitude under "thousands per
+  second". Game page: full feed every 500ms + a ~150-byte probe 4×/s while live and not in
+  review. Scoreboard: hydrated schedule every 500ms + the 2.4KB sweep 4×/s.
+- Hidden tabs pause everything; idle slates back off to 5s; finals settle after the bounded
+  30-minute grace; and **any HTTP 429 now throttles the entire client for 60s** (§18.2),
+  so if MLB ever pushes back, the app slows itself down automatically.

@@ -1676,12 +1676,26 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
   // Cadence is the gap between poll STARTS (scan duration is subtracted in
   // waitAfterScan). The StatsAPI is pull-only — a shorter poll only reduces
   // how long a landed review sits unseen. Hidden tabs still pause.
-  //   live games          : 500ms
+  //   live games          : 250ms (2026-09-05: was 500ms — this is the same
+  //                          cadence the page already used whenever ANY
+  //                          review was in flight, now applied to all live
+  //                          action. It puts EVERY scan-borne category —
+  //                          official-scoring-pending first detection, live
+  //                          scoring-change diffs, ABS challenge rows,
+  //                          runs-at-risk detail, review outcome rows — at
+  //                          the same ≤250ms + one round trip floor the
+  //                          status watcher already gives review flips.)
   //   a review in flight  : 250ms (outcome flips are what the feed is for;
   //                          in-review games are fetched first, so the flip
   //                          lands ~1 request after poll start)
   //   no live games       : 5s
-  const LIVE_POLL_MS = 500;
+  // Politeness: 250ms is inside the README's documented 0.25–0.5s etiquette
+  // band; the tab pauses entirely when hidden, an idle slate backs off to 5s,
+  // finals settle after a bounded 30-minute grace, and api.js self-throttles
+  // for 60s if the API ever answers 429. Worst case on a full 15-game slate:
+  // ~60 playByPlay requests/s + 4 tiny status sweeps/s — two orders of
+  // magnitude below "thousands of requests per second".
+  const LIVE_POLL_MS = 250;
   const REVIEW_POLL_MS = 250;
   const IDLE_POLL_MS = 5000;
   // The schedule is re-fetched at most once per SCHEDULE_TTL_MS (the slate
@@ -1743,11 +1757,13 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
   // window the rescan gap is recency-tiered: a recently-Final game (most
   // likely to still get a scoring decision) is re-scanned at the fast gap,
   // then the base gap, so the worst-case delay for a post-Final change drops
-  // from the old flat ~30s to as little as ~5s in the early, most likely
-  // window while total request volume stays capped by the 30-minute grace.
+  // from the old flat ~30s to as little as ~2.5s in the early, most likely
+  // window while total request volume stays capped by the 30-minute grace
+  // (2026-09-05: fast gap tightened 5s → 2.5s; ≤120 fast-window requests per
+  // finished game, then ≤100 more across the remaining 25 minutes).
   const SCORING_CHANGE_GRACE_MS = 30 * 60 * 1000;   // 30 minutes after Final
   const SCORING_FINAL_RESCAN_MS = 15 * 1000;        // base gap once the fast window passes
-  const SCORING_RECENT_RESCAN_MS = 5 * 1000;        // fast gap while the game is recently Final
+  const SCORING_RECENT_RESCAN_MS = 2.5 * 1000;      // fast gap while the game is recently Final
   const SCORING_RECENT_FINAL_WINDOW_MS = 5 * 60 * 1000;  // "recently Final" = first 5 minutes
 
   let dateStr = todayStr();

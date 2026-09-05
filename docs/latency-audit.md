@@ -2,14 +2,71 @@
 
 **Scope:** this document first traces — **line by line, no guessed field names, no invented
 numbers** — how each requested update category reaches the UI and what its latency ceiling is.
-It then records the one latency **reduction that was implemented** (see the dated addendum below)
-after re-reviewing the same code path the audit flagged as the single genuine slow tail.
-Every figure below is tied to a real code line/constant or to a live-verification already
-documented in this repo; it is not re-measured wall-clock here (this sandbox's tools have no
-outbound network — see "Method" and "What I did NOT claim").
+It then records the latency **reductions that were implemented** (see the dated addenda below)
+after re-reviewing the same code paths. Every figure below is tied to a real code line/constant
+or to a live-verification already documented in this repo; wall-clock timings were not
+re-measured here (this sandbox's shell has no outbound network — some endpoints were
+re-verified live on 2026-09-05 through the sandbox's page-fetch tool; see the 2026-09-05
+addendum and `docs/verification-report.md` §18).
 
-**Baseline:** all deterministic suites green before this audit and green again after the change
-(`node tools/{review,reviews-feed,replay-feed-render,review-probe,review-status,review-watcher,official-scoring,scoring-change,api-fields,hit-model}-test.mjs` + `count-model-derivation.mjs`).
+**Baseline:** all deterministic suites green before this audit and green again after every change
+(`node tools/{api-fields,api-rate-limit,feed-log-persistence,hit-model,official-scoring,page-status-watcher,replay-feed-render,review-probe,review-status,review-test,review-watcher,reviews-feed,scoring-change}-test.mjs`).
+
+---
+
+## >> CHANGE IMPLEMENTED — 2026-09-05: every remaining multi-250ms gap closed (politely)
+
+The 2026-09-04 pass left the Replay Feed at the pull floor but listed three deliberately
+unimplemented options (old §8) plus one cadence tier. All are implemented now, verified
+line by line, with tests. **No API keys exist** (the MLB StatsAPI is keyless); politeness is
+therefore enforced by design — bounded request rates, hidden-tab pause, idle backoff, a
+30-minute post-Final grace, and a **new HTTP-429 self-throttle** that backs the whole client
+off for 60s if the API ever says "slow down". Worst case on a full ~15-game slate is ~64
+requests/s from one browser (~60 lean playByPlay + ~4 tiny status sweeps) — two orders of
+magnitude below "thousands of requests per second".
+
+| # | Change | File:line (2026-09-05) | Effect on the categories you listed |
+|---|---|---|---|
+| 1 | Replay Feed live playByPlay scan **500ms → 250ms** | `reviews-feed.js:1698` (`LIVE_POLL_MS = 250`) | First detection of **official-scoring-pending markers**, **live scoring-change diffs**, **ABS challenge rows**, **runs-at-risk detail** and **review outcome rows** drops from ≤500ms to ≤250ms + one round trip — the same floor the status watcher already gave review flips. This is the cadence the page already used whenever any review was in flight; it is now the ordinary live cadence (inside the README's documented 0.25–0.5s etiquette band). |
+| 2 | Post-Final fast rescan **5s → 2.5s** | `reviews-feed.js:1766` (`SCORING_RECENT_RESCAN_MS = 2.5 * 1000`) | A **scoring change published right after a game goes Final** is caught in ≤2.5s during the first 5 minutes (was ≤5s), ≤15s afterwards, grace still capped at 30min — ≤~220 requests per finished game total. |
+| 3 | Game page: dedicated **250ms review-status watcher** | `game.js:33-44` (constants), `:356-423` (`statusWatchIntervalMs`/`scheduleStatusWatch`/`pollGameStatus`) | A **brand-new challenge/review/boundary call** on the game page is detected in ≤250ms (was ≤500ms + full-feed cycle): the ~150-byte per-game status projection is swept on its own timer; on a review-code flip it paints "🚨 \<official detailedState\> — loading details…" and kicks an out-of-band full feed that renders the banner. It replaces the old in-cycle raced probe (same projection, faster clock, same request budget). A 3s *status-lead grace* (`STATUS_LEAD_GRACE_MS`, game.js:44) keeps the official status trusted over the lagging feed so the two writers cannot flap. |
+| 4 | Scoreboard: dedicated **250ms slate status watcher** | `scoreboard.js:26-30` (constants), `:154` (`scheduleStatusFlips`, pure + tested), `:190-225` (`scheduleReviewStatus`), `:227-270` (`pollReviewStatus`) | The 🚨 **review ticker / card badges / Challenges tab** appear ≤250ms after MLB flips any game to a review code (was: next 500ms hydrated-schedule poll), via the same ~2.4KB whole-slate projection the Replay Feed uses. Re-renders only on a real status flip; the main schedule poll keeps its own 500ms cadence (scores don't need 250ms; review status does). |
+| 5 | **HTTP-429 self-throttle** in the shared client | `api.js:42` (`RATE_LIMIT_BACKOFF_MS = 60s`), `:46` (`rateLimitedForMs`), `:60-63,72` (arm on 429, wait before every request) | Honors the API's own "slow down" signal: after ANY 429, every endpoint funneled through `getJSON()` waits out the remainder of a 60s quiet period before its next request. Normal 2xx/404/500 traffic never trips it (`tools/api-rate-limit-test.mjs` pins all six behaviors). |
+
+**Bugs the new integration tests caught during implementation** (fixed before landing —
+this is why the boot-path tests exist):
+- Re-arming a watcher from every poll cycle *resets its 250ms phase* and silently degrades it
+  to ~2 sweeps/s (`tools/page-status-watcher-test.mjs` §A3/§B1). The watchers are now
+  **self-perpetuating** — armed exactly once per shown-tab lifetime.
+- After a review resolves with no further play, the game page's feed token is stable, so
+  `lastActiveReview` was only recomputed inside `renderAll` and could stay stuck `true`
+  forever (§B4). It is now recomputed on every unchanged-token cycle too.
+- The game-page watcher parks at a **1s timer-only check-in** (no requests) while a review is
+  known (`STATUS_WATCH_RECHECK_MS`, game.js:34) so a back-to-back status-only challenge after
+  a resolution is caught in ≤1s, not ≤5s.
+
+**Updated category table (all surfaces, 2026-09-05):**
+
+| Category | Ceiling before | Ceiling now |
+|---|---|---|
+| New challenge / review / boundary / under-review (Replay Feed) | 250ms watcher | 250ms watcher (unchanged — already at floor) |
+| Same, on the **game page** | ~500ms + feed RTT | **≤250ms + feed RTT** (watcher, #3) |
+| Same, on the **scoreboard ticker** | ~500ms schedule poll | **≤250ms** (watcher, #4) |
+| All review updates / outcomes (feed + game page) | 250ms (probe/watcher) | 250ms (unchanged) |
+| Runs at risk | ~1 pbp RTT after flip | unchanged, plus scan-side detail now ≤250ms (#1) |
+| Official scoring pending — first marker | ≤500ms | **≤250ms** (#1) |
+| Official scoring pending — resolution (live) | ≤250ms while pending (`inProgress:true` rows keep the feed fast — verified `reviews.js:419`) | unchanged |
+| Scoring change tracker — live | ≤500ms | **≤250ms** (#1) |
+| Scoring change tracker — post-Final | ≤5s (first 5min) / ≤15s | **≤2.5s** / ≤15s (#2) |
+
+**Not done, deliberately:** no cadence below 250ms (the API is pull-only; sub-250ms polling
+would multiply requests for at most ~125ms of average gain), no per-game cadence splitting on
+the feed (the whole-slate wave is one request deep; splitting adds complexity without changing
+the floor), and the game page's full-feed poll stays at 500ms (review-relevant paths are all
+at 250ms; doubling full-feed bytes for scores was judged impolite). The §16.4 caveat that a
+live mid-review `statusCode:"MA"` payload has never been captured still stands — the watcher
+is driven by the same registry that §16.1 cross-checked, and the deterministic tests drive it
+with verbatim registry rows.
 
 ---
 
@@ -74,6 +131,10 @@ signal the earliest one MLB publishes?*
 ---
 
 ## 2. One-page answer (what reaches you when)
+
+*(2026-09-05: the 500ms ceilings in this table were halved to 250ms and the §8 options 1–2
+were implemented — see the addendum at the top. The table below is preserved unchanged as
+the 2026-09-04 baseline it verified.)*
 
 | Category you listed | Earliest official signal MLB publishes | Detected by (surface) | Cadence of that poll | New-event latency ≈ |
 |---|---|---|---|---|
@@ -209,6 +270,13 @@ out to `reviews.html`, where the 250 ms status watcher catches the review-state 
   constant or logic was altered.
 
 ## 8. Remaining options to push further (not implemented — each costs extra API requests)
+
+> **[2026-09-05 update: options 1 and 2 below — the game.html and scoreboard status
+> watchers — ARE implemented now (see the addendum at the top, changes #3 and #4).
+> Option 3 remains not implemented by design: official-scoring-pending and scoring
+> changes cannot be surfaced from the schedule, and per-game playByPlay polling on
+> the scoreboard would add per-game requests every cycle for categories the Replay
+> Feed already delivers at 250ms.]**
 
 - **game.html new-review detection:** add a standalone ~150-byte status watcher (mirroring the feed) so a brand-new review drops the page to 250 ms without waiting for the next 500 ms feed cycle.
 - **Scoreboard new-review detection:** add the same lightweight watcher so the ticker appears at ~250 ms instead of the next ~500 ms schedule poll.
