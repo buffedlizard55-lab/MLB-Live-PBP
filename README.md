@@ -285,7 +285,15 @@ node tools/review-status-test.mjs         # official gameStatus registry + revie
 node tools/review-watcher-test.mjs        # 250ms review-status watcher, driven through the real boot path
 node tools/official-scoring-test.mjs      # official-scorer pending rulings
 node tools/api-fields-test.mjs            # playByPlay `fields` projection coverage
+node tools/scoring-change-test.mjs        # official scoring-change tracker (hit ↔ error ↔ out)
+node tools/feed-log-persistence-test.mjs  # replay feed log: every entry survives refresh/revisit
 ```
+
+Every entry the Replay Feed tracks (challenges, reviews, scoring-pending
+rulings, scoring changes) is also logged to the browser per date, so a page
+refresh or a later visit restores the feed rows, scoring baselines, and
+flagged irregularities — detection itself is unchanged (see
+`docs/scoring-changes.md`).
 
 To *see and hear* the ⚠️ Runs at Risk surfaces without waiting for a live review,
 serve the repo and open the offline, fixture-driven preview — it stubs the API with

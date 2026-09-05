@@ -90,6 +90,11 @@
       rulings published after the game. Payload edits without a reclassification (description /
       RBI / score only) and plays that vanish from the payload are flagged as irregularities for
       review, never corrected or hidden.
+      Every tracked entry is also logged to this browser (one log per date, newest seven dates
+      kept, 500 most-recent rows) so a refresh or a later visit restores the feed rows, the
+      scoring baselines and the flagged irregularities before the first scan runs; the log holds
+      only observed payload data, and anything malformed in it is dropped with a console warning
+      rather than guessed.
       Not affiliated with MLB or MLB Advanced Media.
     </p>
   </footer>
