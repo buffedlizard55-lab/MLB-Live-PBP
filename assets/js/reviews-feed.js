@@ -1335,6 +1335,341 @@ function finalScanDecision(grace, settled, now, graceMs, rescanMs, fastRescanMs,
   return 'scan';
 }
 
+/* ------------------------------------------------- feed-log persistence
+ *
+ * FEED LOG (every tracked entry survives a refresh or a later visit).
+ *
+ * The tracker above is poll-diff: a scoring change is knowable ONLY from two
+ * consecutive observations (initial call, then final ruling). Before this
+ * log, both observations lived in memory alone — a page refresh or a fresh
+ * visit wiped every feed row AND the baselines the next diff needed, so
+ * tracked entries were silently lost. This layer changes nothing about
+ * detection: after any poll that adds, updates, ends, or flags an entry, the
+ * page writes its whole observed state to localStorage (one log per date),
+ * and on boot / date change it restores that log before the first scan.
+ *
+ * What is stored — every field below is produced by the merge helpers above
+ * from official playByPlay fields (see buildScoringSnapshot / the
+ * mergeScoringChanges row shape / mergeFeedEvents entry shape). Nothing is
+ * invented for storage; the log is a verbatim copy of observed state:
+ *   entries        — feedState rows { gamePk, review, firstSeen, lastSeen,
+ *                    matchupLabel } in insertion order (reviews of every
+ *                    typeKey, pending-scoring rows, scoring_change rows)
+ *   order          — the stable `<gamePk>:<id>` key order
+ *   snapshots      — per-game scoring baselines { snapshot, signature,
+ *                    firstObservedAt, lastObservedAt, history, rowCreated }
+ *   irregularities — per-game flagged notes (already capped at 30 in memory)
+ *   grace/settled  — post-Final re-scan windows + settled finals, so a
+ *                    revisit continues the bounded grace instead of
+ *                    restarting (or abandoning) it
+ * Not stored: challenge counters (re-fetched live; a stale "now" value must
+ * never be shown) and run-risk alert keys (a revisit behaves exactly like a
+ * first visit — an actively risky review alerts its new observer).
+ *
+ * Bounds (localStorage is ~5 MB and shared): at most FEED_LOG_MAX_ENTRIES
+ * rows (most recent win), FEED_LOG_MAX_SNAPSHOTS_PER_GAME baselines per
+ * game (most recently observed win), FEED_LOG_MAX_IRREGULARITIES_PER_GAME
+ * notes per game, and FEED_LOG_MAX_DATES date-logs (the date on screen is
+ * always kept). Anything trimmed is counted in the payload (`trimmed`) and
+ * any malformed stored record is dropped with a warning — flagged for
+ * review, never silently hidden.
+ *
+ * Pure layer: no DOM, no storage access — the page IIFE owns reading /
+ * writing localStorage. Never throws on malformed input.
+ */
+
+const FEED_LOG_VERSION = 1;
+const FEED_LOG_KEY_PREFIX = 'mlbReplayFeedLog.v1.';
+const FEED_LOG_INDEX_KEY = 'mlbReplayFeedLog.v1.index';
+const FEED_LOG_MAX_ENTRIES = 500;
+const FEED_LOG_MAX_SNAPSHOTS_PER_GAME = 400;
+const FEED_LOG_MAX_IRREGULARITIES_PER_GAME = 30;
+const FEED_LOG_MAX_DATES = 7;
+
+/** Storage key for one date's log, e.g. `mlbReplayFeedLog.v1.2026-09-04`. */
+function feedLogStorageKey(dateStr) {
+  return `${FEED_LOG_KEY_PREFIX}${dateStr || ''}`;
+}
+
+/** Strict calendar-date shape (`YYYY-MM-DD`) — anything else is rejected. */
+function isFeedLogDateStr(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+/** Numeric gamePk keys survive JSON as strings — restore the number form. */
+function feedLogGameKey(key) {
+  const text = String(key);
+  return /^\d+$/.test(text) ? Number(text) : key;
+}
+
+function feedLogFiniteOrNull(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Serialize live tracker state into a JSON-safe log payload.
+ * input = { dateStr, now, feedSeen: Map, feedOrder: [],
+ *           scoringSnapshots: Map, scoringIrregularities: Map,
+ *           scoringGraceFinals: Map, settledGames: Set }.
+ * Caps (most-recent wins) and counts everything trimmed.
+ */
+function serializeFeedLog(input) {
+  const src = input || {};
+  const now = feedLogFiniteOrNull(src.now) != null ? src.now : Date.now();
+  const seen = src.feedSeen instanceof Map ? src.feedSeen : new Map();
+  const order = Array.isArray(src.feedOrder) ? src.feedOrder : [];
+  const seenKeys = new Set();
+  const entries = [];
+  order.forEach((key) => {
+    if (typeof key !== 'string' || seenKeys.has(key)) return;
+    const entry = seen.get(key);
+    if (!entry || !entry.review) return;
+    seenKeys.add(key);
+    entries.push({
+      gamePk: entry.gamePk,
+      review: entry.review,
+      firstSeen: entry.firstSeen,
+      lastSeen: entry.lastSeen,
+      matchupLabel: entry.matchupLabel != null ? entry.matchupLabel : null,
+    });
+  });
+  // Rows present in the map but missing from the order list (should not
+  // happen) are appended rather than dropped — every entry is logged.
+  seen.forEach((entry, key) => {
+    if (seenKeys.has(key) || !entry || !entry.review) return;
+    seenKeys.add(key);
+    entries.push({
+      gamePk: entry.gamePk,
+      review: entry.review,
+      firstSeen: entry.firstSeen,
+      lastSeen: entry.lastSeen,
+      matchupLabel: entry.matchupLabel != null ? entry.matchupLabel : null,
+    });
+  });
+  const trimmedEntries = Math.max(0, entries.length - FEED_LOG_MAX_ENTRIES);
+  const keptEntries = entries.slice(-FEED_LOG_MAX_ENTRIES);
+  const keptKeys = new Set();
+  const keptOrder = [];
+  keptEntries.forEach((entry) => {
+    const key = buildEventKey(entry.gamePk, entry.review);
+    if (!keptKeys.has(key)) {
+      keptKeys.add(key);
+      keptOrder.push(key);
+    }
+  });
+
+  const snapshots = {};
+  let trimmedSnapshots = 0;
+  const snapSource = src.scoringSnapshots instanceof Map ? [...src.scoringSnapshots] : [];
+  snapSource.forEach(([gamePk, perGame]) => {
+    if (!(perGame instanceof Map)) return;
+    const tracked = [...perGame.values()].filter((t) =>
+      t && t.snapshot && typeof t.signature === 'string');
+    tracked.sort((a, b) => (feedLogFiniteOrNull(b.lastObservedAt) || 0) -
+      (feedLogFiniteOrNull(a.lastObservedAt) || 0));
+    trimmedSnapshots += Math.max(0, tracked.length - FEED_LOG_MAX_SNAPSHOTS_PER_GAME);
+    const obj = {};
+    tracked.slice(0, FEED_LOG_MAX_SNAPSHOTS_PER_GAME).forEach((t) => {
+      obj[String(t.snapshot.atBatIndex)] = {
+        snapshot: t.snapshot,
+        signature: t.signature,
+        firstObservedAt: t.firstObservedAt,
+        lastObservedAt: t.lastObservedAt,
+        history: Array.isArray(t.history) ? t.history : [],
+        rowCreated: t.rowCreated === true,
+      };
+    });
+    snapshots[String(gamePk)] = obj;
+  });
+
+  const irregularities = {};
+  const irrSource = src.scoringIrregularities instanceof Map ? [...src.scoringIrregularities] : [];
+  irrSource.forEach(([gamePk, notes]) => {
+    if (!Array.isArray(notes)) return;
+    irregularities[String(gamePk)] =
+      notes.filter((n) => typeof n === 'string').slice(-FEED_LOG_MAX_IRREGULARITIES_PER_GAME);
+  });
+
+  const grace = {};
+  const graceSource = src.scoringGraceFinals instanceof Map ? [...src.scoringGraceFinals] : [];
+  graceSource.forEach(([gamePk, g]) => {
+    if (!g || typeof g !== 'object') return;
+    if (typeof g.firstFinalObservedAt !== 'number' || typeof g.lastScanAt !== 'number') return;
+    grace[String(gamePk)] = {
+      firstFinalObservedAt: g.firstFinalObservedAt,
+      lastScanAt: g.lastScanAt,
+    };
+  });
+
+  const settled = [];
+  const settledSource = src.settledGames instanceof Set ? [...src.settledGames] : [];
+  settledSource.forEach((pk) => { settled.push(pk); });
+
+  return {
+    v: FEED_LOG_VERSION,
+    date: src.dateStr,
+    savedAt: now,
+    entries: keptEntries,
+    order: keptOrder,
+    snapshots,
+    irregularities,
+    grace,
+    settled,
+    trimmed: { entries: trimmedEntries, snapshots: trimmedSnapshots },
+  };
+}
+
+/** One restored baseline, strictly validated — null when unusable. */
+function validRestoredScoringTracked(tracked) {
+  if (!tracked || typeof tracked !== 'object') return null;
+  const snap = tracked.snapshot;
+  if (!snap || typeof snap !== 'object') return null;
+  if (snap.atBatIndex == null) return null;
+  if (typeof snap.eventType !== 'string' || !snap.eventType) return null;
+  if (typeof tracked.signature !== 'string') return null;
+  const history = Array.isArray(tracked.history)
+    ? tracked.history.filter((h) => h && typeof h === 'object' &&
+      h.from && typeof h.from === 'object' &&
+      h.to && typeof h.to === 'object' &&
+      typeof h.at === 'number' && Number.isFinite(h.at))
+    : [];
+  return {
+    snapshot: snap,
+    signature: tracked.signature,
+    firstObservedAt: feedLogFiniteOrNull(tracked.firstObservedAt),
+    lastObservedAt: feedLogFiniteOrNull(tracked.lastObservedAt),
+    history,
+    rowCreated: tracked.rowCreated === true,
+  };
+}
+
+/**
+ * Restore a stored log payload for `dateStr`.
+ * Returns { entries, order, snapshots: Map, irregularities: Map,
+ *           grace: Map, settled: Set, dropped, warnings }.
+ * Anything malformed is dropped and counted/reported — never invented, never
+ * silently hidden. A version or date mismatch restores nothing (the caller
+ * keeps its fresh state).
+ */
+function restoreFeedLog(data, dateStr) {
+  const out = {
+    entries: [],
+    order: [],
+    snapshots: new Map(),
+    irregularities: new Map(),
+    grace: new Map(),
+    settled: new Set(),
+    dropped: 0,
+    warnings: [],
+  };
+  if (!data || typeof data !== 'object') {
+    out.warnings.push('stored feed log is not an object — starting fresh');
+    return out;
+  }
+  if (data.v !== FEED_LOG_VERSION) {
+    out.warnings.push(`stored feed log version ${data && data.v} is not v${FEED_LOG_VERSION} — starting fresh`);
+    return out;
+  }
+  if (data.date !== dateStr) {
+    out.warnings.push(`stored feed log is for ${data.date}, not ${dateStr} — starting fresh`);
+    return out;
+  }
+  (Array.isArray(data.entries) ? data.entries : []).forEach((entry) => {
+    if (!entry || typeof entry !== 'object' || entry.gamePk == null ||
+        !entry.review || typeof entry.review !== 'object' ||
+        typeof entry.review.id !== 'string' || typeof entry.review.typeKey !== 'string') {
+      out.dropped += 1;
+      return;
+    }
+    out.entries.push({
+      gamePk: entry.gamePk,
+      review: entry.review,
+      firstSeen: feedLogFiniteOrNull(entry.firstSeen),
+      lastSeen: feedLogFiniteOrNull(entry.lastSeen),
+      matchupLabel: typeof entry.matchupLabel === 'string' ? entry.matchupLabel : null,
+    });
+  });
+  const keys = new Set(out.entries.map((e) => buildEventKey(e.gamePk, e.review)));
+  (Array.isArray(data.order) ? data.order : []).forEach((key) => {
+    if (typeof key !== 'string' || !keys.has(key) || out.order.includes(key)) return;
+    out.order.push(key);
+  });
+  // Stored rows missing from the stored order still restore (appended in
+  // stored order) — every logged entry comes back.
+  out.entries.forEach((entry) => {
+    const key = buildEventKey(entry.gamePk, entry.review);
+    if (!out.order.includes(key)) out.order.push(key);
+  });
+
+  const snapData = data.snapshots && typeof data.snapshots === 'object' ? data.snapshots : {};
+  Object.keys(snapData).forEach((gameKey) => {
+    const perGame = snapData[gameKey];
+    if (!perGame || typeof perGame !== 'object') { out.dropped += 1; return; }
+    const map = new Map();
+    Object.keys(perGame).forEach((idx) => {
+      const valid = validRestoredScoringTracked(perGame[idx]);
+      if (!valid) { out.dropped += 1; return; }
+      map.set(String(idx), valid);
+    });
+    if (map.size) out.snapshots.set(feedLogGameKey(gameKey), map);
+  });
+
+  const irrData = data.irregularities && typeof data.irregularities === 'object' ? data.irregularities : {};
+  Object.keys(irrData).forEach((gameKey) => {
+    const notes = irrData[gameKey];
+    if (!Array.isArray(notes)) { out.dropped += 1; return; }
+    const clean = notes.filter((n) => typeof n === 'string')
+      .slice(-FEED_LOG_MAX_IRREGULARITIES_PER_GAME);
+    out.dropped += notes.length - clean.length;
+    if (clean.length) out.irregularities.set(feedLogGameKey(gameKey), clean);
+  });
+
+  const graceData = data.grace && typeof data.grace === 'object' ? data.grace : {};
+  Object.keys(graceData).forEach((gameKey) => {
+    const g = graceData[gameKey];
+    if (!g || typeof g !== 'object' ||
+        typeof g.firstFinalObservedAt !== 'number' ||
+        typeof g.lastScanAt !== 'number') { out.dropped += 1; return; }
+    out.grace.set(feedLogGameKey(gameKey), {
+      firstFinalObservedAt: g.firstFinalObservedAt,
+      lastScanAt: g.lastScanAt,
+    });
+  });
+
+  (Array.isArray(data.settled) ? data.settled : []).forEach((pk) => {
+    if (pk == null || (typeof pk !== 'number' && typeof pk !== 'string')) { out.dropped += 1; return; }
+    out.settled.add(typeof pk === 'string' && /^\d+$/.test(pk) ? Number(pk) : pk);
+  });
+
+  return out;
+}
+
+/**
+ * Prune the cross-date log index to FEED_LOG_MAX_DATES entries.
+ * index = { 'YYYY-MM-DD': savedAtMs }. The date on screen is always kept;
+ * otherwise the most recently saved dates win. Pure: returns
+ * { index (pruned copy), remove: [storage keys to delete] } — the caller
+ * owns the actual storage removal.
+ */
+function pruneFeedLogIndex(index, keepDateStr, maxDates) {
+  const src = index && typeof index === 'object' ? index : {};
+  const limit = Number.isFinite(maxDates) && maxDates > 0
+    ? Math.floor(maxDates) : FEED_LOG_MAX_DATES;
+  const dates = Object.keys(src).filter(isFeedLogDateStr);
+  const ranked = dates
+    .slice()
+    .sort((a, b) => (Number(src[b]) || 0) - (Number(src[a]) || 0));
+  const keep = new Set();
+  if (isFeedLogDateStr(keepDateStr)) keep.add(keepDateStr);
+  ranked.forEach((d) => {
+    if (keep.size < limit) keep.add(d);
+  });
+  const pruned = {};
+  keep.forEach((d) => { pruned[d] = src[d]; });
+  const remove = dates.filter((d) => !keep.has(d)).map(feedLogStorageKey);
+  return { index: pruned, remove };
+}
+
 /* ------------------------------------------------------------ page logic */
 
 (() => {
@@ -1459,6 +1794,137 @@ function finalScanDecision(grace, settled, now, graceMs, rescanMs, fastRescanMs,
   //   edits, vanished plays). Kept and displayed, never silently corrected.
   const scoringIrregularities = new Map();
 
+  /* --------------------------------------- feed-log persistence (storage) */
+  // Every tracked entry is logged to localStorage (one log per date) so a
+  // refresh or a later visit restores the feed rows, the scoring baselines,
+  // and the flagged irregularities. Detection is untouched — this only
+  // writes what the merge helpers already observed and reads it back.
+  let lastFeedLogSaveAt = 0;
+  let feedLogSaveTimer = null;
+
+  /** localStorage, or null where it is unavailable (private mode, tests). */
+  function feedLogStore() {
+    try {
+      if (typeof localStorage === 'undefined') return null;
+      return localStorage;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** Write this date's whole observed state now. Never throws. */
+  function saveFeedLogNow() {
+    const store = feedLogStore();
+    if (!store) return false;
+    let payload;
+    try {
+      payload = serializeFeedLog({
+        dateStr,
+        now: Date.now(),
+        feedSeen: feedState.seen,
+        feedOrder: feedState.order,
+        scoringSnapshots,
+        scoringIrregularities,
+        scoringGraceFinals,
+        settledGames,
+      });
+    } catch (err) {
+      console.warn('feed log serialize failed — nothing saved (flagged for review)', err);
+      return false;
+    }
+    try {
+      store.setItem(feedLogStorageKey(dateStr), JSON.stringify(payload));
+      let index = {};
+      try {
+        index = JSON.parse(store.getItem(FEED_LOG_INDEX_KEY)) || {};
+      } catch (_) {
+        index = {};
+      }
+      if (!index || typeof index !== 'object') index = {};
+      index[dateStr] = payload.savedAt;
+      const pruned = pruneFeedLogIndex(index, dateStr, FEED_LOG_MAX_DATES);
+      (pruned.remove || []).forEach((key) => {
+        try { store.removeItem(key); } catch (_) {}
+      });
+      store.setItem(FEED_LOG_INDEX_KEY, JSON.stringify(pruned.index));
+      lastFeedLogSaveAt = Date.now();
+      return true;
+    } catch (err) {
+      // Quota or access failure: the in-memory feed keeps working for this
+      // visit — the loss is flagged, never silently hidden.
+      console.warn('feed log save failed (quota?) — kept in memory for this visit (flagged for review)', err);
+      return false;
+    }
+  }
+
+  /**
+   * Schedule a log write, at most one per second. Polls run every 250–500ms
+   * while live, so an unthrottled write would serialize the whole feed on
+   * every scan for no benefit.
+   */
+  function scheduleFeedLogSave() {
+    if (!feedLogStore()) return;
+    if (Date.now() - lastFeedLogSaveAt >= 1000) {
+      saveFeedLogNow();
+      return;
+    }
+    if (feedLogSaveTimer != null) return;
+    feedLogSaveTimer = setTimeout(() => {
+      feedLogSaveTimer = null;
+      saveFeedLogNow();
+    }, 1000);
+  }
+
+  /**
+   * Restore this date's logged state into the live trackers. Runs on boot
+   * and on date change, BEFORE the first scan, so the first paint already
+   * shows every logged entry and the first diff runs against the previously
+   * observed baselines. Restored rows merge idempotently with fresh polls
+   * (stable `<gamePk>:<id>` keys); restored scoring baselines let a change
+   * that landed while the page was closed still diff honestly against what
+   * was last observed. Never throws.
+   */
+  function restorePersistedLog() {
+    const store = feedLogStore();
+    if (!store) return { restored: 0, dropped: 0 };
+    let raw = null;
+    try {
+      raw = store.getItem(feedLogStorageKey(dateStr));
+    } catch (_) {
+      return { restored: 0, dropped: 0 };
+    }
+    if (!raw) return { restored: 0, dropped: 0 };
+    let data = null;
+    try {
+      data = JSON.parse(raw);
+    } catch (err) {
+      console.warn(`feed log for ${dateStr} is not valid JSON — starting fresh (flagged for review)`, err);
+      return { restored: 0, dropped: 0 };
+    }
+    const res = restoreFeedLog(data, dateStr);
+    (res.warnings || []).forEach((note) => {
+      console.warn(`feed log (${dateStr}) — flagged for review: ${note}`);
+    });
+    res.entries.forEach((entry) => {
+      const key = buildEventKey(entry.gamePk, entry.review);
+      if (!feedState.seen.has(key)) feedState.seen.set(key, entry);
+    });
+    res.order.forEach((key) => {
+      if (feedState.seen.has(key) && feedState.order.indexOf(key) < 0) feedState.order.push(key);
+    });
+    feedState.seen.forEach((_, key) => {
+      if (feedState.order.indexOf(key) < 0) feedState.order.push(key);
+    });
+    res.snapshots.forEach((map, gamePk) => scoringSnapshots.set(gamePk, map));
+    res.irregularities.forEach((notes, gamePk) => scoringIrregularities.set(gamePk, notes));
+    res.grace.forEach((grace, gamePk) => scoringGraceFinals.set(gamePk, grace));
+    res.settled.forEach((gamePk) => settledGames.add(gamePk));
+    if (res.dropped) {
+      console.warn(`feed log (${dateStr}): ${res.dropped} malformed stored record(s) dropped (flagged for review)`);
+    }
+    return { restored: res.entries.length, dropped: res.dropped };
+  }
+
   // --- Audio alert state (gentle raindrop chime for challenges/reviews/boundary, not ABS) ---
   let isFirstLoad = true;
   let pendingAlertableCount = 0;
@@ -1510,6 +1976,10 @@ function finalScanDecision(grace, settled, now, graceMs, rescanMs, fastRescanMs,
   }
 
   function resetFeed() {
+    try {
+      clearTimeout(feedLogSaveTimer);
+    } catch (_) {}
+    feedLogSaveTimer = null;
     feedState.seen.clear();
     feedState.order.length = 0;
     settledGames = new Set();
@@ -1534,6 +2004,9 @@ function finalScanDecision(grace, settled, now, graceMs, rescanMs, fastRescanMs,
     // whose gamePk collides, and suppress a review that is already running.
     reviewStatusCodes = new Map();
     reviewStatusFlipPending = false;
+    // A date with a logged feed restores it now, so navigating dates (or
+    // back to today) shows every entry logged on that date.
+    restorePersistedLog();
   }
 
   function $ (sel) { return document.querySelector(sel); }
@@ -2307,6 +2780,14 @@ function finalScanDecision(grace, settled, now, graceMs, rescanMs, fastRescanMs,
       updated: [...result.updated, ...scoringResult.updated],
       ended: result.ended,
     };
+    // Log every tracked entry: any poll that adds, updates, ends, or flags
+    // an entry (or advances a Final's grace window) persists the whole
+    // observed state, so a refresh or a later visit restores it. Detection
+    // above is untouched — this only writes what was observed.
+    if (combined.added.length || combined.updated.length || combined.ended.length ||
+        scoring.irregularities.length || isFinal) {
+      scheduleFeedLogSave();
+    }
 
     // Official challenges-remaining counters. The schedule already supplied
     // the manager `review` half; the ABS half only lives in feed/live's
@@ -3258,6 +3739,9 @@ function finalScanDecision(grace, settled, now, graceMs, rescanMs, fastRescanMs,
         matchup: matchupFor(entry, games.find((g) => g.gamePk === entry.gamePk) || null),
       }));
     },
+    // Test seam: force-write this date's feed log now (returns true when
+    // saved). The page itself saves automatically after every changing poll.
+    _flushFeedLog() { return saveFeedLogNow(); },
   };
 
   document.addEventListener('DOMContentLoaded', () => {
@@ -3290,9 +3774,25 @@ function finalScanDecision(grace, settled, now, graceMs, rescanMs, fastRescanMs,
         // sweep now, then back to the watcher cadence.
         pollReviewStatus();
       } else {
+        // Flush the log on hide: a refresh or a closed tab must keep every
+        // entry tracked so far.
+        saveFeedLogNow();
         stopPolling();
       }
     });
+    try {
+      if (typeof window.addEventListener === 'function') {
+        // Last-resort flush for refresh/close/navigation (the visibility
+        // handler above already covers tab-hide; this covers the rest).
+        window.addEventListener('pagehide', () => { saveFeedLogNow(); });
+      }
+    } catch (_) {}
+    // Restore this date's logged feed BEFORE the first scan, and paint it
+    // immediately: a refresh or a later visit shows every logged entry on
+    // the first paint, and the first poll diffs against the restored
+    // baselines instead of starting over.
+    restorePersistedLog();
+    render();
     load();
     // First sweep immediately rather than one cadence later: a page opened
     // mid-review must show the review on the first paint, and the sweep also
@@ -3320,6 +3820,13 @@ function finalScanDecision(grace, settled, now, graceMs, rescanMs, fastRescanMs,
       buildScoringSnapshot, scoringSnapshotSignature, scoringCategory,
       scoringEventLabel, scoringInningLabel, scoringMechanism,
       scoringChangeSummary, mergeScoringChanges, finalScanDecision,
+      // Feed-log persistence (pure layer — every tracked entry survives a
+      // refresh / revisit via a per-date localStorage log)
+      FEED_LOG_VERSION, FEED_LOG_KEY_PREFIX, FEED_LOG_INDEX_KEY,
+      FEED_LOG_MAX_ENTRIES, FEED_LOG_MAX_SNAPSHOTS_PER_GAME,
+      FEED_LOG_MAX_IRREGULARITIES_PER_GAME, FEED_LOG_MAX_DATES,
+      feedLogStorageKey, isFeedLogDateStr,
+      serializeFeedLog, restoreFeedLog, pruneFeedLogIndex,
     };
   }
 })();

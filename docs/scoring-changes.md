@@ -52,3 +52,23 @@ Each row (key `<gamePk>:scoring-<atBatIndex>`, one row per play however many rul
 ## Irregularity policy
 
 Anything that does not fit the verified vocabulary is flagged, never guessed: description-only rewrites, RBI changes, score-after corrections without reclassification, plays disappearing from the payload, multiple rulings on one play. An empty play list is treated as a payload blip (state preserved). Every flag is visible on-page (⚠️ list at the bottom of the feed) and in `console.warn` for review.
+
+## Feed log — every tracked entry survives a refresh or a later visit
+
+**Date:** 2026-09-05
+**Status:** ✅ Fully Implemented and Tested
+**Requirement:** Keep detection exactly as-is, but log every entry so a refresh or a fresh visit shows everything tracked.
+
+**Problem it fixes:** all tracker state (`feedState`, `scoringSnapshots`, `scoringIrregularities`, `scoringGraceFinals`, `settledGames`) lived in memory only, so a refresh wiped every feed row *and* the baselines the next poll-diff needed — tracked entries, including scoring changes, were silently lost.
+
+**How it works (detection untouched):** after any poll that adds, updates, ends, or flags an entry (or advances a Final's grace window), the page writes its whole observed state to `localStorage` under `mlbReplayFeedLog.v1.<YYYY-MM-DD>`; on boot and on date change it restores that log *before* the first scan and paints it immediately, so the first poll diffs against the previously observed baselines. Restored rows merge idempotently by stable key (`<gamePk>:<id>`); a change that landed while the page was closed still diffs honestly against what was last observed. Writes are throttled (≤1/s) plus flushed on tab-hide/`pagehide`.
+
+**What is stored:** feed rows of every `typeKey` (reviews, ABS, pending-scoring, scoring-change) with `firstSeen`/`lastSeen`/`matchupLabel`; per-game scoring baselines (`snapshot`, `signature`, `firstObservedAt`, `lastObservedAt`, `history`, `rowCreated`); per-game irregularity notes; post-Final grace windows + settled finals (a revisit *continues* the bounded grace instead of restarting it). Every stored field is produced by `mergeFeedEvents` / `mergeScoringChanges` from official playByPlay fields — nothing invented for storage. Deliberately **not** stored: challenge counters (re-fetched live; a stale "now" value must never be shown) and run-risk alert keys (a revisit behaves exactly like a first visit).
+
+**Bounds:** 500 most-recent rows, 400 baselines/game, 30 notes/game, 7 date-logs (the viewed date always kept); trims are counted in the payload (`trimmed`), malformed stored records are dropped with a `console.warn` — flagged, never hidden. No `localStorage` (private mode, tests) degrades to the old in-memory behavior.
+
+**Tests:** `tools/feed-log-persistence-test.mjs` — 7 sections: key/date validation; serialize caps with trim counts; round-trip through the real merge helpers (no phantom row after refresh; a post-refresh ruling updates with the *original* initial call and the multi-ruling flag); idempotent re-admit + cleanup protection; malformed-log handling (version/date mismatch, 10+ malformed records dropped and counted); index pruning; and a full refresh simulation through the real boot path (baseline → rescore → flush → fresh VM, row painted before the first scan settles, no duplicate after it, tabs intact).
+
+## Verification limits (flagged for review)
+
+- **No live re-verification was possible in this session:** the sandbox has no external network (`curl https://statsapi.mlb.com/api/v1/eventTypes` → exit 35; `fetch` fails), so the registry/payload shapes above could not be re-fetched. All checks rest on the repo's live-verbatim fixtures (eventTypes + playByPlay captures of 2026-09-04, scoring log entries #230/#232) and the deterministic suites, which are all green (11/11). If the upstream registry or the scoring-changes log vocabulary drifts, the nightly API smoke test (`docs/workflows/smoke.yml`) is the tripwire — treat any smoke failure as an irregularity for review before trusting new rows.
