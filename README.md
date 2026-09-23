@@ -265,13 +265,15 @@ for archived games the request is scoped to the feed's game season.
 
 ## Run it locally
 
-Any static file server works — no installs required:
+Run the built-in persistence server (recommended — persists scoring changes and reviews to disk across browsers):
 
 ```bash
-# Python
-python3 -m http.server 8000
+# Node built-in server (multi-browser persistent logging backend)
+node server.mjs
 
-# or Node
+# or any static file server
+python3 -m http.server 8000
+# or
 npx serve .
 ```
 
@@ -281,26 +283,33 @@ Then open <http://localhost:8000>. You can also open `index.html` directly in a 
 To run the deterministic, network-free checks:
 
 ```bash
-node tools/hit-model-test.mjs             # two-sided hit forecast model
-node tools/review-test.mjs                # challenge / replay review parser (incl. real API shapes)
-node tools/reviews-feed-test.mjs          # all-games Replay Feed diff helpers
-node tools/replay-feed-render-test.mjs    # end-to-end Replay Feed render (captured live payloads)
-node tools/review-probe-test.mjs          # in-review lean-probe signature (game.js)
-node tools/review-status-test.mjs         # official gameStatus registry + review detection (all 4 copies)
-node tools/review-watcher-test.mjs        # 250ms review-status watcher, driven through the real boot path
-node tools/page-status-watcher-test.mjs   # 250ms watchers on the game page + scoreboard, real boot path
-node tools/api-rate-limit-test.mjs        # HTTP-429 self-throttle (60s quiet period) in the API client
-node tools/official-scoring-test.mjs      # official-scorer pending rulings
-node tools/api-fields-test.mjs            # playByPlay `fields` projection coverage
-node tools/scoring-change-test.mjs        # official scoring-change tracker (hit ↔ error ↔ out)
-node tools/feed-log-persistence-test.mjs  # replay feed log: every entry survives refresh/revisit
+node tools/hit-model-test.mjs                  # two-sided hit forecast model
+node tools/review-test.mjs                     # challenge / replay review parser (incl. real API shapes)
+node tools/reviews-feed-test.mjs               # all-games Replay Feed diff helpers
+node tools/replay-feed-render-test.mjs         # end-to-end Replay Feed render (captured live payloads)
+node tools/review-probe-test.mjs               # in-review lean-probe signature (game.js)
+node tools/review-status-test.mjs              # official gameStatus registry + review detection (all 4 copies)
+node tools/review-watcher-test.mjs             # 250ms review-status watcher, driven through the real boot path
+node tools/page-status-watcher-test.mjs        # 250ms watchers on the game page + scoreboard, real boot path
+node tools/api-rate-limit-test.mjs             # HTTP-429 self-throttle (60s quiet period) in the API client
+node tools/official-scoring-test.mjs           # official-scorer pending rulings
+node tools/api-fields-test.mjs                 # playByPlay `fields` projection coverage
+node tools/scoring-change-test.mjs             # official scoring-change tracker (hit ↔ error ↔ out)
+node tools/feed-log-persistence-test.mjs       # replay feed log: every entry survives refresh/revisit
+node tools/cross-browser-persistence-test.mjs  # cross-browser & across-the-website persistence verification
 ```
 
-Every entry the Replay Feed tracks (challenges, reviews, scoring-pending
-rulings, scoring changes) is also logged to the browser per date, so a page
-refresh or a later visit restores the feed rows, scoring baselines, and
-flagged irregularities — detection itself is unchanged (see
-`docs/scoring-changes.md`).
+Every entry tracked (challenges, reviews, scoring-pending rulings, scoring
+changes) is persistent across the website:
+- **Across browsers & sessions**: saved to the backend disk store (`data/feed-log-<date>.json`)
+  via `POST /api/feed-log` and cached in `localStorage`, so opening the website on
+  another browser immediately restores all tracked entries and baselines.
+- **Across the website**:
+  - `reviews.html`: renders the All feed and dedicated ✏️ Scoring Changes tab.
+  - `game.html`: dedicated **Challenges & Reviews** tab displays official scoring changes
+    with full initial-call-to-final-ruling breakdown, and updates the tab badge.
+  - `index.html`: scoreboard cards display the `✏️ N Scoring Change(s)` indicator.
+  (see `docs/scoring-changes.md`).
 
 To *see and hear* the ⚠️ Runs at Risk surfaces without waiting for a live review,
 serve the repo and open the offline, fixture-driven preview — it stubs the API with

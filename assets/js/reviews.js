@@ -1548,15 +1548,45 @@ const MLBReviews = (() => {
 
     // Body: Reason headline + Play description
     const body = UI.el('div', 'review-card-body');
-    body.appendChild(UI.el('h4', 'review-reason-title', review.reason));
-    const scoreImpact = renderScoreImpact(review, 'review-card');
-    if (scoreImpact) body.appendChild(scoreImpact);
-    const absMeta = renderAbsContext(review);
-    if (absMeta) body.appendChild(absMeta);
-    body.appendChild(UI.el('p', 'review-desc-text', review.description));
-    // Official-scorer pending rulings: show the resolved ruling when available.
-    if (review.typeKey === 'pending_scoring' && review.resolvedDescription) {
-      body.appendChild(UI.el('p', 'review-resolved-text', `Resolved as: ${review.resolvedDescription}`));
+    body.appendChild(UI.el('h4', 'review-reason-title', review.reason || review.headline || 'Scoring Change'));
+
+    if (review.typeKey === 'scoring_change') {
+      const block = UI.el('div', 'feed-scoring');
+      if (review.initial && review.final) {
+        const headline = UI.el('div', 'feed-scoring-headline');
+        headline.appendChild(UI.el('span', `feed-scoring-call feed-scoring-call-${review.initial.category || 'hit'}`, review.initial.label || 'Initial'));
+        headline.appendChild(UI.el('span', 'feed-scoring-arrow', '→'));
+        headline.appendChild(UI.el('span', `feed-scoring-call feed-scoring-call-${review.final.category || 'hit'}`, review.final.label || 'Final'));
+        if (review.changeCount > 1) {
+          headline.appendChild(UI.el('span', 'feed-scoring-multiple', `${review.changeCount} rulings observed`));
+        }
+        block.appendChild(headline);
+      }
+      const initDesc = review.initialDescription || (review.initial && review.initial.label);
+      if (initDesc) {
+        block.appendChild(UI.el('div', 'feed-scoring-line feed-scoring-initial', `Initial call: ${initDesc}`));
+      }
+      if (review.description) {
+        block.appendChild(UI.el('div', 'feed-scoring-line feed-scoring-final', `Final ruling: ${review.description}`));
+      }
+      if (review.scoreAfter && (review.scoreAfter.away != null || review.scoreAfter.home != null)) {
+        block.appendChild(UI.el('div', 'feed-scoring-line feed-scoring-score',
+          `Score after play: Away ${review.scoreAfter.away} – Home ${review.scoreAfter.home}`));
+      }
+      if (review.mechanism && review.mechanism.label) {
+        block.appendChild(UI.el('div', 'feed-scoring-line feed-scoring-mechanism', review.mechanism.label));
+      }
+      body.appendChild(block);
+    } else {
+      const scoreImpact = renderScoreImpact(review, 'review-card');
+      if (scoreImpact) body.appendChild(scoreImpact);
+      const absMeta = renderAbsContext(review);
+      if (absMeta) body.appendChild(absMeta);
+      body.appendChild(UI.el('p', 'review-desc-text', review.description));
+      // Official-scorer pending rulings: show the resolved ruling when available.
+      if (review.typeKey === 'pending_scoring' && review.resolvedDescription) {
+        body.appendChild(UI.el('p', 'review-resolved-text', `Resolved as: ${review.resolvedDescription}`));
+      }
     }
     card.appendChild(body);
 
@@ -1625,6 +1655,13 @@ const MLBReviews = (() => {
         'Detected only from the StatsAPI event registry os_ruling_pending_primary / os_ruling_pending_prior (GET /api/v1/eventTypes).';
       statsBar.appendChild(item);
     }
+    const scoringChanges = reviewData.scoringChanges || (reviews || []).filter((r) => r && r.typeKey === 'scoring_change');
+    if (scoringChanges.length > 0) {
+      const item = statItem('Scoring Changes', scoringChanges.length, 'stat-scoring-change');
+      item.title = `${scoringChanges.length} official scoring change${scoringChanges.length === 1 ? '' : 's'} tracked for this game. ` +
+        'Initial call and final ruling from official scorer changes.';
+      statsBar.appendChild(item);
+    }
     container.appendChild(statsBar);
 
     // 2. Active Review Live Callout if present
@@ -1636,7 +1673,7 @@ const MLBReviews = (() => {
     // 3. List of Reviews / Challenges
     if (!reviews.length) {
       container.appendChild(UI.el('div', 'empty small',
-        'No challenges or replay reviews in this game yet.'));
+        'No challenges, replay reviews, or official scoring changes in this game yet.'));
       return;
     }
 

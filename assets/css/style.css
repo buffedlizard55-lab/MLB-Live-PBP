@@ -1123,6 +1123,17 @@ a:hover { text-decoration: underline; }
   font-weight: 700;
   animation: pulse 1.2s infinite;
 }
+.card-scoring-indicator {
+  color: #fcc419;
+  font-size: 11px;
+  font-weight: 700;
+  background: rgba(252, 196, 25, 0.12);
+  border: 1px solid rgba(252, 196, 25, 0.35);
+  padding: 1px 6px;
+  border-radius: 999px;
+  display: inline-block;
+  margin-top: 2px;
+}
 
 /* Game Page Live Review Banner */
 .live-review-banner-wrap {

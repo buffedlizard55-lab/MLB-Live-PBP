@@ -219,6 +219,7 @@
       // A live feed can be large. Keep the existing DOM when no baseball state changed.
       if (changed) {
         renderAll();
+        syncGameScoringChanges();
       } else {
         // Recompute review-ness even when nothing else changed: right after a
         // review resolves — before any further play — the token is stable, and
@@ -495,9 +496,37 @@
       (Date.now() - statusReviewObservedAt) < STATUS_LEAD_GRACE_MS;
   }
 
+  let gameScoringChanges = [];
+  let lastScoringSyncAt = 0;
+
+  async function syncGameScoringChanges() {
+    if (!window.MLBFeedLog) return;
+    const now = Date.now();
+    if (now - lastScoringSyncAt < 3000) return;
+    lastScoringSyncAt = now;
+    const date = (gd() && gd().datetime && gd().datetime.officialDate) ||
+                 (gd() && gd().datetime && gd().datetime.originalDate) ||
+                 (new URLSearchParams(window.location.search).get('date')) ||
+                 new Date().toISOString().slice(0, 10);
+    if (!date || !gamePk) return;
+    try {
+      const changes = await window.MLBFeedLog.getScoringChangesForGame(date, gamePk);
+      if (Array.isArray(changes) && changes.length !== gameScoringChanges.length) {
+        gameScoringChanges = changes;
+        renderAll();
+      }
+    } catch (_) {}
+  }
+
   function renderAll() {
     document.title = pageTitle();
-    const reviewData = window.MLBReviews ? window.MLBReviews.extractReviews(feed) : { reviews: [], activeReview: null, summary: {} };
+    const rawReviewData = window.MLBReviews ? window.MLBReviews.extractReviews(feed) : { reviews: [], activeReview: null, summary: {} };
+    const allReviews = [...(rawReviewData.reviews || []), ...gameScoringChanges];
+    const reviewData = {
+      ...rawReviewData,
+      reviews: allReviews,
+      scoringChanges: gameScoringChanges,
+    };
     // The feed is authoritative EXCEPT during the status-lead grace window,
     // when MLB has flipped the official status to a review state but has not
     // written the review into the feed yet (verified finding, verification-
@@ -505,7 +534,7 @@
     // re-downloads the full feed.
     lastActiveReview = !!(reviewData && reviewData.activeReview) || statusLeadGraceActive();
     renderLiveReviewAlert(reviewData.activeReview);
-    renderReviewTabBadge(reviewData.reviews.length);
+    renderReviewTabBadge(allReviews.length);
     renderHeader();
     renderLivePanel(reviewData.activeReview);
     renderLinescore();
@@ -1503,8 +1532,15 @@
     $('#panel-boxscore').style.display = tab === 'boxscore' ? '' : 'none';
     $('#panel-props').style.display = tab === 'props' ? '' : 'none';
     $('#panel-reviews').style.display = tab === 'reviews' ? '' : 'none';
+    if (tab === 'reviews') syncGameScoringChanges();
     // Lazy rendering keeps live updates fast on the default play-by-play view.
-    const reviewData = window.MLBReviews ? window.MLBReviews.extractReviews(feed) : { reviews: [], activeReview: null, summary: {} };
+    const rawReviewData = window.MLBReviews ? window.MLBReviews.extractReviews(feed) : { reviews: [], activeReview: null, summary: {} };
+    const allReviews = [...(rawReviewData.reviews || []), ...gameScoringChanges];
+    const reviewData = {
+      ...rawReviewData,
+      reviews: allReviews,
+      scoringChanges: gameScoringChanges,
+    };
     if (feed && tab === 'boxscore') renderBoxscore();
     if (feed && tab === 'plays') renderPlays(reviewData);
     if (feed && tab === 'props' && window.Props) window.Props.render($('#props-wrap'), feed);

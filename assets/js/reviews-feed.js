@@ -1864,6 +1864,19 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
       });
       store.setItem(FEED_LOG_INDEX_KEY, JSON.stringify(pruned.index));
       lastFeedLogSaveAt = Date.now();
+
+      // Multi-browser persistence: send log to server so another browser
+      // opening the website immediately receives all tracked entries.
+      if (typeof fetch === 'function') {
+        try {
+          fetch('/api/feed-log', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          }).catch(() => {});
+        } catch (_) {}
+      }
+
       return true;
     } catch (err) {
       // Quota or access failure: the in-memory feed keeps working for this
@@ -1939,6 +1952,132 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
       console.warn(`feed log (${dateStr}): ${res.dropped} malformed stored record(s) dropped (flagged for review)`);
     }
     return { restored: res.entries.length, dropped: res.dropped };
+  }
+
+  let syncInFlight = false;
+  let lastServerSyncAt = 0;
+
+  /**
+   * Asynchronously synchronize with the server's persistent feed log
+   * (GET /api/feed-log?date=... or data/feed-log-<date>.json).
+   * Merges server-persisted entries, scoring baselines, irregularities,
+   * and grace windows into live state so that any browser or new session
+   * immediately sees all tracked entries and changes across the website.
+   */
+  async function syncFeedLogFromServer() {
+    if (syncInFlight || typeof fetch !== 'function') return;
+    syncInFlight = true;
+    const targetDate = dateStr;
+    try {
+      let data = null;
+      try {
+        const res = await fetch(`/api/feed-log?date=${encodeURIComponent(targetDate)}`, {
+          headers: { Accept: 'application/json' },
+          cache: 'no-store',
+        });
+        if (res.ok) data = await res.json();
+      } catch (_) {}
+
+      if (!data) {
+        try {
+          const resStatic = await fetch(`data/feed-log-${encodeURIComponent(targetDate)}.json`, {
+            headers: { Accept: 'application/json' },
+            cache: 'no-store',
+          });
+          if (resStatic.ok) data = await resStatic.json();
+        } catch (_) {}
+      }
+
+      if (!data || data.date !== targetDate || targetDate !== dateStr) {
+        syncInFlight = false;
+        return;
+      }
+
+      const res = restoreFeedLog(data, targetDate);
+      let changed = false;
+
+      res.entries.forEach((entry) => {
+        const key = buildEventKey(entry.gamePk, entry.review);
+        if (!feedState.seen.has(key)) {
+          feedState.seen.set(key, entry);
+          changed = true;
+        } else {
+          const existing = feedState.seen.get(key);
+          if (entry.review && entry.review.typeKey === 'scoring_change') {
+            if (!existing.review || existing.review.typeKey !== 'scoring_change' ||
+                (entry.review.changeCount || 0) > (existing.review.changeCount || 0)) {
+              feedState.seen.set(key, entry);
+              changed = true;
+            }
+          }
+        }
+      });
+
+      res.order.forEach((key) => {
+        if (feedState.seen.has(key) && feedState.order.indexOf(key) < 0) {
+          feedState.order.push(key);
+          changed = true;
+        }
+      });
+      feedState.seen.forEach((_, key) => {
+        if (feedState.order.indexOf(key) < 0) feedState.order.push(key);
+      });
+
+      res.snapshots.forEach((map, gamePk) => {
+        const existingMap = scoringSnapshots.get(gamePk) || new Map();
+        let mapChanged = false;
+        map.forEach((val, idx) => {
+          if (!existingMap.has(idx)) {
+            existingMap.set(idx, val);
+            mapChanged = true;
+          }
+        });
+        if (mapChanged) scoringSnapshots.set(gamePk, existingMap);
+      });
+
+      res.irregularities.forEach((notes, gamePk) => {
+        const existingNotes = scoringIrregularities.get(gamePk) || [];
+        let notesChanged = false;
+        notes.forEach((n) => {
+          if (!existingNotes.includes(n)) {
+            existingNotes.push(n);
+            notesChanged = true;
+          }
+        });
+        if (notesChanged) scoringIrregularities.set(gamePk, existingNotes);
+      });
+
+      res.grace.forEach((grace, gamePk) => {
+        if (!scoringGraceFinals.has(gamePk)) scoringGraceFinals.set(gamePk, grace);
+      });
+      res.settled.forEach((gamePk) => settledGames.add(gamePk));
+
+      lastServerSyncAt = Date.now();
+
+      if (changed) {
+        render();
+        const store = feedLogStore();
+        if (store) {
+          try {
+            const currentPayload = serializeFeedLog({
+              dateStr,
+              now: Date.now(),
+              feedSeen: feedState.seen,
+              feedOrder: feedState.order,
+              scoringSnapshots,
+              scoringIrregularities,
+              scoringGraceFinals,
+              settledGames,
+            });
+            store.setItem(feedLogStorageKey(dateStr), JSON.stringify(currentPayload));
+          } catch (_) {}
+        }
+      }
+    } catch (err) {
+      console.warn(`feed log server sync failed (${targetDate})`, err);
+    } finally {
+      syncInFlight = false;
+    }
   }
 
   // --- Audio alert state (gentle raindrop chime for challenges/reviews/boundary, not ABS) ---
@@ -2023,6 +2162,7 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
     // A date with a logged feed restores it now, so navigating dates (or
     // back to today) shows every entry logged on that date.
     restorePersistedLog();
+    syncFeedLogFromServer();
   }
 
   function $ (sel) { return document.querySelector(sel); }
@@ -2503,6 +2643,11 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
         pendingRunRiskNotify = [];
       }
       isFirstLoad = false;
+
+      // Periodic sync with server log to pick up entries logged by other browsers
+      if (Date.now() - lastServerSyncAt >= 15000) {
+        syncFeedLogFromServer();
+      }
 
       render();
       renderStatusLine();
@@ -3809,6 +3954,7 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
     // baselines instead of starting over.
     restorePersistedLog();
     render();
+    syncFeedLogFromServer();
     load();
     // First sweep immediately rather than one cadence later: a page opened
     // mid-review must show the review on the first paint, and the sweep also
