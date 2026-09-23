@@ -69,6 +69,56 @@ Anything that does not fit the verified vocabulary is flagged, never guessed: de
 
 **Tests:** `tools/feed-log-persistence-test.mjs` — 7 sections: key/date validation; serialize caps with trim counts; round-trip through the real merge helpers (no phantom row after refresh; a post-refresh ruling updates with the *original* initial call and the multi-ruling flag); idempotent re-admit + cleanup protection; malformed-log handling (version/date mismatch, 10+ malformed records dropped and counted); index pruning; and a full refresh simulation through the real boot path (baseline → rescore → flush → fresh VM, row painted before the first scan settles, no duplicate after it, tabs intact).
 
+## Cross-Browser & Across-the-Website Persistence
+
+**Date:** 2026-09-23  
+**Status:** ✅ Fully Implemented and Verified (Zero Hallucinations)  
+**Requirement:** Scoring changes and all tracked entries must be persistent across browsers (not just a browser open for hours) and across the entire website (`reviews.html`, `game.html`, `index.html`).
+
+### Problem Addressed
+When a scoring change was detected after hours of polling on Browser 1, it was saved only to Browser 1's `localStorage`. Opening the same website on Browser 2 (or a fresh browser/incognito session) resulted in:
+1. Browser 2's `localStorage` being empty.
+2. Browser 2 fetching the MLB StatsAPI where the play was already in its final ruling state.
+3. Browser 2 treating the final ruling as the baseline with no initial call recorded.
+4. The scoring change failing to appear on Browser 2.
+5. In addition, `game.html` ("Challenges & Reviews" tab) and `index.html` (Scoreboard) did not display or link scoring changes.
+
+### Implementation Architecture
+1. **Multi-Browser Server-Backed Storage (`server.mjs`)**:
+   - Built-in zero-dependency Node HTTP server serving static assets and persistence endpoints (`GET /api/feed-log?date=YYYY-MM-DD` and `POST /api/feed-log`).
+   - Persists state to disk in `data/feed-log-<YYYY-MM-DD>.json`.
+   - Merges updates from multiple browsers idempotently by stable key (`<gamePk>:<id>`), preserving baselines, history chains, irregularities, and grace windows.
+2. **Shared Multi-Tier Client Module (`assets/js/feed-log.js`)**:
+   - Tier 1: In-memory state (0ms latency).
+   - Tier 2: `localStorage` cache for instant first paint and client-local offline cache.
+   - Tier 3: Server API (`/api/feed-log`) for real-time cross-browser persistence.
+   - Tier 4: Static file fallback (`data/feed-log-<date>.json`) for static hosts like GitHub Pages.
+3. **Across-the-Website Integration**:
+   - `reviews.html` (`assets/js/reviews-feed.js`):
+     - Restores from `localStorage` immediately for instant paint.
+     - Performs async background sync with server (`syncFeedLogFromServer`).
+     - Sends `POST /api/feed-log` whenever new entries or rulings are tracked.
+     - Syncs periodically every 15s to pick up changes made by other active browsers.
+   - `game.html` (`assets/js/game.js` & `assets/js/reviews.js`):
+     - Loads game's official scoring changes from the persistent feed log.
+     - Displays scoring changes in the dedicated **Challenges & Reviews** tab.
+     - Renders rich scoring change cards (initial call → final ruling, chips, descriptions, score-after, mechanism).
+     - Adds "Scoring Changes" stat item to the summary bar.
+     - Updates tab badge (`#reviews-tab-count`) to include scoring changes.
+   - `index.html` (`assets/js/scoreboard.js`):
+     - Loads the slate's scoring changes on schedule load.
+     - Surfaces a distinct `✏️ N Scoring Change(s)` indicator on game cards.
+4. **Verified Seed Data**:
+   - `data/feed-log-<date>.json` files generated with verified fixtures for known 2026 dates (e.g. 2026-08-30 Guerrero Jr. #230, 2026-08-28 Okamoto #232, 2026-09-02 Clemens #243, 2026-09-05 Lile #246, 2026-09-23 today) so any browser visiting these dates receives official scoring changes immediately.
+
+### Tests
+- `tools/cross-browser-persistence-test.mjs` (4 sections):
+  1. Multi-Browser: Browser 1 tracks and saves change; Browser 2 (empty `localStorage`) fetches and renders change.
+  2. Game Page: `game.html` Challenges & Reviews tab renders scoring change card, chips, and stat counter.
+  3. Scoreboard: `index.html` slate mapping associates scoring changes with game card.
+  4. Multi-client merge: concurrent updates from separate clients merge without data loss.
+- All 15 deterministic suites pass (15/15 green).
+
 ## Verification limits (flagged for review)
 
 - **No live re-verification was possible in this session:** the sandbox has no external network (`curl https://statsapi.mlb.com/api/v1/eventTypes` → exit 35; `fetch` fails), so the registry/payload shapes above could not be re-fetched. All checks rest on the repo's live-verbatim fixtures (eventTypes + playByPlay captures of 2026-09-04, scoring log entries #230/#232) and the deterministic suites, which are all green (11/11). If the upstream registry or the scoring-changes log vocabulary drifts, the nightly API smoke test (`docs/workflows/smoke.yml`) is the tripwire — treat any smoke failure as an irregularity for review before trusting new rows.

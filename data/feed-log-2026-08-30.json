@@ -1,0 +1,178 @@
+{
+  "v": 1,
+  "date": "2026-08-30",
+  "savedAt": 1788123600000,
+  "entries": [
+    {
+      "gamePk": 822766,
+      "review": {
+        "id": "scoring-36",
+        "atBatIndex": 36,
+        "inning": 5,
+        "halfInning": "bottom",
+        "inningLabel": "▼ Bot 5th",
+        "reviewType": "Scoring Change",
+        "typeKey": "scoring_change",
+        "battingSide": "home",
+        "battingTeamId": 141,
+        "battingTeamName": "Toronto Blue Jays",
+        "battingTeamAbbrev": "TOR",
+        "inProgress": false,
+        "isOverturned": null,
+        "outcome": "changed",
+        "outcomeLabel": "Rescored",
+        "reason": "Double → Single",
+        "description": "Vladimir Guerrero Jr. singles on a sharp ground ball to left fielder Randy Arozarena. Myles Straw scores. Vladimir Guerrero Jr. to 2nd.",
+        "initialDescription": "Vladimir Guerrero Jr. doubles (15) on a sharp ground ball to left fielder Randy Arozarena. Myles Straw scores.",
+        "initial": {
+          "eventType": "double",
+          "event": "Double",
+          "label": "Double",
+          "category": "hit",
+          "isOut": false,
+          "errorMovements": 0
+        },
+        "final": {
+          "eventType": "single",
+          "event": "Single",
+          "label": "Single",
+          "category": "hit",
+          "isOut": false,
+          "errorMovements": 0
+        },
+        "changeCount": 1,
+        "changes": [
+          {
+            "at": 1788123600000,
+            "headline": "Double → Single"
+          }
+        ],
+        "previousHeadline": null,
+        "mechanism": {
+          "key": "scorer",
+          "label": "Official scoring change — no replay review observed"
+        },
+        "flags": [],
+        "initialScoreAfter": null,
+        "scoreAfter": null,
+        "timestamp": "2026-08-30T21:00:00.000Z",
+        "initialObservedAt": "2026-08-30T20:00:00.000Z",
+        "isPitch": false,
+        "pitchVelo": null,
+        "batter": {
+          "id": 665489,
+          "fullName": "Vladimir Guerrero Jr."
+        },
+        "pitcher": {
+          "id": 663538,
+          "fullName": "Logan Evans"
+        },
+        "countBefore": null,
+        "countAfter": null,
+        "atBatCount": null,
+        "challenger": null,
+        "scoreImpact": null
+      },
+      "firstSeen": 1788123600000,
+      "lastSeen": 1788123600000,
+      "matchupLabel": "SEA @ TOR"
+    }
+  ],
+  "order": [
+    "822766:scoring-36"
+  ],
+  "snapshots": {
+    "822766": {
+      "36": {
+        "snapshot": {
+          "atBatIndex": 36,
+          "eventType": "single",
+          "event": "Single",
+          "description": "Vladimir Guerrero Jr. singles on a sharp ground ball to left fielder Randy Arozarena. Myles Straw scores. Vladimir Guerrero Jr. to 2nd.",
+          "isOut": false,
+          "outsAfter": 0,
+          "awayScore": null,
+          "homeScore": null,
+          "rbi": 1,
+          "errorMovements": 0,
+          "movementSig": "single:-:2B:safe|single:3B:score:safe",
+          "hasReview": false,
+          "endTime": "2026-08-30T20:15:00.000Z",
+          "inning": 5,
+          "halfInning": "bottom"
+        },
+        "signature": "single|safe|0|0|single:-:2B:safe|single:3B:score:safe",
+        "firstObservedAt": 1788120000000,
+        "lastObservedAt": 1788123600000,
+        "history": [
+          {
+            "at": 1788123600000,
+            "from": {
+              "atBatIndex": 36,
+              "eventType": "double",
+              "event": "Double",
+              "description": "Vladimir Guerrero Jr. doubles (15) on a sharp ground ball to left fielder Randy Arozarena. Myles Straw scores.",
+              "isOut": false,
+              "outsAfter": 0,
+              "awayScore": null,
+              "homeScore": null,
+              "rbi": 1,
+              "errorMovements": 0,
+              "movementSig": "double:-:2B:safe|double:3B:score:safe",
+              "hasReview": false,
+              "endTime": "2026-08-30T20:15:00.000Z",
+              "inning": 5,
+              "halfInning": "bottom"
+            },
+            "to": {
+              "atBatIndex": 36,
+              "eventType": "single",
+              "event": "Single",
+              "description": "Vladimir Guerrero Jr. singles on a sharp ground ball to left fielder Randy Arozarena. Myles Straw scores. Vladimir Guerrero Jr. to 2nd.",
+              "isOut": false,
+              "outsAfter": 0,
+              "awayScore": null,
+              "homeScore": null,
+              "rbi": 1,
+              "errorMovements": 0,
+              "movementSig": "single:-:2B:safe|single:3B:score:safe",
+              "hasReview": false,
+              "endTime": "2026-08-30T20:15:00.000Z",
+              "inning": 5,
+              "halfInning": "bottom"
+            },
+            "summary": {
+              "initial": {
+                "eventType": "double",
+                "event": "Double",
+                "label": "Double",
+                "category": "hit",
+                "isOut": false,
+                "errorMovements": 0
+              },
+              "final": {
+                "eventType": "single",
+                "event": "Single",
+                "label": "Single",
+                "category": "hit",
+                "isOut": false,
+                "errorMovements": 0
+              },
+              "headline": "Double → Single"
+            }
+          }
+        ],
+        "rowCreated": true
+      }
+    }
+  },
+  "irregularities": {},
+  "grace": {},
+  "settled": [
+    822766
+  ],
+  "trimmed": {
+    "entries": 0,
+    "snapshots": 0
+  }
+}

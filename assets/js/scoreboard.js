@@ -39,6 +39,18 @@
   let reviewStatusTimer = null;
   let reviewStatusInFlight = false;
   let reviewStatusCodes = new Map();
+  let scoringChangesByGame = new Map();
+
+  async function loadScoringChangesForSlate(requestDate) {
+    if (!window.MLBFeedLog) return;
+    try {
+      const map = await window.MLBFeedLog.getScoringChangesByGame(requestDate);
+      if (requestDate === dateStr && map && map.size) {
+        scoringChangesByGame = map;
+        render();
+      }
+    } catch (_) {}
+  }
 
   /* ------------------------------------------------------------------ state */
 
@@ -51,6 +63,7 @@
     const d = new Date(`${dateStr}T12:00:00`);
     d.setDate(d.getDate() + days);
     dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    scoringChangesByGame.clear();
   }
 
   /* ------------------------------------------------------------------ fetch */
@@ -74,6 +87,7 @@
       const nextGames = await MLB.getSchedule(requestDate);
       if (requestDate !== dateStr) return;
       games = nextGames;
+      loadScoringChangesForSlate(requestDate);
       render();
       statusLine.textContent =
         `${games.length} game${games.length === 1 ? '' : 's'} · ` +
@@ -450,6 +464,11 @@
       foot.appendChild(UI.el('span', 'card-review-indicator',
         `🚨 ${inspection.typeLabel || 'Review in Progress'}`));
     }
+    const scChanges = scoringChangesByGame.get(game.gamePk);
+    if (scChanges && scChanges.length) {
+      foot.appendChild(UI.el('span', 'card-scoring-indicator',
+        `✏️ ${scChanges.length} Scoring Change${scChanges.length === 1 ? '' : 's'}`));
+    }
     if (isLive && ls) {
       foot.appendChild(UI.countDots(ls.balls, ls.strikes, ls.outs, 'card-count'));
       const last = lastPlayText(game);
@@ -523,6 +542,7 @@
     nextDay() { shiftDate(1); syncUrl(); updateDateLabel(); games = []; load(); },
     today() {
       dateStr = todayStr();
+      scoringChangesByGame.clear();
       syncUrl();
       updateDateLabel();
       games = [];
