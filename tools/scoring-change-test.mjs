@@ -588,6 +588,64 @@ assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: mid - 1600
 assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: 0 }, true, GRACE_MS + 1, GRACE_MS, BASE_MS, FAST_MS, FAST_WINDOW), 'skip',
   'recency tiers never extend polling past the grace window');
 
+/* ----- the optional HOT tier (2026-09-26): inside the fast window, the first
+ * SCORING_HOT_WINDOW_MS is rescanned at the hottest gap. Defaults to "off"
+ * when the two extra params are omitted, so every call above is unchanged. */
+const HOT_MS = 1000;
+const HOT_WINDOW = 2 * 60 * 1000;
+// Hot tier wins inside its window: a scan 1250ms old is due at the 1s hot gap
+// but NOT at the fixture's (much longer) fast gap — so 'scan' here can only
+// come from the hot tier.
+assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: HOT_MS + 250 }, true, (2 * HOT_MS) + 250,
+  GRACE_MS, BASE_MS, FAST_MS, FAST_WINDOW, HOT_MS, HOT_WINDOW), 'scan',
+  'the first 2 minutes after Final are rescanned at ~1s (hot tier)');
+// Same age, hot params omitted: the FAST_MS fast gap has not elapsed -> skip.
+assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: HOT_MS + 250 }, true, (2 * HOT_MS) + 250,
+  GRACE_MS, BASE_MS, FAST_MS, FAST_WINDOW), 'skip',
+  'without the hot params the fast gap governs (back-compat pinned)');
+// Inside the hot gap -> skip even with the hot tier on.
+assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: 900 }, true, 1000,
+  GRACE_MS, BASE_MS, FAST_MS, FAST_WINDOW, HOT_MS, HOT_WINDOW), 'skip',
+  'within the hot gap -> skip');
+// Past the hot window the FAST_MS tier governs again, not the hot gap:
+// 1500ms since the last scan is inside it (skip) even though the hot gap
+// alone would have been satisfied.
+assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: HOT_WINDOW + 1000 }, true, HOT_WINDOW + 2500,
+  GRACE_MS, BASE_MS, FAST_MS, FAST_WINDOW, HOT_MS, HOT_WINDOW), 'skip',
+  'past the hot window the fast tier governs (inside FAST_MS -> skip)');
+assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: HOT_WINDOW - FAST_MS - 1000 }, true, HOT_WINDOW + 2500,
+  GRACE_MS, BASE_MS, FAST_MS, FAST_WINDOW, HOT_MS, HOT_WINDOW), 'scan',
+  'past the hot window the fast tier still catches the ruling (past FAST_MS -> scan)');
+// And the hot tier can never extend polling beyond the grace window.
+assert.equal(finalScanDecision({ firstFinalObservedAt: 0, lastScanAt: 0 }, true, GRACE_MS + 1,
+  GRACE_MS, BASE_MS, FAST_MS, FAST_WINDOW, HOT_MS, HOT_WINDOW), 'skip',
+  'the hot tier never extends polling past the grace window');
+
+/* The page must actually USE the hot tier: the shipped constants and the
+ * finalScanDecision call site both have to carry it (a constant that is never
+ * passed would make this test's call-site contract a lie). */
+{
+  const src = readFileSync(new URL('../assets/js/reviews-feed.js', import.meta.url), 'utf8');
+  // Reads "<n>" and "<n> * 1000" forms alike: the literal is written however
+  // the source expresses it; only the resulting milliseconds matter here.
+  const msValue = (name) => {
+    // Evaluates the literal's own multiplication chain ("1000", "2 * 60 * 1000")
+    // so the assertion is on the shipped milliseconds, not on its spelling.
+    const m = new RegExp(`${name}\\s*=\\s*([^;]+);`).exec(src);
+    assert.ok(m, `${name} is defined in reviews-feed.js`);
+    const parts = m[1].split('*').map((part) => Number(part.trim()));
+    assert.ok(parts.length && parts.every((n) => Number.isFinite(n)),
+      `${name} is a numeric literal product`);
+    return parts.reduce((a, b) => a * b, 1);
+  };
+  assert.equal(msValue('SCORING_HOT_RESCAN_MS'), 1000, 'SCORING_HOT_RESCAN_MS is 1s');
+  const hotWin = msValue('SCORING_HOT_WINDOW_MS');
+  assert.equal(hotWin, 120000, 'SCORING_HOT_WINDOW_MS is 2 minutes');
+  const callSite = /finalScanDecision\(([\s\S]{0,400}?)\);/.exec(src)[1];
+  assert.ok(/SCORING_HOT_RESCAN_MS/.test(callSite) && /SCORING_HOT_WINDOW_MS/.test(callSite),
+    'ingestGame passes both hot-tier constants to finalScanDecision');
+}
+
 /* ===================== 11. Feed integration contracts (All feed, alerts) == */
 
 const scoringReview = r3.added[0].review;

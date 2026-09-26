@@ -14,6 +14,48 @@ addendum and `docs/verification-report.md` §18).
 
 ---
 
+## >> CHANGE IMPLEMENTED — 2026-09-26: stalls removed, cross-session push, post-Final 1s tier
+
+A second line-by-line pass over the same categories, looking specifically for *time the reader
+waits that is not the API's fault*. Eight changes were implemented; every one is pinned by a
+test that fails without it (negative controls were run for each — see
+`docs/verification-report.md` §19).
+
+| # | Change | Where | Effect on the categories you listed |
+|---|---|---|---|
+| 1 | **Cross-session push (SSE).** The server now streams the shared log: `GET /api/feed-log/stream?date=…` + a broadcast on every accepted `POST /api/feed-log`. | `server.mjs` (`sseClients`, `broadcastFeedLog`, the stream route, the POST broadcast); `assets/js/feed-log.js` `subscribeFeedLog()` | A **challenge / review / boundary / pending ruling / scoring change** detected by ANY other tab or browser appears in this page as soon as the observing session writes it (the Replay Feed is the only writer of that log; its write is coalesced at ≤1/s), instead of on the next shared-log pull (15s in the feed, one per poll on the scoreboard). Pulling remains the fallback, byte-for-byte the old path. |
+| 2 | **Scoreboard: pushed badges + a pull that no longer competes with the schedule.** | `assets/js/scoreboard.js` (`startScoringLogStream`, `applyScoringLogPayload`, `SCORING_LOG_POLL_MS = 15000`, `scoringLogPullGapMs`) | The **scoring-change tracker** badge (✏️) lands with the pushed frame. With no stream (static hosting) the previous per-poll behaviour is kept exactly, so the badge is never slower. |
+| 3 | **Game page: pushed scoring changes for its game + a mid-cycle review flip no longer dropped.** | `assets/js/game.js` (`startGameScoringStream`, `scoringChangesFromPayload`, `statusFlipPending`) | The page's **Challenges & Reviews / scoring-change** cards update on the push; the 3s pull stays (15s only while a stream is live). A status flip that lands while a full-feed cycle is in flight now runs a fresh cycle **the instant that cycle ends** instead of being dropped by `requestInFlight` and waiting for the next tick. |
+| 4 | **Replay Feed: a flip mid-wave is fetched out of band.** | `assets/js/reviews-feed.js` (`kickPriorityScan`, wired to `reviewStatusFlips` via `waveInFlight`) | A **challenge / review / boundary call that begins while the slate scan is running** no longer waits for that whole wave (up to `PBP_TIMEOUT_MS = 3000ms` on one stalled game): the flipped game(s) are fetched immediately, one request per flip. |
+| 5 | **Run-at-risk notification no longer waits for the slowest game.** | `assets/js/reviews-feed.js` (`RUN_RISK_NOTIFY_COALESCE_MS = 250`, `scheduleRunRiskNotify`, `flushRunRiskNotify`; end-of-poll flush kept) | The desktop **runs-at-risk** alert leaves ~250ms after the first response carrying it instead of at the end of the poll; the same batch is never sent twice (`tools/review-watcher-test.mjs` §4d pins both). The chime already fired that early. |
+| 6 | **Post-Final scoring-change tier: 0–2min @1s.** | `assets/js/reviews-feed.js` (`SCORING_HOT_RESCAN_MS = 1000`, `SCORING_HOT_WINDOW_MS = 2*60*1000`, `finalScanDecision(...)` 9-arg) | A **post-Final scorer ruling** published in the first two minutes after the final out (where most of them land) is caught in ≤~1s instead of ≤2.5s, then ≤2.5s to 5min, then ≤15s, all inside the unchanged 30-min grace. Volume: ~292 requests per finished game (was ~220); ≈2.4 req/s averaged over 15 finished games. |
+| 7 | **Cosmetic team directory can no longer stall a poll.** | `assets/js/reviews-feed.js` (`TEAMS_WAIT_MS = 600`, `TEAMS_RETRY_MS = 5min`, `resolveTeamDirectory`, `applyTeamDirectory`, `sleepMs`) | The directory supplies abbreviation chips only. It is now awaited for at most 600ms and applied whenever it lands; previously a stalled `/teams` could hold `requestInFlight` for api.js's default 8s timeout × (1 + 1 retry) + 150ms backoff ≈ **up to ~16.2s**, during which every watcher-triggered scan was dropped. |
+| 8 | **Earliest-signal cadence 250ms → 125ms** on all three status watchers — the sweep that *is* the challenge/review/boundary/under-review signal. | `reviews-feed.js` (`REVIEW_STATUS_POLL_MS`), `scoreboard.js` (`REVIEW_STATUS_POLL_MS`), `game.js` (`STATUS_WATCH_POLL_MS`) | Halves both the average and worst-case detection delay for **new challenges, reviews, boundary calls and under-review states** on the feed, the scoreboard ticker and the game page. Costs 8 requests/s of ~2.4 KB on the feed/scoreboard (≈19 KB/s) and ~150 B on the game page; overlap-guarded, live-only, parked when hidden or idle. Footprint and rules: `docs/api-compliance.md`. |
+| 9 | **Probe-first banner on the game page.** On a status flip the banner is painted from the lean projected play-by-play (~3 KB) instead of after the 1–2MB full feed lands; the full feed replaces it and the status-lead grace keeps it from flapping. | `game.js` (`probeRenderReview`, `statusLeadReview`, render in `renderAll`) | **Under-review banner** on the game page: one ~3 KB round trip instead of one full-feed download — seconds earlier on a slow connection. |
+| 10 | **Honour the server's own 429 window; open connections early.** | `assets/js/api.js` (`parseRetryAfter`, `RATE_LIMIT_MAX_BACKOFF_MS`, armed in `getJSON`); `index.html` / `game.html` / `reviews.html` (`preconnect` + `dns-prefetch`) | After an HTTP 429 the quiet period is the server's `Retry-After` (seconds or HTTP-date), clamped to **[1s, 5min]**; absent/garbage headers keep the documented 60s. The three pages preconnect to `statsapi.mlb.com` so the first poll does not pay DNS+TCP+TLS setup. |
+
+**Updated ceilings (2026-09-26):**
+
+| Category | Ceiling now |
+|---|---|
+| New challenge / review / boundary / under-review (Replay Feed) | **≤125ms** watcher + one pbp RTT, **even mid-wave** (#4, #8) |
+| Same, on the game page | **≤125ms** watcher + one probe RTT for the banner (#9); a mid-cycle flip adds one cycle, not one tick (#3) |
+| Same, on the scoreboard ticker | **≤125ms** watcher (#8) |
+| All review updates / outcomes | ≤250ms + one round trip |
+| Runs at risk | one pbp RTT after the flip; notification ~250ms after the first response carrying it (#5) |
+| Official scoring pending — marker & resolution | ≤250ms (rides the pbp scan; no status field exists) |
+| Scoring change tracker — live | ≤250ms |
+| Scoring change tracker — post-Final | **≤~1s** (0–2min) → ≤2.5s (2–5min) → ≤15s (5–30min) (#6) |
+| Same, in another browser/tab | **push: ~one round trip**, plus the writer's ≤1s log-write coalescing (was ≤15s) (#1) |
+
+**Not claimed:** no wall-clock milliseconds were re-measured here — the sandbox shell has no
+outbound network; every number above is either a code constant (with its file/function) or a
+test-pinned behaviour. §3–§5 of this document carry 2026-09-05 line numbers; `reviews-feed.js`
+has grown since (constants now sit near L1700–1800), so re-grep a symbol before trusting an
+old line citation.
+
+---
+
 ## >> CHANGE IMPLEMENTED — 2026-09-05: every remaining multi-250ms gap closed (politely)
 
 The 2026-09-04 pass left the Replay Feed at the pull floor but listed three deliberately
@@ -49,7 +91,7 @@ this is why the boot-path tests exist):
 
 | Category | Ceiling before | Ceiling now |
 |---|---|---|
-| New challenge / review / boundary / under-review (Replay Feed) | 250ms watcher | 250ms watcher (unchanged — already at floor) |
+| New challenge / review / boundary / under-review (Replay Feed) | 250ms watcher | 250ms watcher (that pass; **125ms since 2026-09-26** — see the addendum) |
 | Same, on the **game page** | ~500ms + feed RTT | **≤250ms + feed RTT** (watcher, #3) |
 | Same, on the **scoreboard ticker** | ~500ms schedule poll | **≤250ms** (watcher, #4) |
 | All review updates / outcomes (feed + game page) | 250ms (probe/watcher) | 250ms (unchanged) |
@@ -233,6 +275,12 @@ out to `reviews.html`, where the 250 ms status watcher catches the review-state 
 
 ## 6. Verified conclusions
 
+> **Status note (2026-09-26):** this section is the 2026-08-30 pass. The dated addenda at the
+> top of this document supersede its ceilings — in particular the game page and the scoreboard
+> now DO have dedicated 250ms status watchers (2026-09-05), the post-Final rescan is tiered
+> (1s/2.5s/15s, 2026-09-26), and cross-browser updates are pushed rather than polled
+> (2026-09-26). The reasoning below is kept as the record of how each ceiling was derived.
+
 1. **Review-state detection on the Replay Feed is at the practical floor.** For a pull-only API the
    floor is *one cadence + one RTT*. `reviews.html` already polls the earliest signal (game status)
    at 250 ms via a watcher and kicks an out-of-band scan on a flip. The documented worst case is
@@ -277,6 +325,14 @@ out to `reviews.html`, where the 250 ms status watcher catches the review-state 
 > changes cannot be surfaced from the schedule, and per-game playByPlay polling on
 > the scoreboard would add per-game requests every cycle for categories the Replay
 > Feed already delivers at 250ms.]**
+>
+> **[2026-09-26 update: option 3's *reason* still holds, but the underlying limit is now
+> addressed from the other side — the pages that CAN carry these categories receive them by
+> push (feed/scoreboard/game-page SSE, changes #1–#3), and the Replay Feed fetches a flipped
+> game out of band on a mid-wave flip (#4, one request per flip, not per game per cycle).
+> A sub-250ms cadence remains deliberately unimplemented: doubling the scan rate buys at most
+> 125ms off a ceiling that is otherwise one round trip, at double the request volume — the
+> opposite of the "good citizen" constraint this repo documents.]**
 
 - **game.html new-review detection:** add a standalone ~150-byte status watcher (mirroring the feed) so a brand-new review drops the page to 250 ms without waiting for the next 500 ms feed cycle.
 - **Scoreboard new-review detection:** add the same lightweight watcher so the ticker appears at ~250 ms instead of the next ~500 ms schedule poll.

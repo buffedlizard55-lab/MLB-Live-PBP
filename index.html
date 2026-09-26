@@ -6,6 +6,18 @@
   <title>MLB Live Scoreboard</title>
   <meta name="description" content="Live MLB scoreboard and game play-by-play powered by the public MLB StatsAPI — the same data behind mlb.com Gameday.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='46' fill='%23fff' stroke='%23e03131' stroke-width='6'/%3E%3Cpath d='M50 4 A46 46 0 0 1 96 50 M50 96 A46 46 0 0 1 4 50 M4 50 A46 46 0 0 1 50 4 M96 50 A46 46 0 0 1 50 96' stroke='%23e03131' stroke-width='2.5' fill='none'/%3E%3C/svg%3E">
+  <!-- Open the data host while the stylesheet is still parsing: each page's
+       first request is a cross-origin call to statsapi.mlb.com (assets/js/api.js),
+       and preconnect removes that DNS + TCP + TLS setup (one connection setup;
+       standard preconnect behaviour, not a figure measured here) from the
+       critical path of the first poll. The two
+       image hosts are only dns-prefetched — they are lazy-loaded logos and
+       headshots off the critical path, so an extra connection would cost more
+       than it saves. Ignored by browsers without support; harmless otherwise. -->
+  <link rel="preconnect" href="https://statsapi.mlb.com" crossorigin>
+  <link rel="dns-prefetch" href="https://statsapi.mlb.com">
+  <link rel="dns-prefetch" href="https://www.mlbstatic.com">
+  <link rel="dns-prefetch" href="https://img.mlbstatic.com">
   <link rel="stylesheet" href="assets/css/style.css">
 </head>
 <body class="page-scoreboard">

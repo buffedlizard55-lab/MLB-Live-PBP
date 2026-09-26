@@ -16,14 +16,19 @@
   // docs/latency-audit.md addendum). While any game is live, sweep the
   // `fields`-projected, hydration-free schedule (MLB.getReviewStatus:
   // gamePk + status for the whole slate in ~2.4 KB / 1 chunk — verified live
-  // 2026-09-02 and again 2026-09-05) every 250ms, so the 🚨 review ticker /
-  // card badges appear the moment MLB flips a status to a review code
+  // 2026-09-02 and again 2026-09-05), so the 🚨 review ticker / card badges
+  // appear within one sweep of MLB flipping a status to a review code
   // (M*/N*/IH — the field that changes the instant a review is CALLED)
   // instead of on the next 500ms hydrated-schedule poll. The hydrated
   // schedule keeps its own 500ms cadence for scores/counts; only status
   // flips ride this fast, tiny sweep. Parks at 5s (no requests) when the
   // slate has nothing live and whenever the tab is hidden.
-  const REVIEW_STATUS_POLL_MS = 250;
+  //
+  // 250ms → 125ms (2026-09-26): the ticker is this page's whole review story,
+  // so its sweep is the request that best repays a tighter interval — 8/s of
+  // ~2.4 KB (~19 KB/s), overlap-guarded and parked on an idle slate or a
+  // hidden tab. See docs/api-compliance.md for the footprint this fits in.
+  const REVIEW_STATUS_POLL_MS = 125;
   const REVIEW_STATUS_IDLE_MS = 5000;
   const REVIEW_STATUS_TIMEOUT_MS = 2500;
 
@@ -41,15 +46,85 @@
   let reviewStatusCodes = new Map();
   let scoringChangesByGame = new Map();
 
-  async function loadScoringChangesForSlate(requestDate) {
+  /**
+   * Scoring-change badges for the slate. Two paths, one render:
+   *
+   *   - PUSH (preferred): the server's live log tail (SSE) delivers the merged
+   *     log the moment ANY session records a scoring change, so the ✏️ badges
+   *     appear in milliseconds without this page asking for anything.
+   *   - PULL (fallback): a throttled GET, because this used to run on EVERY
+   *     poll — up to 4 requests/s, competing with the schedule request for the
+   *     same connection while adding nothing (the log changes only when a
+   *     scorer ruling is observed).
+   *
+   * On static hosting (no /api/feed-log) both are no-ops and the page simply
+   * shows no scoring-change badge, exactly as before.
+   */
+  // With a live push stream the periodic pull is only a safety net; without
+  // one (no EventSource, endpoint absent, stream gave up) the page keeps its
+  // original behaviour of re-reading the log on every poll — the badge must
+  // never be slower just because the push path is unavailable.
+  const SCORING_LOG_POLL_MS = 15000;
+  let lastScoringLogAt = 0;
+  let scoringLogPrimed = false; // a payload for the CURRENT date has been applied
+  let scoringLogStream = null;
+  const scoringLogPullGapMs = () => (scoringLogStream ? SCORING_LOG_POLL_MS : 0);
+
+  function applyScoringLogPayload(payload, requestDate) {
+    if (!payload || requestDate !== dateStr) return;
+    const map = window.MLBFeedLog && window.MLBFeedLog.scoringChangesByGameFromPayload
+      ? window.MLBFeedLog.scoringChangesByGameFromPayload(payload)
+      : null;
+    if (!map) return;
+    // A push is authoritative (the server just merged a write), so an empty
+    // payload really does mean "no scoring changes" — including clearing a
+    // badge whose change was superseded.
+    scoringChangesByGame = map;
+    scoringLogPrimed = true;
+    render();
+  }
+
+  async function loadScoringChangesForSlate(requestDate, force) {
     if (!window.MLBFeedLog) return;
+    // The first call for a date is never throttled (boot / date switch); after
+    // that the log is only re-pulled every SCORING_LOG_POLL_MS, since the
+    // stream covers everything in between.
+    if (!force && scoringLogPrimed && Date.now() - lastScoringLogAt < scoringLogPullGapMs()) return;
+    lastScoringLogAt = Date.now();
     try {
       const map = await window.MLBFeedLog.getScoringChangesByGame(requestDate);
-      if (requestDate === dateStr && map && map.size) {
+      if (requestDate !== dateStr) return;
+      scoringLogPrimed = true;
+      // A pull that finds nothing must not wipe a badge the page already
+      // shows; a pull that finds something replaces the map wholesale.
+      if (map && (map.size || !scoringChangesByGame.size)) {
         scoringChangesByGame = map;
         render();
       }
     } catch (_) {}
+  }
+
+  /** Live tail of the shared log; re-armed per date and when a tab returns. */
+  function startScoringLogStream() {
+    stopScoringLogStream();
+    if (!window.MLBFeedLog || typeof window.MLBFeedLog.subscribeFeedLog !== 'function') return;
+    const requestDate = dateStr;
+    scoringLogStream = window.MLBFeedLog.subscribeFeedLog(requestDate, (payload) => {
+      lastScoringLogAt = Date.now(); // a push supersedes the next pull
+      applyScoringLogPayload(payload, requestDate);
+    }, {
+      // The stream gave up (endpoint absent/blocked): drop the handle so the
+      // pull returns to its per-poll cadence and a later tab-show can retry.
+      onClose: () => { scoringLogStream = null; },
+    });
+    if (typeof scoringLogStream !== 'function') scoringLogStream = null;
+  }
+
+  function stopScoringLogStream() {
+    if (typeof scoringLogStream === 'function') {
+      try { scoringLogStream(); } catch (_) {}
+    }
+    scoringLogStream = null;
   }
 
   /* ------------------------------------------------------------------ state */
@@ -64,6 +139,9 @@
     d.setDate(d.getDate() + days);
     dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     scoringChangesByGame.clear();
+    lastScoringLogAt = 0; // the new date's log must be pulled (or pushed) fresh
+    scoringLogPrimed = false;
+    startScoringLogStream();
   }
 
   /* ------------------------------------------------------------------ fetch */
@@ -87,7 +165,8 @@
       const nextGames = await MLB.getSchedule(requestDate);
       if (requestDate !== dateStr) return;
       games = nextGames;
-      loadScoringChangesForSlate(requestDate);
+      // Forced (unthrottled) until this date's log has been applied once.
+      loadScoringChangesForSlate(requestDate, !scoringLogPrimed);
       render();
       statusLine.textContent =
         `${games.length} game${games.length === 1 ? '' : 's'} · ` +
@@ -543,14 +622,26 @@
     today() {
       dateStr = todayStr();
       scoringChangesByGame.clear();
+      lastScoringLogAt = 0;
+      scoringLogPrimed = false;
       syncUrl();
       updateDateLabel();
       games = [];
+      startScoringLogStream();
       load();
     },
     pickDate() {
       const d = $('#date-picker').value;
-      if (d) { dateStr = d; syncUrl(); updateDateLabel(); games = []; load(); }
+      if (d) {
+        dateStr = d;
+        lastScoringLogAt = 0;
+        scoringLogPrimed = false;
+        syncUrl();
+        updateDateLabel();
+        games = [];
+        startScoringLogStream();
+        load();
+      }
     },
   };
 
@@ -574,6 +665,9 @@
         // load() re-renders from the hydrated schedule; the watcher (stopped
         // on hide) restarts here for its one sweep-armed lifetime.
         scheduleReviewStatus();
+        // A stream that gave up (endpoint absent, or an outage) is retried
+        // when the tab comes back; a healthy one is left connected.
+        if (!scoringLogStream) startScoringLogStream();
         load();
       } else {
         // No hidden-tab requests at all: park the fast status sweep.
@@ -585,6 +679,9 @@
     // observes has anything live, 5s otherwise — without ever being reset by
     // the schedule poll's phase.
     scheduleReviewStatus(true);
+    // Live push for scoring-change badges (no-op without a server); the
+    // throttled pull inside load() remains the fallback.
+    startScoringLogStream();
     load();
   });
 })();

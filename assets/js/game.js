@@ -25,12 +25,20 @@
   // docs/latency-audit.md addendum). While the game is live and NOT already
   // known to be in review, this timer sweeps the ~150-byte per-game status
   // projection (MLB.getGameStatus — verified live 2026-09-05 to return
-  // exactly {"gameData":{"status":{…}}} in one small response) every 250ms,
-  // so a brand-new challenge/review is seen at ≤250ms instead of at the next
-  // 500ms full-feed cycle. The official status is the field MLB flips the
-  // instant a review is CALLED (registry codes M*/N*/IH — see
+  // exactly {"gameData":{"status":{…}}} in one small response), so a
+  // brand-new challenge/review is seen within one sweep instead of at the
+  // next 500ms full-feed cycle. The official status is the field MLB flips
+  // the instant a review is CALLED (registry codes M*/N*/IH — see
   // statusSaysReview below), i.e. the earliest signal that exists.
-  const STATUS_WATCH_POLL_MS = 250;
+  //
+  // 250ms → 125ms (2026-09-26). This sweep is the earliest signal available,
+  // so it is where extra requests buy the most: half the interval halves both
+  // the average and the worst-case detection delay. The payload is a ~150-byte
+  // per-game projection (8/s ≈ 1.2 KB/s), an overlap guard
+  // (statusWatchInFlight) means a slow response stretches the cadence rather
+  // than stacking requests, and the watcher only sweeps while the game is live
+  // and not already known to be in review. See docs/api-compliance.md.
+  const STATUS_WATCH_POLL_MS = 125;
   const STATUS_WATCH_RECHECK_MS = 1000; // in-review: timer-only check-ins (no fetch)
   const STATUS_WATCH_IDLE_MS = 5000;    // parked when preview/final/hidden
   const STATUS_WATCH_TIMEOUT_MS = 2500; // stalled sweep fails fast; next tick retries
@@ -54,6 +62,16 @@
   let lastActiveReview = false;
   let activeTab = 'plays';
   let requestInFlight = false;
+  // Set when the 250ms status watcher saw a review flip while a full-feed
+  // cycle was already in flight: that cycle's feed was requested BEFORE the
+  // flip, so it cannot carry the review. The flag makes load() run again the
+  // instant the cycle finishes (one round trip earlier than the next tick).
+  let statusFlipPending = false;
+  // The review the LEAN probe reported during the status-lead window, kept so
+  // the banner painted from it is not wiped by a full feed that was requested
+  // before the flip landed (see probeRenderReview / renderAll).
+  let statusLeadReview = null;
+  let probeRenderInFlight = false;
   // Review-status watcher state: its own timer (never shares the poll timer)
   // and an in-flight guard so a sweep can never overlap itself and stack
   // requests on a slow network.
@@ -114,6 +132,9 @@
         // watcher (stopped on hide) restarts here — its only re-arming
         // points are boot and "tab shown" (it self-perpetuates otherwise).
         scheduleStatusWatch();
+        // A stream that gave up while the tab was away is retried here; a
+        // healthy one is left connected.
+        if (!gameScoringStream && gameScoringStreamDate) startGameScoringStream(gameScoringStreamDate);
         load(true);
       } else {
         stopPolling();
@@ -242,6 +263,10 @@
       scheduleNext(5000);
     } finally {
       requestInFlight = false;
+      if (statusFlipPending) {
+        statusFlipPending = false;
+        load(false);
+      }
     }
   }
 
@@ -418,16 +443,78 @@
         if (line) {
           line.textContent = `🚨 ${statusLeadLabel} — loading details…`;
         }
-        // Out-of-band full feed: renders the banner + review tab now. If a
-        // cycle is already in flight its own full feed carries the review;
-        // the requestInFlight guard makes the redundant call a no-op.
-        load(false);
+        // Paint the banner from the LEAN probe (one ~3KB request) instead of
+        // waiting for the 1-2MB full feed below — the earliest possible
+        // banner. Fire-and-forget: it renders only if it finds the review and
+        // the full feed replaces it either way.
+        probeRenderReview(st);
+        // Out-of-band full feed: renders everything else now. If a cycle is
+        // already in flight, its feed was requested before the flip and
+        // cannot carry the review — so mark it and re-run the moment it
+        // finishes (session 2026-09-26) rather than silently dropping the
+        // kick and waiting for the next scheduled tick.
+        if (requestInFlight) statusFlipPending = true;
+        else load(false);
       }
     } catch (err) {
       // Deliberately quiet — see the doc comment above.
     } finally {
       statusWatchInFlight = false;
       scheduleStatusWatch();
+    }
+  }
+
+  /**
+   * Paint the review banner from the LEAN probe, before the full feed lands.
+   *
+   * The full feed is 1-2MB; the projected playByPlay is ~3KB and carries the
+   * same `reviewDetails` markers the banner is built from (api.js PBP_FIELDS
+   * includes about/result/matchup/playEvents/reviewDetails/runners). On a
+   * slow connection that is the difference between a banner in ~150ms and one
+   * in seconds, and it costs one small request per status flip.
+   *
+   * The synthesized feed keeps the data we already have (teams, challenge
+   * counters, linescore) and swaps in the fresh status the watcher just read
+   * plus the probe's plays, so extractReviews() sees exactly what it would
+   * have seen from a full feed. Everything rendered here is replaced by the
+   * authoritative renderAll() the moment the full feed lands with the review;
+   * until then the status-lead grace keeps it on screen (see renderAll).
+   * Never throws: any failure just falls through to the full feed.
+   */
+  async function probeRenderReview(status) {
+    if (!feed || !gamePk || probeRenderInFlight) return;
+    if (!MLB.getPlayByPlay || !window.MLBReviews || !window.MLBReviews.extractReviews) return;
+    probeRenderInFlight = true;
+    try {
+      const plays = await MLB.getPlayByPlay(gamePk, {
+        timeout: PROBE_TIMEOUT_MS, retries: PROBE_RETRIES,
+      });
+      if (!plays) return;
+      // Only paint when the LEAN ENDPOINT ITSELF carries the review (an
+      // in-progress reviewDetails on a play) — the same test the in-review
+      // fast path uses. A status-only flip (official status says review, play
+      // details not written yet) stays the 🚨 status line's job, exactly as
+      // before this change; the full feed brings that banner a moment later.
+      if (!reviewProbeState(plays).hasInProgress) return;
+      const synthesized = {
+        ...feed,
+        gameData: {
+          ...(feed.gameData || {}),
+          status: status || (feed.gameData && feed.gameData.status) || {},
+        },
+        liveData: { ...(feed.liveData || {}), plays },
+      };
+      const data = window.MLBReviews.extractReviews(synthesized);
+      if (!data || !data.activeReview) return; // nothing to paint early
+      statusLeadReview = data.activeReview;
+      lastActiveReview = true;
+      renderLiveReviewAlert(data.activeReview);
+      renderReviewTabBadge((data.reviews || []).length + gameScoringChanges.length);
+    } catch (_) {
+      // The full feed that follows is authoritative; a failed early paint
+      // must never surface as a page error.
+    } finally {
+      probeRenderInFlight = false;
     }
   }
 
@@ -499,16 +586,74 @@
   let gameScoringChanges = [];
   let lastScoringSyncAt = 0;
 
+  /* Live push for this game's scoring changes (see assets/js/feed-log.js):
+   * another tab/browser recording a scorer ruling reaches this page as a
+   * pushed frame instead of waiting for the 3s pull. The pull stays as the
+   * fallback — and returns to 3s if the stream ever gives up. */
+  let gameScoringStream = null;
+  let gameScoringStreamDate = null;
+
+  /** This game's scoring-change reviews out of one pushed log payload. */
+  function scoringChangesFromPayload(payload) {
+    const out = [];
+    const entries = payload && Array.isArray(payload.entries) ? payload.entries : [];
+    entries.forEach((e) => {
+      if (Number(e.gamePk) === Number(gamePk) &&
+          e.review && e.review.typeKey === 'scoring_change') {
+        out.push(e.review);
+      }
+    });
+    return out;
+  }
+
+  // Closes the stream. The date is deliberately kept: it is what a later
+  // retry (tab shown) re-subscribes with.
+  function stopGameScoringStream() {
+    if (typeof gameScoringStream === 'function') {
+      try { gameScoringStream(); } catch (_) {}
+    }
+    gameScoringStream = null;
+  }
+
+  function startGameScoringStream(date) {
+    if (!window.MLBFeedLog || typeof window.MLBFeedLog.subscribeFeedLog !== 'function') return;
+    if (!date || !gamePk) return;
+    if (gameScoringStream && gameScoringStreamDate === date) return;
+    stopGameScoringStream();
+    const target = date;
+    gameScoringStreamDate = target;
+    gameScoringStream = window.MLBFeedLog.subscribeFeedLog(target, (payload) => {
+      if (target !== gameScoringStreamDate) return;
+      const changes = scoringChangesFromPayload(payload);
+      // The pushed payload is authoritative for this date; only a length
+      // change re-renders (the page renders the change cards, not the feed).
+      if (changes.length === gameScoringChanges.length) return;
+      gameScoringChanges = changes;
+      lastScoringSyncAt = Date.now();
+      renderAll();
+    }, {
+      // Stream gone (endpoint absent/blocked): forget it, so the ordinary
+      // 3s pull takes over and a later tab-show can retry.
+      onClose: () => { gameScoringStream = null; },
+    });
+    if (typeof gameScoringStream !== 'function') gameScoringStream = null;
+  }
+
   async function syncGameScoringChanges() {
     if (!window.MLBFeedLog) return;
     const now = Date.now();
-    if (now - lastScoringSyncAt < 3000) return;
+    // A live push stream makes the periodic pull a safety net; with no stream
+    // (or after one gave up) the original 3s cadence applies, so this can
+    // never make the page slower than it was.
+    const gapMs = gameScoringStream ? 15000 : 3000;
+    if (now - lastScoringSyncAt < gapMs) return;
     lastScoringSyncAt = now;
     const date = (gd() && gd().datetime && gd().datetime.officialDate) ||
                  (gd() && gd().datetime && gd().datetime.originalDate) ||
                  (new URLSearchParams(window.location.search).get('date')) ||
                  new Date().toISOString().slice(0, 10);
     if (!date || !gamePk) return;
+    startGameScoringStream(date);
     try {
       const changes = await window.MLBFeedLog.getScoringChangesForGame(date, gamePk);
       if (Array.isArray(changes) && changes.length !== gameScoringChanges.length) {
@@ -533,7 +678,12 @@
     // report §16). Without the grace the two writers flap and each flap
     // re-downloads the full feed.
     lastActiveReview = !!(reviewData && reviewData.activeReview) || statusLeadGraceActive();
-    renderLiveReviewAlert(reviewData.activeReview);
+    // The authoritative feed wins as soon as it carries the review; until
+    // then (the status-lead window) the banner the probe painted stands in,
+    // so the two writers cannot flap it off screen.
+    if (reviewData.activeReview) statusLeadReview = null;
+    renderLiveReviewAlert(reviewData.activeReview ||
+      (statusLeadGraceActive() ? statusLeadReview : null));
     renderReviewTabBadge(allReviews.length);
     renderHeader();
     renderLivePanel(reviewData.activeReview);

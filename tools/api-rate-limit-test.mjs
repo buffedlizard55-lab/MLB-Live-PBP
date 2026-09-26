@@ -25,8 +25,23 @@ const apiSource = readFileSync(path.join(here, '..', 'assets', 'js', 'api.js'), 
 /* ------------------------------------------------ fake clock + recording timers */
 
 let fakeNow = 1_000_000; // arbitrary epoch ms
+// Real-clock epoch minus fake-clock epoch, so a date string BUILT from fake
+// time parses back to the same fake instant (Date.parse stays coherent with
+// Date.now — needed by the Retry-After HTTP-date case).
+const realEpochOffset = Date.now() - fakeNow;
 class FakeDate extends Date {
   static now() { return fakeNow; }
+  static parse(str) {
+    const real = Date.parse(str);
+    return Number.isFinite(real) ? real - realEpochOffset : NaN;
+  }
+}
+
+/** HTTP-date string for a fake-clock instant (fake now + ms). RFC 9110
+ *  HTTP-dates carry whole seconds, so the parsed delay can be up to 999ms
+ *  shorter than requested — assertions below allow for that. */
+function fakeDateString(ms) {
+  return new Date(realEpochOffset + fakeNow + ms).toUTCString();
 }
 
 const timers = new Map();
@@ -75,7 +90,15 @@ async function fakeFetch(url) {
     ok: r.status >= 200 && r.status < 300,
     status: r.status,
     json: async () => r.json,
+    // Real fetch exposes a Headers object; a stub that omits it must not
+    // break the Retry-After probe (guarded in api.js).
+    headers: r.headers,
   };
+}
+
+/** Minimal Headers stand-in exposing only what api.js reads. */
+function fakeHeaders(map) {
+  return { get: (name) => (map[String(name).toLowerCase()] ?? null) };
 }
 
 /* ------------------------------------------------------------------- boot */
@@ -181,6 +204,73 @@ assert.equal(typeof MLB.rateLimitedForMs, 'function', 'rateLimitedForMs is expor
     assert.equal(MLB.rateLimitedForMs(), 0, `HTTP ${status} does not arm the backoff`);
   }
   console.log('  6 non-429 failures never arm the backoff — ok');
+}
+
+/* 7. Retry-After is the SERVER's own instruction: a short window is honored
+ * exactly (waits the server's number, not a flat 60s), which is what makes a
+ * 429 cost 2s instead of 60s when the API says so. */
+{
+  fakeNow += 10 * 60 * 1000;
+  assert.equal(MLB.rateLimitedForMs(), 0, 'fresh state before the header case');
+  respond = () => ({ status: 429, json: {}, headers: fakeHeaders({ 'retry-after': '2' }) });
+  try { await MLB.getSchedule('2026-09-05', { retries: 0 }); } catch (err) { /* expected */ }
+  const remaining = MLB.rateLimitedForMs();
+  assert.ok(remaining > 1900 && remaining <= 2000,
+    `Retry-After: 2 -> a ~2s quiet period, not 60s (got ${remaining}ms)`);
+  respond = () => ({ status: 200, json: { allPlays: [], currentPlay: null } });
+  sleepsSeen.length = 0;
+  const promise = MLB.getPlayByPlay(823342, { retries: 0, timeout: 5000 });
+  await drain();
+  await promise;
+  assert.equal(sleepsSeen.length, 1, 'the follow-up request still waits first');
+  assert.ok(sleepsSeen[0] > 1900 && sleepsSeen[0] <= 2000,
+    `it waited the server-named 2s (got ${sleepsSeen[0]}ms)`);
+  console.log('  7 Retry-After (seconds) replaces the default window — ok');
+}
+
+/* 8. An HTTP-date Retry-After is parsed too, and the window is clamped on
+ * both ends: a bogus "0" still waits the 1s floor (never hammer), an absurd
+ * 10-minute value is capped at 5 minutes (never park the page forever). */
+{
+  /** Fire one 429 carrying `headerValue` (a value, or () => value, so a
+   *  date string can be built from the CURRENT fake clock) and return the
+   *  quiet period it armed. Deliberately NOT driven through drain(): with
+   *  retries:0 there is no backoff sleep to flush, the abort guard is cleared
+   *  when the fetch rejects, and advancing the fake clock here would spend
+   *  part of the very window being measured. */
+  async function armWith(headerValue) {
+    fakeNow += 10 * 60 * 1000; // expire any previous window (so no pre-sleep)
+    const value = typeof headerValue === 'function' ? headerValue() : headerValue;
+    respond = () => ({ status: 429, json: {}, headers: fakeHeaders({ 'retry-after': value }) });
+    try { await MLB.getPlayByPlay(823342, { retries: 0, timeout: 5000 }); }
+    catch (err) { /* expected: the 429 propagates */ }
+    return MLB.rateLimitedForMs();
+  }
+
+  const parsedDate = MLB.parseRetryAfter(fakeDateString(4000));
+  assert.ok(parsedDate > 3000 && parsedDate <= 4000,
+    `HTTP-date form parsed to ~4s of fake-clock delay (got ${parsedDate}ms)`);
+  const dated = await armWith(() => fakeDateString(4000));
+  assert.ok(dated > 3000 && dated <= 4000,
+    `date form armed a ~4s (whole-second) window (got ${dated}ms)`);
+
+  const floored = await armWith('0');
+  assert.ok(floored > 900 && floored <= 1000,
+    `Retry-After: 0 is floored at 1s, never "retry now" (got ${floored}ms)`);
+
+  const capped = await armWith('600');
+  assert.ok(capped > 299_000 && capped <= 300_000,
+    `Retry-After: 600 is capped at 5min (got ${capped}ms)`);
+
+  // A malformed header falls back to the documented default 60s.
+  const fallback = await armWith('soon-ish');
+  assert.ok(fallback > 59_000 && fallback <= 60_000,
+    `unparseable Retry-After -> default 60s (got ${fallback}ms)`);
+  assert.equal(MLB.parseRetryAfter('soon-ish'), null, 'unparseable -> null (use the default)');
+  assert.equal(MLB.parseRetryAfter(null), null, 'absent -> null (use the default)');
+  assert.equal(MLB.parseRetryAfter(''), null, 'empty -> null (use the default)');
+  assert.equal(MLB.parseRetryAfter('0'), 0, 'a valid "0" parses to 0 (floored at the call site)');
+  console.log('  8 date form + clamps [1s, 5min] + malformed fallback — ok');
 }
 
 console.log('\napi rate-limit backoff tests passed');
