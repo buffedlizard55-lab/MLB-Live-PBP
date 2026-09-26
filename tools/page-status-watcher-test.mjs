@@ -1,16 +1,21 @@
 #!/usr/bin/env node
 /* ============================================================================
- * page-status-watcher-test.mjs — integration tests for the standalone 250ms
- * review-status watchers added 2026-09-05 to the two pages that previously
- * detected a BRAND-NEW review only on their ~500ms ordinary cycle:
+ * page-status-watcher-test.mjs — integration tests for the standalone
+ * review-status watchers on the two pages that previously detected a
+ * BRAND-NEW review only on their ~500ms ordinary cycle. The watcher cadence
+ * was 250ms from 2026-09-05 and is 125ms since 2026-09-26 (that sweep is the
+ * earliest signal that exists, so it is the request that best repays a
+ * tighter interval — see docs/api-compliance.md):
  *
  *   1. assets/js/scoreboard.js — whole-slate watcher (MLB.getReviewStatus):
- *      the 🚨 review ticker / card badges must appear ≤250ms after MLB flips
- *      a status to a review code, not on the next 500ms hydrated-schedule
- *      poll (docs/latency-audit.md §8 option 2, now implemented).
+ *      the 🚨 review ticker / card badges must appear within one sweep of MLB
+ *      flipping a status to a review code, not on the next 500ms
+ *      hydrated-schedule poll (docs/latency-audit.md §8 option 2).
  *   2. assets/js/game.js — per-game watcher (MLB.getGameStatus): a new
- *      review flips the page to its fast path and kicks an OUT-OF-BAND full
- *      feed ≤250ms after the flip (latency-audit §8 option 1, implemented).
+ *      review flips the page to its fast path, paints the banner from the
+ *      LEAN probe (~3KB) instead of waiting for the 1-2MB full feed, and
+ *      kicks an OUT-OF-BAND full feed (latency-audit §8 option 1 + the
+ *      2026-09-26 probe-first change).
  *
  * Both pages are booted through their REAL DOMContentLoaded path in a VM
  * with fake timers, a recording DOM stub, a programmable MLB client, and
@@ -18,16 +23,18 @@
  * banner rendering are exercised, not stubbed).
  *
  * Verified behaviors (observable, no internals):
- *   scoreboard: sweep cadence 250ms while live; first sweep adopts without
+ *   scoreboard: sweep cadence 125ms while live; first sweep adopts without
  *     re-rendering; a real flip merges + re-renders (ticker up/down) and
  *     drops the main poll to its 250ms review cadence; a no-change sweep
  *     does not re-render; a hidden tab stops sweeping; an idle slate backs
- *     off to 5s; the pure diff helper scheduleStatusFlips is pinned.
- *   game page: watcher sweeps 250ms while live && !in-review; a review flip
- *     paints "🚨 <official detailedState>" from status alone AND kicks an
- *     out-of-band full feed; the banner renders once the feed carries the
- *     review; the lean probe then owns in-review ticks; resolution re-arms
- *     the watcher; a hidden tab stops sweeping.
+ *     off to 5s; the pure diff helper scheduleStatusFlips is pinned; a
+ *     pushed feed-log frame updates the scoring-change badge with no pull.
+ *   game page: watcher sweeps 125ms while live && !in-review; a review flip
+ *     paints "🚨 <official detailedState>" from status alone, paints the
+ *     BANNER from the lean probe while the full feed is still in flight, and
+ *     kicks an out-of-band full feed; the banner survives the stale in-flight
+ *     feed landing (no flap); the lean probe then owns in-review ticks;
+ *     resolution re-arms the watcher; a hidden tab stops sweeping.
  *
  * Fixtures mirror the verbatim shapes captured in replay-feed-render-test /
  * review-watcher-test (real gameStatus registry rows for MA; the same
@@ -136,6 +143,32 @@ function collectStrings(node, out = []) {
   if (node.title) out.push(node.title);
   (node.children || []).forEach((c) => collectStrings(c, out));
   return out;
+}
+
+/* ------------------------------------------------- live push (SSE) harness */
+
+class FakeEventSource {
+  constructor(url) {
+    this.url = url;
+    this.listeners = new Map();
+    this.closed = false;
+    FakeEventSource.instances.push(this);
+  }
+  addEventListener(type, cb) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(cb);
+  }
+  close() { this.closed = true; }
+  emit(type, event) {
+    (this.listeners.get(type) || []).slice().forEach((cb) => cb(event));
+  }
+}
+FakeEventSource.instances = [];
+
+function pushFrame(payload) {
+  const stream = FakeEventSource.instances[FakeEventSource.instances.length - 1];
+  stream.emit('feed-log', { data: typeof payload === 'string' ? payload : JSON.stringify(payload) });
+  return stream;
 }
 
 /* ------------------------------------------------------------- UI / MLB stubs */
@@ -259,6 +292,19 @@ const STATUS_MANAGER_CHALLENGE = {
     },
   };
 
+  // Transport stub for the shared-log module: every GET of the log endpoint is
+  // counted, so the page's pull policy (per poll vs. throttled-with-push) is
+  // directly observable. The payload itself starts empty.
+  const net = { logGets: 0 };
+  let pullPayload = {
+    v: 1, date: '2026-09-05', savedAt: 0, entries: [], order: [],
+    snapshots: {}, irregularities: {}, grace: {}, settled: [],
+  };
+  const fetchStub = async (url) => {
+    if (String(url).includes('/api/feed-log?')) net.logGets += 1;
+    return { ok: true, json: async () => pullPayload };
+  };
+
   const context = {
     console: { warn() {}, error() {}, log() {} },
     Map, Set, Date, Math, Number, String, Object, Array, URLSearchParams, RegExp, JSON, URL,
@@ -270,9 +316,12 @@ const STATUS_MANAGER_CHALLENGE = {
     clearTimeout: fakeClearTimeout,
     setInterval: fakeSetInterval,
     clearInterval: fakeClearInterval,
+    EventSource: FakeEventSource,
+    fetch: fetchStub,
     module: { exports: {} },
   };
   vm.createContext(context);
+  vm.runInContext(src('assets/js/feed-log.js'), context, { filename: 'assets/js/feed-log.js' });
   vm.runInContext(src('assets/js/scoreboard.js'), context, { filename: 'assets/js/scoreboard.js' });
 
   /* A1. Pure sweep-diff policy (window.Scoreboard._scheduleStatusFlips). */
@@ -330,14 +379,17 @@ const STATUS_MANAGER_CHALLENGE = {
   }
   console.log('  A2 armed sweep + no-change-no-render — ok');
 
-  /* A3. Sweep cadence is 250ms while a game is live (~4 sweeps / second). */
+  /* A3. Sweep cadence is 125ms while a game is live (~8 sweeps / second).
+   * 2026-09-26: was 250ms/~4x — the sweep is the earliest signal that exists
+   * (one ~2.4 KB whole-slate status request), so it is where a tighter
+   * interval buys the most. */
   {
     const before = calls.reviewStatus;
     await advance(1000);
     const delta = calls.reviewStatus - before;
-    assert.ok(delta >= 3 && delta <= 5,
-      `live watcher sweeps ~4x/s (got ${delta} in 1000ms)`);
-    console.log('  A3 live sweep cadence 250ms — ok');
+    assert.ok(delta >= 7 && delta <= 9,
+      `live watcher sweeps ~8x/s (got ${delta} in 1000ms)`);
+    console.log('  A3 live sweep cadence 125ms — ok');
   }
 
   /* A4. THE LATENCY FIX: a review flip paints the ticker within one 250ms
@@ -398,6 +450,79 @@ const STATUS_MANAGER_CHALLENGE = {
     await advance(3500);
     assert.equal(calls.reviewStatus, before + 1, 'one idle sweep after ~5s');
     console.log('  A7 idle 5s backoff — ok');
+  }
+
+  /* A8. LIVE PUSH for scoring-change badges (2026-09-26). Before this, the
+   * badge could only appear on the next slate poll and the shared log was
+   * re-fetched on every poll; now the server pushes the entry and the badge
+   * lands synchronously with the frame, while the pull stays as a safety net
+   * (and returns to its per-poll cadence the moment the stream gives up). */
+  {
+    assert.equal(FakeEventSource.instances.length, 1,
+      'the scoreboard opens exactly one live stream');
+    const stream = FakeEventSource.instances[0];
+    const streamDate = /\/api\/feed-log\/stream\?date=(\d{4}-\d{2}-\d{2})/.exec(stream.url);
+    assert.ok(streamDate, `the stream subscribes to the log endpoint (${stream.url})`);
+
+    // Put the slate back to live so the polls actually run: the checks below
+    // are about the pull policy DURING polling, not about an idle slate. The
+    // page only learns the slate is live again on its next poll (idle cadence
+    // 5s), so wait for that poll and the tightened cadence after it.
+    slateStatus = baseStatus;
+    sweepStatus = baseStatus;
+    await advance(6000);
+
+    const scoringReview = {
+      id: 'scoring-9',
+      typeKey: 'scoring_change',
+      reviewType: 'Official Scoring Change',
+      reason: 'Error → Double',
+      outcome: 'changed',
+      outcomeLabel: 'Rescored',
+      atBatIndex: 9,
+      batter: { id: 1, fullName: 'Pushed Scorer' },
+    };
+    const payload = {
+      v: 1,
+      date: streamDate[1],
+      savedAt: 1758914400000,
+      entries: [{ gamePk: 823342, review: scoringReview, firstSeen: 1758914400000, lastSeen: 1758914400000 }],
+      order: ['823342:scoring-9'],
+      snapshots: {}, irregularities: {}, grace: {}, settled: [],
+    };
+
+    const before = { ...calls };
+    const getsBefore = net.logGets;
+    pushFrame(payload);
+    const cardText = collectStrings(registry['#game-list']).join('|');
+    assert.ok(cardText.includes('Scoring Change'),
+      'the pushed scoring change shows on the game card the moment the frame arrives');
+    assert.equal(net.logGets, getsBefore, 'and needed no log request');
+    assert.equal(calls.schedule, before.schedule, 'and no schedule fetch');
+    assert.equal(calls.reviewStatus, before.reviewStatus, 'and no status sweep');
+
+    /* While the stream is live the pull is throttled (a safety net), so a
+     * burst of polls must not re-read the log. */
+    const getsWithStream = net.logGets;
+    const pollsWithStream = calls.schedule;
+    await advance(2000);
+    assert.ok(calls.schedule > pollsWithStream + 1,
+      `the slate is polling again (${calls.schedule - pollsWithStream} polls in 2s)`);
+    assert.equal(net.logGets, getsWithStream,
+      'with a live stream the log is not re-pulled on every poll');
+
+    /* Stream gives up (endpoint blocked/absent): the handle must be dropped
+     * and the pull must return to its per-poll cadence — the push path may
+     * never make the page slower when it is unavailable. */
+    stream.emit('error');
+    stream.emit('error');
+    stream.emit('error');
+    assert.equal(stream.closed, true, 'the stream gives up after repeated failures');
+    const getsAfterClose = net.logGets;
+    await advance(2500);
+    assert.ok(net.logGets > getsAfterClose,
+      `without a stream the log is re-read on the polls again (${net.logGets - getsAfterClose} gets)`);
+    console.log('  A8 pushed scoring-change badge + pull fallback — ok');
   }
 
   console.log('scoreboard status-watcher tests passed\n');
@@ -467,6 +592,18 @@ const STATUS_MANAGER_CHALLENGE = {
   };
 
   let currentPlay = currentPlayNoReview;
+  // Away runs, mutable so a test can make a parked feed's token differ from
+  // the last rendered one (feedToken includes the linescore runs) and thereby
+  // force renderAll() to run when it lands.
+  let awayRuns = 3;
+  // When set, getLiveFeed parks on this deferred (after snapshotting its
+  // payload) so a test can hold a cycle in flight.
+  let feedGate = null;
+  // The play the LEAN probe (getPlayByPlay) reports as currentPlay. Set
+  // independently of `currentPlay` so a test can make the probe agree or
+  // disagree with the (possibly in-flight, hence stale) full feed — that is
+  // how the probe-first banner path is isolated from the feed path.
+  let probePlay = null;
   const buildFeed = () => ({
     gamePk: 823342,
     gameData: {
@@ -483,7 +620,7 @@ const STATUS_MANAGER_CHALLENGE = {
       linescore: {
         currentInning: 6, inningState: 'Bottom',
         innings: [{ away: { runs: 1 }, home: { runs: 0 } }],
-        teams: { away: { runs: 3 }, home: { runs: 1 } },
+        teams: { away: { runs: awayRuns }, home: { runs: 1 } },
         balls: 1, strikes: 0, outs: 1,
       },
       boxscore: { teams: {
@@ -503,14 +640,21 @@ const STATUS_MANAGER_CHALLENGE = {
 
   const MLBStub = {
     ...FORMATTERS,
-    getLiveFeed: async () => { calls.feed += 1; return buildFeed(); },
+    getLiveFeed: async () => {
+      calls.feed += 1;
+      // Captured at REQUEST time: a cycle in flight cannot see a status flip
+      // that lands while it is being fetched (feedGate lets a test hold it).
+      const payload = buildFeed();
+      if (feedGate) await feedGate;
+      return payload;
+    },
     getGameStatus: async () => {
       calls.gameStatus += 1;
       return { gameData: { status: watchStatus() } };
     },
     getPlayByPlay: async () => {
       calls.pbp += 1;
-      return { allPlays: [completedPlay], currentPlay };
+      return { allPlays: [completedPlay], currentPlay: probePlay || currentPlay };
     },
   };
 
@@ -554,8 +698,8 @@ const STATUS_MANAGER_CHALLENGE = {
     const before = calls.gameStatus;
     await advance(1000);
     const delta = calls.gameStatus - before;
-    assert.ok(delta >= 3 && delta <= 5, `watcher sweeps ~4x/s while live (got ${delta} in 1000ms)`);
-    console.log('  B1 boot + live watcher cadence 250ms — ok');
+    assert.ok(delta >= 7 && delta <= 9, `watcher sweeps ~8x/s while live (got ${delta} in 1000ms)`);
+    console.log('  B1 boot + live watcher cadence 125ms — ok');
   }
 
   /* B2. THE LATENCY FIX, step 1: MLB flips the official status to MA. Within
@@ -631,6 +775,113 @@ const STATUS_MANAGER_CHALLENGE = {
     await advance(300);
     assert.ok(calls.feed > feedsBefore, 'showing the tab reloads');
     console.log('  B5 hidden-tab park + resume — ok');
+  }
+
+  /* B6. THE MID-CYCLE FLIP (2026-09-26). If the official status flips to a
+   * review state WHILE a full-feed cycle is already in flight, that cycle was
+   * requested before the flip and cannot carry the review. The page must run
+   * again the instant it finishes — not drop the kick and wait for the next
+   * scheduled tick. */
+  {
+    // Settle back to a live game with no review, and let the watcher re-arm.
+    feedStatus = baseStatus;
+    watchStatus = baseStatus;
+    currentPlay = currentPlayNoReview;
+    await advance(4000); // past the 3s status-lead grace of the previous section
+    assert.equal(collectStrings(registry['#live-review-banner-wrap']).join('|').length, 0,
+      'no review banner before the mid-cycle flip');
+
+    // Park a full-feed cycle: its payload is snapshotted NOW (no review).
+    // The lean probe is held on the SAME no-review play, so this section
+    // isolates the feed-cycle behaviour; the probe-first banner is section B7.
+    probePlay = currentPlayNoReview;
+    let releaseFeed = null;
+    feedGate = new Promise((r) => { releaseFeed = r; });
+    await advance(500); // the cycle starts and parks
+    const feedsWhileParked = calls.feed;
+    assert.ok(feedsWhileParked > 0, 'a full-feed cycle is in flight');
+
+    // MLB flips the status while that cycle is still in flight, and the feed
+    // (once fetched AFTER the flip) carries the review.
+    watchStatus = () => STATUS_MANAGER_CHALLENGE;
+    currentPlay = currentPlayUnderReview;
+    await advance(250); // one watcher sweep sees the flip, mid-cycle
+
+    assert.ok(registry['#status-line'].text.includes('Manager challenge: Tag play'),
+      'the flip is painted on the status line even though a cycle is in flight');
+    assert.equal(collectStrings(registry['#live-review-banner-wrap']).join('|').length, 0,
+      'the in-flight cycle cannot carry the review (it was fetched before the flip)');
+
+    // Release it: the kicked cycle must now run WITHOUT waiting for a tick.
+    const feedsBeforeRelease = calls.feed;
+    const pbpBeforeRelease = calls.pbp;
+    releaseFeed();
+    feedGate = null;
+    for (let i = 0; i < 60; i += 1) await new Promise((r) => setImmediate(r));
+    assert.ok(calls.feed > feedsBeforeRelease || calls.pbp > pbpBeforeRelease,
+      'the flip runs a fresh cycle the instant the in-flight one finishes '
+      + `(no clock advance: feed ${calls.feed - feedsBeforeRelease}, pbp ${calls.pbp - pbpBeforeRelease})`);
+    await advance(300);
+    assert.ok(collectStrings(registry['#live-review-banner-wrap']).join('|').length > 0,
+      'and the review banner renders from the fresh cycle');
+    console.log('  B6 mid-cycle flip re-runs the cycle immediately — ok');
+  }
+
+  /* B7. PROBE-FIRST BANNER (2026-09-26). The full feed is 1–2MB; the lean
+   * projected playByPlay is ~3KB and carries the same reviewDetails markers
+   * the banner is built from. On a status flip the page must therefore paint
+   * the banner from the PROBE — while the full feed is still downloading —
+   * instead of waiting for it. The full feed is held on a deferred here, so
+   * any banner that appears can only have come from the probe. */
+  {
+    // Settle back to a live game with no review, past the grace window of the
+    // previous section, and make both sources agree there is no review.
+    feedStatus = baseStatus;
+    watchStatus = baseStatus;
+    currentPlay = currentPlayNoReview;
+    probePlay = currentPlayNoReview;
+    await advance(4000);
+    assert.equal(collectStrings(registry['#live-review-banner-wrap']).join('|').length, 0,
+      'no review banner before the probe-path flip');
+
+    // Hold the next full feed on a deferred; the probe answers WITH the review.
+    // The parked payload is a real CHANGE (the score moved), so when it lands
+    // renderAll() really runs — that is what makes the no-flap assertion below
+    // capable of failing (with a token-identical payload renderAll would be
+    // skipped and the assertion would be vacuous).
+    awayRuns = 4;
+    let releaseFeed = null;
+    feedGate = new Promise((r) => { releaseFeed = r; });
+    probePlay = currentPlayUnderReview;
+    watchStatus = () => STATUS_MANAGER_CHALLENGE;
+    const pbpBefore = calls.pbp;
+    const feedsBefore = calls.feed;
+
+    await advance(150); // one 125ms sweep sees the flip
+    for (let i = 0; i < 60; i += 1) await new Promise((r) => setImmediate(r));
+
+    assert.ok(calls.pbp > pbpBefore, 'the flip asked the LEAN endpoint about the play');
+    assert.ok(calls.feed > feedsBefore, 'and the out-of-band full feed is in flight');
+    const probeBanner = collectStrings(registry['#live-review-banner-wrap']).join('|');
+    assert.ok(probeBanner.length > 0,
+      'the banner is painted from the lean probe while the 1-2MB feed is still in flight');
+
+    // Release the STALE feed (payload snapshotted before the flip, so it does
+    // not carry the review): the probe-painted banner must survive it — the
+    // two writers must not flap it off screen during the status-lead window.
+    releaseFeed();
+    feedGate = null;
+    await advance(300);
+    assert.ok(collectStrings(registry['#live-review-banner-wrap']).join('|').length > 0,
+      'the banner survives the stale in-flight feed landing (no flap)');
+
+    // Once the authoritative feed carries the review it simply keeps it.
+    currentPlay = currentPlayUnderReview;
+    await advance(600);
+    assert.ok(collectStrings(registry['#live-review-banner-wrap']).join('|').length > 0,
+      'the authoritative feed keeps the banner up');
+    probePlay = null;
+    console.log('  B7 probe-first banner while the full feed is in flight — ok');
   }
 
   console.log('game page status-watcher tests passed');

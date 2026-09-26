@@ -38,14 +38,45 @@ const MLB = (() => {
    * outstanding call until the window clears. The flag is process-wide (all
    * endpoints share one host and one budget). Normal 2xx/4xx/5xx traffic
    * never trips it.
+   *
+   * The quiet period is the SERVER's call whenever the 429 carries a
+   * Retry-After header (seconds or an HTTP-date, RFC 9110 §10.2.3): waiting
+   * the window the API itself asked for is both the politest and the fastest
+   * correct behavior — a fixed 60s would sit idle past a "Retry-After: 2"
+   * and cut a 5-minute instruction short. Without the header the default 60s
+   * still applies. The value is clamped to [1s, 5min] so a missing/bogus/
+   * absurd header can neither turn the apology into hammering nor park the
+   * page forever.
    */
   const RATE_LIMIT_BACKOFF_MS = 60 * 1000;
+  const RATE_LIMIT_MIN_BACKOFF_MS = 1000;
+  const RATE_LIMIT_MAX_BACKOFF_MS = 5 * 60 * 1000;
   let lastRateLimitedAt = 0;
+  let rateLimitBackoffMs = RATE_LIMIT_BACKOFF_MS;
+
+  /**
+   * Parse a Retry-After header into milliseconds — or null when the header is
+   * absent, empty, or not one of the two forms RFC 9110 allows (delay-seconds
+   * or an HTTP-date). null therefore means "the API did not say", which is
+   * what selects the documented 60s default; a valid "0" means "retry now"
+   * and is floored at RATE_LIMIT_MIN_BACKOFF_MS by the caller.
+   */
+  function parseRetryAfter(value) {
+    if (value == null) return null;
+    const raw = String(value).trim();
+    if (!raw) return null;
+    if (/^\d+(\.\d+)?$/.test(raw)) {
+      const secs = Number(raw);
+      return Number.isFinite(secs) ? Math.round(secs * 1000) : null;
+    }
+    const when = Date.parse(raw);
+    return Number.isFinite(when) ? Math.max(0, when - Date.now()) : null;
+  }
 
   /** Milliseconds remaining in the current 429 quiet period (0 = none). */
   function rateLimitedForMs() {
     return lastRateLimitedAt
-      ? Math.max(0, lastRateLimitedAt + RATE_LIMIT_BACKOFF_MS - Date.now())
+      ? Math.max(0, lastRateLimitedAt + rateLimitBackoffMs - Date.now())
       : 0;
   }
 
@@ -69,7 +100,20 @@ const MLB = (() => {
           headers: { Accept: 'application/json' },
         });
         if (!res.ok) {
-          if (res.status === 429) lastRateLimitedAt = Date.now();
+          if (res.status === 429) {
+            lastRateLimitedAt = Date.now();
+            // Prefer the server's own Retry-After; clamp so neither a bogus
+            // tiny value nor an absurd one is honored literally.
+            let headerMs = null;
+            try {
+              headerMs = res.headers && typeof res.headers.get === 'function'
+                ? parseRetryAfter(res.headers.get('Retry-After'))
+                : null;
+            } catch (_) { headerMs = null; }
+            rateLimitBackoffMs = headerMs == null
+              ? RATE_LIMIT_BACKOFF_MS
+              : Math.min(Math.max(headerMs, RATE_LIMIT_MIN_BACKOFF_MS), RATE_LIMIT_MAX_BACKOFF_MS);
+          }
           const err = new Error(`HTTP ${res.status} for ${url}`);
           err.status = res.status;
           throw err;
@@ -462,7 +506,8 @@ const MLB = (() => {
   return {
     getSchedule, getReviewStatus, getGameStatus, getLiveFeed, getPlayByPlay,
     getTeams, getChallengeCounts,
-    rateLimitedForMs,
+    rateLimitedForMs, parseRetryAfter,
+    RATE_LIMIT_BACKOFF_MS, RATE_LIMIT_MAX_BACKOFF_MS,
     teamLogoUrl, teamLogoFallbackUrl, headshotUrl,
     ordinal, localTime, localDate, localDateTime,
     inningLabel, inningGlyph, sides, scoreOf,

@@ -2,7 +2,9 @@
 /* ============================================================================
  * review-watcher-test.mjs — integration test for the Replay Feed's
  * review-status watcher: the change that makes "a play is under review"
- * arrive in ~250ms instead of up to ~3s.
+ * arrive within one sweep instead of up to ~3s. The sweep is the earliest
+ * signal that exists for a challenge / review / boundary call; its cadence is
+ * 125ms since 2026-09-26 (250ms before that — see docs/api-compliance.md).
  *
  * It drives the REAL page boot path (DOMContentLoaded -> load() + the
  * watcher's own timer) with fake timers and a stubbed MLB client, then
@@ -268,23 +270,56 @@ const MLBStub = {
   },
 };
 
+/* ------------------------------------------- live push (SSE) test harness */
+
+class FakeEventSource {
+  constructor(url) {
+    this.url = url;
+    this.listeners = new Map();
+    this.closed = false;
+    FakeEventSource.instances.push(this);
+  }
+  addEventListener(type, cb) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(cb);
+  }
+  close() { this.closed = true; }
+  emit(type, event) {
+    (this.listeners.get(type) || []).slice().forEach((cb) => cb(event));
+  }
+}
+FakeEventSource.instances = [];
+
+/** Deliver one frame on the newest stream exactly as a browser would. */
+function pushFrame(payload) {
+  const stream = FakeEventSource.instances[FakeEventSource.instances.length - 1];
+  stream.emit('feed-log', { data: typeof payload === 'string' ? payload : JSON.stringify(payload) });
+  return stream;
+}
+
 /* ---------------------------------------------------------------- run page */
 
 const context = {
   console: { warn() {}, error() {}, log() {} },
-  Map, Set, Date, Math, Number, String, Object, Array, URLSearchParams, RegExp, JSON,
+  Map, Set, Date, Math, Number, String, Object, Array, URL, URLSearchParams, RegExp, JSON,
   CSS: { escape: (s) => s },
   UI: UIStub,
   MLB: MLBStub,
-  window: { location: { search: '' }, history: { replaceState() {} } },
+  window: { location: 'http://localhost/reviews.html', history: { replaceState() {} } },
   document: documentStub,
   setTimeout: fakeSetTimeout,
   clearTimeout: fakeClearTimeout,
   setInterval: fakeSetInterval,
   clearInterval: fakeClearInterval,
+  EventSource: FakeEventSource,
   module: { exports: {} },
 };
 vm.createContext(context);
+// The REAL shared log module: the push path under test is subscribeFeedLog
+// itself (frame parsing, the per-date guard, the give-up-after-3-errors rule),
+// not a stub of it.
+vm.runInContext(readFileSync(new URL('../assets/js/feed-log.js', import.meta.url), 'utf8'),
+  context, { filename: 'assets/js/feed-log.js' });
 vm.runInContext(readFileSync(new URL('../assets/js/reviews.js', import.meta.url), 'utf8'),
   context, { filename: 'assets/js/reviews.js' });
 vm.runInContext(readFileSync(new URL('../assets/js/reviews-feed.js', import.meta.url), 'utf8'),
@@ -410,6 +445,121 @@ assert.equal(context.window.ReplayFeed.getRunsAtRisk(), 0, 'nothing at risk befo
   await advance(4600);
 }
 
+/* 4c. THE MID-WAVE FLIP (added 2026-09-26). The status watcher's flip handler
+ * calls load(); if a full-slate scan is ALREADY in flight that call is a
+ * no-op (requestInFlight), so before this change the flipped game's row could
+ * only land when the whole wave finished — after the slowest game in it. The
+ * flip must instead fetch the flipped game out of band, immediately.
+ *
+ * Every playByPlay fetch is parked on a deferred, so the ordinary wave is
+ * provably still outstanding while the flip happens. */
+{
+  // A FRESH gamePk with no feed row of its own yet (822686 already carries a
+  // row from section 4b, and a row wins over the status in the strip): the
+  // brand-new-challenge case.
+  SCHEDULE_GAMES.push({
+    gamePk: 824529,
+    season: '2026',
+    status: baseStatus(),
+    teams: {
+      away: { team: { id: 144, name: 'Atlanta Braves', link: '/api/v1/teams/144' }, score: 0 },
+      home: { team: { id: 120, name: 'Washington Nationals', link: '/api/v1/teams/120' }, score: 2 },
+    },
+    linescore: { teams: { away: { runs: 0 }, home: { runs: 2 } }, currentInning: 3, inningState: 'Bottom' },
+    review: { hasChallenges: false, away: { used: 0, remaining: 1 }, home: { used: 0, remaining: 1 } },
+  });
+  reviewStatusByGame.set(824529, STATUS_IN_PROGRESS);
+
+  let release = null;
+  pbpGate = new Promise((r) => { release = r; });
+  const beforeWave = calls.pbp;
+  await advance(500); // ordinary poll starts; every fetch parks on the gate
+  assert.ok(calls.pbp > beforeWave, 'the ordinary wave is in flight (parked)');
+
+  reviewStatusByGame.set(824529, STATUS_INSTANT_REPLAY); // In Progress -> IH: a new review
+  const atFlip = calls.pbp;
+  await advance(250); // watcher sweep sees the flip
+
+  assert.equal(calls.pbp, atFlip + 1,
+    `the flipped game is fetched out of band while the wave is still parked (${atFlip} -> ${calls.pbp})`);
+  assert.ok(collectStrings(registry['#active-strip']).join('|').includes('Instant Replay'),
+    'the strip already shows the new official status for the game with no row yet');
+
+  // A second sweep with the same status must not stack a second priority fetch.
+  const afterKick = calls.pbp;
+  await advance(250);
+  assert.equal(calls.pbp, afterKick,
+    'an unchanged sweep adds no extra fetch (the priority scan is already running)');
+
+  release();
+  pbpGate = null;
+  for (let i = 0; i < 30; i += 1) await new Promise((r) => setImmediate(r));
+  await advance(600);
+  SCHEDULE_GAMES.pop();
+  reviewStatusByGame.delete(824529);
+  await advance(600);
+}
+
+/* 4d. THE RUN-AT-RISK NOTIFICATION (added 2026-09-26). The chime has always
+ * fired from the first response that carries the alert, but the DESKTOP
+ * notification was flushed at the END of the poll — i.e. after the slowest
+ * game in the wave, up to PBP_TIMEOUT_MS on a stalled one. It now leaves one
+ * short coalescing window after that first response, so a run already on the
+ * scoreboard is put in front of the user as soon as it is known.
+ *
+ * A second game is parked for 4s: if the notification still waited for the
+ * wave, nothing would be recorded here. */
+{
+  const notificationStub = function Notification(title, opts) {
+    notificationStub.log.push({ title, opts });
+  };
+  notificationStub.permission = 'granted';
+  notificationStub.log = [];
+  context.Notification = notificationStub;
+
+  // Deliberately distinct club names (not the Braves/Nationals used by the
+  // other fixture games) so "the notification for the game that ANSWERED" is
+  // unambiguous in the assertions below.
+  SCHEDULE_GAMES.push({
+    gamePk: 824638,
+    season: '2026',
+    status: baseStatus(),
+    teams: {
+      away: { team: { id: 147, name: 'New York Yankees', link: '/api/v1/teams/147' }, score: 0 },
+      home: { team: { id: 111, name: 'Boston Red Sox', link: '/api/v1/teams/111' }, score: 2 },
+    },
+    linescore: { teams: { away: { runs: 0 }, home: { runs: 2 } }, currentInning: 3, inningState: 'Bottom' },
+    review: { hasChallenges: false, away: { used: 0, remaining: 1 }, home: { used: 0, remaining: 1 } },
+  });
+  reviewStatusByGame.set(824638, STATUS_MANAGER_CHALLENGE);
+  pbpByGame.set(824638, PBP_WITH_REVIEW); // a reviewed play that credited a run
+  slowPks.add(823342);                    // the slowest game in the wave
+  slowMs = 4000;
+  context.window.ReplayFeed.setNotifyEnabled(true);
+
+  await advance(500); // wave starts: 824638 answers, 823342 is still parked
+
+  const answeredNotes = () => notificationStub.log.filter((n) =>
+    `${n.title} ${n.opts.body || ''}`.includes('Yankees'));
+  assert.equal(answeredNotes().length, 1,
+    'the run-at-risk notification for the game that ANSWERED left before the slow game landed');
+  assert.ok(/RUN AT RISK/i.test(answeredNotes()[0].title) ||
+            /RUN AT RISK/i.test(answeredNotes()[0].opts.body || ''),
+    'the notification is the run-at-risk notification');
+
+  await advance(4200); // let the slow game land and the poll end
+  assert.equal(answeredNotes().length, 1,
+    'the end-of-poll flush does not re-notify the same run-at-risk event');
+
+  context.window.ReplayFeed.setNotifyEnabled(false);
+  SCHEDULE_GAMES.pop();
+  slowPks.clear(); // no NEW slow fetches; the parked one still has to land
+  pbpByGame.delete(824638);
+  reviewStatusByGame.delete(824638);
+  await advance(5000); // let the parked slow fetch resolve and the wave finish
+  await advance(600);
+}
+
 /* 5. An unchanged sweep triggers no EXTRA scan. While a review is in flight
  * the ordinary poll is already at the 250ms REVIEW cadence, so the watcher
  * sweeping on the same 250ms tick must not double it: over 1s we expect the
@@ -450,15 +600,99 @@ assert.equal(context.window.ReplayFeed.getRunsAtRisk(), 0, 'nothing at risk befo
   assert.ok(calls.reviewStatus > before, 'becoming visible sweeps immediately');
 }
 
-/* 8. The watcher really is faster than the schedule cache it replaced, and
- * the 2026-09-05 cadence tightening is pinned: the live playByPlay scan runs
- * at 250ms (was 500ms — see docs/latency-audit.md addendum) and the
- * post-Final fast rescan gap is 2.5s (was 5s). */
+/* 8. LIVE PUSH — the cross-session path added 2026-09-26. Another browser's
+ * (or another tab's) review / challenge / pending-ruling entry is persisted to
+ * the shared server log; the server pushes it over the SSE tail, and the row
+ * must appear in THIS page immediately, with no poll of any kind. The same
+ * render is driven synchronously by the frame, so the assertion runs before
+ * any timer could fire. */
+{
+  const PUSH_PK = 824777;
+  const pushedReview = {
+    id: 'pushed-1',
+    typeKey: 'challenge',
+    reviewType: 'Manager challenge',
+    reason: 'Pushed challenge reason',
+    description: 'Pushed challenge description',
+    inProgress: false,
+    outcome: 'overturned',
+    outcomeLabel: 'Overturned',
+    atBatIndex: 12,
+    challengeTeamId: 116,
+    teamId: 116,
+  };
+  const payloadFor = (date, review, gamePk) => ({
+    v: 1,
+    date,
+    savedAt: 1758914400000,
+    entries: [{ gamePk, review, firstSeen: 1758914400000, lastSeen: 1758914400000 }],
+    order: [`${gamePk}:${review.id}`],
+    snapshots: {},
+    irregularities: {},
+    grace: {},
+    settled: [],
+  });
+
+  assert.equal(FakeEventSource.instances.length, 1,
+    'the feed opens exactly one live stream');
+  const stream = FakeEventSource.instances[0];
+  const streamDate = /\/api\/feed-log\/stream\?date=(\d{4}-\d{2}-\d{2})/.exec(stream.url);
+  assert.ok(streamDate, `the stream subscribes to the log endpoint (${stream.url})`);
+  const feedDate = streamDate[1];
+
+  const before = { ...calls };
+  pushFrame(payloadFor(feedDate, pushedReview, PUSH_PK));
+
+  const text = collectStrings(registry['#feed-list']).join('|');
+  assert.ok(text.includes('Pushed challenge reason'),
+    'the pushed entry is on screen the moment the frame arrives');
+  assert.ok(text.includes('Manager challenge'),
+    'the pushed entry keeps its official review type');
+  assert.equal(calls.pbp, before.pbp, 'rendering a pushed entry needs no playByPlay fetch');
+  assert.equal(calls.reviewStatus, before.reviewStatus, 'and no status sweep');
+  assert.equal(calls.schedule, before.schedule, 'and no schedule fetch');
+
+  /* A repeated frame is idempotent (the server re-pushes on every write). */
+  pushFrame(payloadFor(feedDate, pushedReview, PUSH_PK));
+  const repeat = collectStrings(registry['#feed-list']).join('|');
+  assert.equal(repeat.split('Pushed challenge reason').length - 1, 1,
+    'a repeated frame does not duplicate the row');
+
+  /* A frame for another date is not this page's business. */
+  pushFrame(payloadFor('1999-01-01', { ...pushedReview, id: 'stale-1', reason: 'Stale reason' }, 824778));
+  assert.equal(collectStrings(registry['#feed-list']).join('|').includes('Stale reason'), false,
+    'a frame for a different date is ignored');
+
+  /* A malformed frame must never throw into the page. */
+  pushFrame('{not json');
+  assert.ok(collectStrings(registry['#feed-list']).join('|').includes('Pushed challenge reason'),
+    'a malformed frame leaves the rendered feed untouched');
+
+  /* The stream is per date: a date switch closes the old one and opens a new
+   * one, so the new date's entries are pushed too. */
+  context.window.ReplayFeed.nextDay();
+  assert.equal(FakeEventSource.instances.length, 2,
+    'a date switch opens a stream for the new date');
+  assert.equal(stream.closed, true, 'the previous date\'s stream is closed');
+  const nextStream = FakeEventSource.instances[1];
+  const nextDate = /date=(\d{4}-\d{2}-\d{2})/.exec(nextStream.url)[1];
+  assert.notEqual(nextDate, feedDate, 'the new stream targets the new date');
+}
+
+/* 9. The watcher really is faster than the schedule cache it replaced, and
+ * the cadence tightening is pinned: the live playByPlay scan runs at 250ms
+ * (was 500ms — see docs/latency-audit.md addendum), the post-Final fast
+ * rescan gap is 2.5s (was 5s), and since 2026-09-26 the first two minutes
+ * after a final out are rescanned every 1s (the hot tier — see
+ * docs/latency-audit.md 2026-09-26 addendum). */
 {
   const src = readFileSync(new URL('../assets/js/reviews-feed.js', import.meta.url), 'utf8');
   const watcherMs = Number(/REVIEW_STATUS_POLL_MS\s*=\s*(\d+)/.exec(src)[1]);
   const ttl = Number(/SCHEDULE_TTL_MS\s*=\s*(\d+)/.exec(src)[1]);
-  assert.equal(watcherMs, 250, 'the watcher cadence is 250ms');
+  // The sweep must stay faster than the wave it feeds and than the schedule
+  // cache it replaced; 125ms is half the 250ms wave, so a flip is seen within
+  // half of one scan interval.
+  assert.equal(watcherMs, 125, 'the watcher cadence is 125ms (2026-09-26)');
   assert.ok(watcherMs < ttl, `watcher ${watcherMs}ms < schedule cache ${ttl}ms`);
   const liveMs = Number(/LIVE_POLL_MS\s*=\s*(\d+)/.exec(src)[1]);
   const reviewMs = Number(/REVIEW_POLL_MS\s*=\s*(\d+)/.exec(src)[1]);
@@ -467,6 +701,16 @@ assert.equal(context.window.ReplayFeed.getRunsAtRisk(), 0, 'nothing at risk befo
   const recentMs = Number(/SCORING_RECENT_RESCAN_MS\s*=\s*([\d.]+\s*\*\s*1000|\d+)/.exec(src)[1]
     .replace(/\s*\*\s*1000/, ''));
   assert.equal(recentMs, 2.5, 'the post-Final fast rescan gap is 2.5s (2026-09-05)');
+  // 2026-09-26: the first two minutes after the final out are rescanned at 1s
+  // (the hot tier), so a post-Final scorer ruling in the window where it is
+  // most likely lands ~1s after publication instead of ~2.5s.
+  const hotMs = Number(/SCORING_HOT_RESCAN_MS\s*=\s*(\d+)/.exec(src)[1]);
+  const hotWindow = /SCORING_HOT_WINDOW_MS\s*=\s*(\d+)\s*\*\s*(\d+)\s*\*\s*(\d+)/.exec(src);
+  assert.equal(hotMs, 1000, 'the post-Final hot rescan gap is 1s (2026-09-26)');
+  assert.equal(Number(hotWindow[1]) * Number(hotWindow[2]) * Number(hotWindow[3]), 120000,
+    'the hot tier covers the first 2 minutes after Final');
+  assert.ok(hotMs < recentMs * 1000,
+    `hot ${hotMs}ms is faster than the fast tier ${recentMs * 1000}ms`);
 }
 
 console.log('Review-status watcher integration test passed successfully!');

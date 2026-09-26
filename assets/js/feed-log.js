@@ -236,11 +236,13 @@
   }
 
   /**
-   * Extract all scoring changes by gamePk for a date.
+   * Extract all scoring changes by gamePk from an ALREADY-LOADED log payload.
+   * Pure (no fetch, no storage): the pushed stream payloads and the restored
+   * local payloads both go through this, so a page can update its
+   * scoring-change badges without another round trip.
    * Returns Map<gamePk, review[]>.
    */
-  async function getScoringChangesByGame(dateStr) {
-    const log = await fetchLog(dateStr);
+  function scoringChangesByGameFromPayload(log) {
     const map = new Map();
     if (!log || !Array.isArray(log.entries)) return map;
     log.entries.forEach((e) => {
@@ -254,6 +256,80 @@
     return map;
   }
 
+  /**
+   * Extract all scoring changes by gamePk for a date (network/storage).
+   * Returns Map<gamePk, review[]>.
+   */
+  async function getScoringChangesByGame(dateStr) {
+    const log = await fetchLog(dateStr);
+    return scoringChangesByGameFromPayload(log);
+  }
+
+  /* ------------------------------------------------------------- live push
+   * `subscribeFeedLog(date, onPayload)` opens an EventSource on
+   * /api/feed-log/stream (server.mjs) and calls onPayload with each merged log
+   * payload the server pushes — i.e. the moment ANY browser/session observes a
+   * new review, challenge, pending ruling or scoring change. Without it, the
+   * only way another session's entry reached this page was the periodic GET
+   * (15s in the Replay Feed, one per poll on the scoreboard).
+   *
+   * Degrades exactly like the rest of this module: no EventSource (old
+   * browser, Node/test context) or no such endpoint (static/GitHub Pages
+   * deployment → 404) means the subscription gives up after a few failed
+   * attempts and returns null, leaving the caller's ordinary polling intact.
+   * Returns an unsubscribe function, or null when a stream cannot be used.
+   */
+  const FEED_LOG_STREAM_MAX_ERRORS = 3;
+
+  function subscribeFeedLog(dateStr, onPayload, opts) {
+    if (!isDateStr(dateStr) || typeof onPayload !== 'function') return null;
+    const options = opts || {};
+    if (options.disabled) return null;
+    const ES = options.EventSource ||
+      (typeof EventSource !== 'undefined' ? EventSource : null);
+    if (typeof ES !== 'function') return null;
+    let source = null;
+    let errors = 0;
+    let closed = false;
+    try {
+      source = new ES(`/api/feed-log/stream?date=${encodeURIComponent(dateStr)}`);
+    } catch (_) {
+      return null;
+    }
+    source.addEventListener('open', () => { errors = 0; });
+    source.addEventListener('feed-log', (event) => {
+      errors = 0;
+      if (closed) return;
+      let payload = null;
+      try {
+        payload = JSON.parse(event && event.data);
+      } catch (_) {
+        return; // a malformed frame is ignored, never thrown into the page
+      }
+      // Only this date's log is actionable; a stale frame (date switched
+      // between the write and the delivery) is dropped.
+      if (payload && payload.date === dateStr) onPayload(payload);
+    });
+    source.addEventListener('error', () => {
+      errors += 1;
+      // The browser retries on its own; after a few consecutive failures the
+      // endpoint is presumed absent (static hosting) or blocked, and the
+      // caller's polling remains the source of truth. onClose lets the caller
+      // drop its stream handle and go back to its FAST pull cadence instead of
+      // keeping the "a stream is live" assumption.
+      if (errors >= FEED_LOG_STREAM_MAX_ERRORS && !closed) {
+        closed = true;
+        try { source.close(); } catch (_) {}
+        if (typeof options.onClose === 'function') options.onClose();
+      }
+    });
+    return function unsubscribeFeedLog() {
+      if (closed) return;
+      closed = true;
+      try { source.close(); } catch (_) {}
+    };
+  }
+
   const MLBFeedLog = {
     FEED_LOG_VERSION,
     FEED_LOG_KEY_PREFIX,
@@ -264,8 +340,11 @@
     mergePayloads,
     fetchLog,
     saveLog,
+    subscribeFeedLog,
+    FEED_LOG_STREAM_MAX_ERRORS,
     getScoringChangesForGame,
     getScoringChangesByGame,
+    scoringChangesByGameFromPayload,
   };
 
   root.MLBFeedLog = MLBFeedLog;

@@ -1316,8 +1316,15 @@ function activeHasIdx(ctx, idx) {
  *
  * Returns 'scan' (fetch it) or 'skip' (settled beyond the grace window, or
  * not due yet). grace = { firstFinalObservedAt, lastScanAt }.
+ *
+ * `hotRescanMs`/`hotWindowMs` add an optional SECOND (hotter) tier inside the
+ * fast window — the first minutes after the final out, where a scorer ruling
+ * is most likely — so the rescan gap can taper in three steps instead of two.
+ * They default to "no hot tier", so every pre-existing call keeps identical
+ * semantics.
  */
-function finalScanDecision(grace, settled, now, graceMs, rescanMs, fastRescanMs, fastWindowMs) {
+function finalScanDecision(grace, settled, now, graceMs, rescanMs, fastRescanMs, fastWindowMs,
+                           hotRescanMs, hotWindowMs) {
   if (!settled) return 'scan'; // live game: the ordinary cadence owns it
   if (!grace || typeof grace.firstFinalObservedAt !== 'number') {
     // Never seen as Final before: this poll IS its first Final observation.
@@ -1326,11 +1333,15 @@ function finalScanDecision(grace, settled, now, graceMs, rescanMs, fastRescanMs,
   const age = now - grace.firstFinalObservedAt;
   if (age > graceMs) return 'skip';
   const hasFast = Number.isFinite(fastRescanMs) && Number.isFinite(fastWindowMs);
-  // A recently-Final game is rescanned at the fast gap; older finals (still
-  // inside grace) at the base gap. Uses `age` (time since the game went
-  // Final), not a separate clock, so the taper is purely a function of the
-  // single authoritative timestamp we already track.
-  const gap = (hasFast && age >= 0 && age < fastWindowMs) ? fastRescanMs : rescanMs;
+  const hasHot = Number.isFinite(hotRescanMs) && Number.isFinite(hotWindowMs);
+  // The tiers taper with the game's age: hottest gap first, then the fast gap,
+  // then the base gap. Uses `age` (time since the game went Final), not a
+  // separate clock, so the taper is purely a function of the single
+  // authoritative timestamp we already track. The hot tier is checked first,
+  // so it wins when both windows match.
+  let gap = rescanMs;
+  if (hasFast && age >= 0 && age < fastWindowMs) gap = fastRescanMs;
+  if (hasHot && age >= 0 && age < hotWindowMs) gap = hotRescanMs;
   if (typeof grace.lastScanAt === 'number' && now - grace.lastScanAt < gap) return 'skip';
   return 'scan';
 }
@@ -1706,6 +1717,24 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
   // exists to surface. A fresh cache resolves immediately, so a poll cycle is
   // just the playByPlay wave.
   const SCHEDULE_TTL_MS = 3000;
+  // The official team directory (/api/v1/teams) is COSMETIC on this page — it
+  // supplies abbreviation chips; every name renders from the schedule
+  // otherwise. It must therefore never hold the poll (2026-09-26): the feed
+  // waits at most TEAMS_WAIT_MS for it, and a directory that is slower than
+  // that is applied the moment it lands (applyTeamDirectory → re-render)
+  // rather than stalling the scan behind an api.js default (8000ms timeout,
+  // 1 retry, 150ms backoff ≈ up to ~16.2s on a stalled /teams). After an
+  // attempt that fails or overruns, no further attempt is made for
+  // TEAMS_RETRY_MS so a broken endpoint cannot tax every poll.
+  const TEAMS_WAIT_MS = 600;
+  const TEAMS_RETRY_MS = 5 * 60 * 1000;
+  // Run-at-risk desktop notification coalescing window. The chime fires the
+  // instant the first response carrying the alert lands; the notification is
+  // staged for this long so a poll where two games go at-risk in the same
+  // instant still produces ONE notification, and then it LEAVES — it no
+  // longer waits for the end of the poll (i.e. for the slowest game in the
+  // wave, up to PBP_TIMEOUT_MS on a stalled one).
+  const RUN_RISK_NOTIFY_COALESCE_MS = 250;
   // Per-game playByPlay: fail fast, no retry. A stalled game must not hold the
   // whole poll (requestInFlight) for 5s+; the NEXT poll (≤ interval later)
   // retries, and a retry inside the same poll only delays that next poll.
@@ -1738,14 +1767,26 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
    * flip kicks an out-of-band scan instead of waiting for the next tick.
    *
    *   worst case before : ~3000ms (schedule cache) + up to 500ms poll
-   *   worst case after  : ~250ms (watcher) + one round trip
+   *   worst case after  : ~125ms (watcher) + one round trip
    *
    * It runs on its own timer rather than inside load() so it adds ZERO
    * serialized latency to the playByPlay scan, and it is only fast while a
    * game is actually live — a review cannot start on a game that has not
    * started, so an idle slate backs off to 5s.
+   *
+   * 250ms → 125ms (2026-09-26): this ONE request is the earliest signal that
+   * exists for a challenge / review / boundary call / "under review" state —
+   * no other endpoint can know sooner — so with the app's own budget as the
+   * only constraint it is the request that best repays a tighter interval.
+   * The payload is the fields-projected, hydration-free whole-slate status
+   * (~2.4 KB), so 8/s costs ~19 KB/s against a host we are already reading
+   * 60 playByPlay requests/s from; the fetch is guarded against overlap
+   * (`reviewStatusInFlight`), so a slow response simply stretches the
+   * effective cadence instead of stacking requests. See
+   * docs/api-compliance.md for the full footprint and the terms this stays
+   * inside.
    * ------------------------------------------------------------------- */
-  const REVIEW_STATUS_POLL_MS = 250;
+  const REVIEW_STATUS_POLL_MS = 125;
   const REVIEW_STATUS_IDLE_MS = 5000;
   const REVIEW_STATUS_TIMEOUT_MS = 2500;
 
@@ -1754,17 +1795,29 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
   // Finals are re-scanned for scoring changes for this long after the page
   // first sees them as Final, so a late scorer ruling is still caught live
   // without re-polling yesterday's slate forever. Within that bounded grace
-  // window the rescan gap is recency-tiered: a recently-Final game (most
-  // likely to still get a scoring decision) is re-scanned at the fast gap,
-  // then the base gap, so the worst-case delay for a post-Final change drops
-  // from the old flat ~30s to as little as ~2.5s in the early, most likely
-  // window while total request volume stays capped by the 30-minute grace
-  // (2026-09-05: fast gap tightened 5s → 2.5s; ≤120 fast-window requests per
-  // finished game, then ≤100 more across the remaining 25 minutes).
+  // window the rescan gap is recency-tiered: the minutes right after the final
+  // out (most likely to still get a scoring decision) are re-scanned hottest,
+  // then at the fast gap, then the base gap, so the worst-case delay for a
+  // post-Final change drops from the old flat ~30s to ~1s where it matters,
+  // while total request volume stays capped by the 30-minute grace.
+  // Timeline of the tiers (2026-09-26): 0–2 min @1s, 2–5 min @2.5s,
+  // 5–30 min @15s (2026-09-05 had: 0–5 min @2.5s, 5–30 min @15s).
   const SCORING_CHANGE_GRACE_MS = 30 * 60 * 1000;   // 30 minutes after Final
   const SCORING_FINAL_RESCAN_MS = 15 * 1000;        // base gap once the fast window passes
   const SCORING_RECENT_RESCAN_MS = 2.5 * 1000;      // fast gap while the game is recently Final
   const SCORING_RECENT_FINAL_WINDOW_MS = 5 * 60 * 1000;  // "recently Final" = first 5 minutes
+  // HOTTEST TIER (2026-09-26): the first two minutes after the final out are
+  // where the overwhelming majority of post-Final scorer rulings land (a
+  // hit/error change is usually announced within a minute or two of the game
+  // ending), so that slice is rescanned every second — down from the 2.5s the
+  // fast tier gave it. Request volume stays inside the SAME bounded 30-minute
+  // grace and is merely redistributed toward the window that matters: ~120
+  // scans in the hot 2 minutes + ~72 across the remaining fast window (2.5s) +
+  // ~100 across the remaining 25 minutes (15s) ≈ 292 per finished game, versus
+  // ≈220 before — on a 15-game slate ≈2.4 requests/s averaged over the half
+  // hour, still far below the live playByPlay cadence it replaces.
+  const SCORING_HOT_RESCAN_MS = 1000;               // hottest gap: first SCORING_HOT_WINDOW_MS
+  const SCORING_HOT_WINDOW_MS = 2 * 60 * 1000;
 
   let dateStr = todayStr();
   let games = [];
@@ -1782,6 +1835,11 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
   let scheduleDate = null;
   let lastScheduleAt = 0;
   let scheduleInFlight = null;
+  // Official team directory state: the season whose directory is applied
+  // (success only, so a later poll can retry after a failure) and when the
+  // last attempt was made (enforces TEAMS_RETRY_MS between attempts).
+  let teamsDirectorySeason = null;
+  let teamsDirectoryAttemptedAt = 0;
   // Review-status watcher state: its own timer, an in-flight guard (a sweep
   // must never overlap itself and stack requests), the last observed
   // gamePk -> statusCode map, and a flag that tells load() a review flipped
@@ -1790,6 +1848,9 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
   let reviewStatusInFlight = false;
   let reviewStatusCodes = new Map();
   let reviewStatusFlipPending = false;
+  // gamePks whose out-of-band priority scan (kickPriorityScan) is running, so
+  // the same flipped game is never fetched twice over itself.
+  const priorityScanInFlight = new Set();
   // One alert (chime + notification) per poll at most — but fired the moment
   // the FIRST game response reports it, instead of after the slowest game.
   let pollAlertFired = false;
@@ -1956,6 +2017,135 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
 
   let syncInFlight = false;
   let lastServerSyncAt = 0;
+  // Live push (Server-Sent Events, server.mjs): the moment ANY session writes
+  // a tracked entry, the server pushes the merged log here, so the rows appear
+  // without waiting for the next periodic pull (15s). Null when the endpoint
+  // is unavailable (static hosting / tests) — the pull stays the fallback.
+  let feedLogUnsubscribe = null;
+
+  /**
+   * Merge one server log payload (pulled with GET, or pushed over the stream)
+   * into live state. Returns true when it changed something on screen.
+   *
+   * Push and pull share this function on purpose: they can never diverge, and
+   * a payload for a date the user has since navigated away from is ignored.
+   */
+  function applyServerFeedLog(data, targetDate) {
+    if (!data || data.date !== targetDate || targetDate !== dateStr) return false;
+
+    const res = restoreFeedLog(data, targetDate);
+    let changed = false;
+
+    res.entries.forEach((entry) => {
+      const key = buildEventKey(entry.gamePk, entry.review);
+      if (!feedState.seen.has(key)) {
+        feedState.seen.set(key, entry);
+        changed = true;
+      } else {
+        const existing = feedState.seen.get(key);
+        if (entry.review && entry.review.typeKey === 'scoring_change') {
+          if (!existing.review || existing.review.typeKey !== 'scoring_change' ||
+              (entry.review.changeCount || 0) > (existing.review.changeCount || 0)) {
+            feedState.seen.set(key, entry);
+            changed = true;
+          }
+        }
+      }
+    });
+
+    res.order.forEach((key) => {
+      if (feedState.seen.has(key) && feedState.order.indexOf(key) < 0) {
+        feedState.order.push(key);
+        changed = true;
+      }
+    });
+    feedState.seen.forEach((_, key) => {
+      if (feedState.order.indexOf(key) < 0) feedState.order.push(key);
+    });
+
+    res.snapshots.forEach((map, gamePk) => {
+      const existingMap = scoringSnapshots.get(gamePk) || new Map();
+      let mapChanged = false;
+      map.forEach((val, idx) => {
+        if (!existingMap.has(idx)) {
+          existingMap.set(idx, val);
+          mapChanged = true;
+        }
+      });
+      if (mapChanged) scoringSnapshots.set(gamePk, existingMap);
+    });
+
+    res.irregularities.forEach((notes, gamePk) => {
+      const existingNotes = scoringIrregularities.get(gamePk) || [];
+      let notesChanged = false;
+      notes.forEach((n) => {
+        if (!existingNotes.includes(n)) {
+          existingNotes.push(n);
+          notesChanged = true;
+        }
+      });
+      if (notesChanged) scoringIrregularities.set(gamePk, existingNotes);
+    });
+
+    res.grace.forEach((grace, gamePk) => {
+      if (!scoringGraceFinals.has(gamePk)) scoringGraceFinals.set(gamePk, grace);
+    });
+    res.settled.forEach((gamePk) => settledGames.add(gamePk));
+
+    lastServerSyncAt = Date.now();
+    return changed;
+  }
+
+  /**
+   * React to a merged payload: repaint, and mirror it into this browser's
+   * localStorage so a reload shows it immediately.
+   */
+  function publishServerFeedLogChange() {
+    render();
+    const store = feedLogStore();
+    if (!store) return;
+    try {
+      const currentPayload = serializeFeedLog({
+        dateStr,
+        now: Date.now(),
+        feedSeen: feedState.seen,
+        feedOrder: feedState.order,
+        scoringSnapshots,
+        scoringIrregularities,
+        scoringGraceFinals,
+        settledGames,
+      });
+      store.setItem(feedLogStorageKey(dateStr), JSON.stringify(currentPayload));
+    } catch (_) {}
+  }
+
+  /**
+   * Subscribe to the server's live log tail (SSE). Every accepted write from
+   * ANY session is pushed here, so cross-browser updates land in milliseconds
+   * instead of on the next poll. No-ops (returns false) when the page has no
+   * EventSource or the endpoint is absent — the periodic pull covers that.
+   */
+  function startFeedLogStream() {
+    stopFeedLogStream();
+    if (!window.MLBFeedLog || typeof window.MLBFeedLog.subscribeFeedLog !== 'function') return false;
+    const targetDate = dateStr;
+    feedLogUnsubscribe = window.MLBFeedLog.subscribeFeedLog(targetDate, (payload) => {
+      if (applyServerFeedLog(payload, targetDate)) publishServerFeedLogChange();
+    }, {
+      // Give-up notice: clear the handle so the next visibilitychange retries,
+      // and so the page never believes a dead stream is live.
+      onClose: () => { feedLogUnsubscribe = null; },
+    });
+    if (typeof feedLogUnsubscribe !== 'function') feedLogUnsubscribe = null;
+    return !!feedLogUnsubscribe;
+  }
+
+  function stopFeedLogStream() {
+    if (typeof feedLogUnsubscribe === 'function') {
+      try { feedLogUnsubscribe(); } catch (_) {}
+    }
+    feedLogUnsubscribe = null;
+  }
 
   /**
    * Asynchronously synchronize with the server's persistent feed log
@@ -1988,91 +2178,7 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
         } catch (_) {}
       }
 
-      if (!data || data.date !== targetDate || targetDate !== dateStr) {
-        syncInFlight = false;
-        return;
-      }
-
-      const res = restoreFeedLog(data, targetDate);
-      let changed = false;
-
-      res.entries.forEach((entry) => {
-        const key = buildEventKey(entry.gamePk, entry.review);
-        if (!feedState.seen.has(key)) {
-          feedState.seen.set(key, entry);
-          changed = true;
-        } else {
-          const existing = feedState.seen.get(key);
-          if (entry.review && entry.review.typeKey === 'scoring_change') {
-            if (!existing.review || existing.review.typeKey !== 'scoring_change' ||
-                (entry.review.changeCount || 0) > (existing.review.changeCount || 0)) {
-              feedState.seen.set(key, entry);
-              changed = true;
-            }
-          }
-        }
-      });
-
-      res.order.forEach((key) => {
-        if (feedState.seen.has(key) && feedState.order.indexOf(key) < 0) {
-          feedState.order.push(key);
-          changed = true;
-        }
-      });
-      feedState.seen.forEach((_, key) => {
-        if (feedState.order.indexOf(key) < 0) feedState.order.push(key);
-      });
-
-      res.snapshots.forEach((map, gamePk) => {
-        const existingMap = scoringSnapshots.get(gamePk) || new Map();
-        let mapChanged = false;
-        map.forEach((val, idx) => {
-          if (!existingMap.has(idx)) {
-            existingMap.set(idx, val);
-            mapChanged = true;
-          }
-        });
-        if (mapChanged) scoringSnapshots.set(gamePk, existingMap);
-      });
-
-      res.irregularities.forEach((notes, gamePk) => {
-        const existingNotes = scoringIrregularities.get(gamePk) || [];
-        let notesChanged = false;
-        notes.forEach((n) => {
-          if (!existingNotes.includes(n)) {
-            existingNotes.push(n);
-            notesChanged = true;
-          }
-        });
-        if (notesChanged) scoringIrregularities.set(gamePk, existingNotes);
-      });
-
-      res.grace.forEach((grace, gamePk) => {
-        if (!scoringGraceFinals.has(gamePk)) scoringGraceFinals.set(gamePk, grace);
-      });
-      res.settled.forEach((gamePk) => settledGames.add(gamePk));
-
-      lastServerSyncAt = Date.now();
-
-      if (changed) {
-        render();
-        const store = feedLogStore();
-        if (store) {
-          try {
-            const currentPayload = serializeFeedLog({
-              dateStr,
-              now: Date.now(),
-              feedSeen: feedState.seen,
-              feedOrder: feedState.order,
-              scoringSnapshots,
-              scoringIrregularities,
-              scoringGraceFinals,
-              settledGames,
-            });
-            store.setItem(feedLogStorageKey(dateStr), JSON.stringify(currentPayload));
-          } catch (_) {}
-        }
-      }
+      if (applyServerFeedLog(data, targetDate)) publishServerFeedLogChange();
     } catch (err) {
       console.warn(`feed log server sync failed (${targetDate})`, err);
     } finally {
@@ -2102,6 +2208,7 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
   // where two games go at-risk at the same instant produces ONE notification
   // covering both (the chime itself fires immediately from maybeAlertNow).
   let pendingRunRiskNotify = [];
+  let runRiskNotifyTimer = null;
   let notifyEnabled = false;
 
   try {
@@ -2147,6 +2254,10 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
     alertedRunRiskKeys.clear();
     pendingRunRiskAlerts = [];
     pendingRunRiskNotify = [];
+    if (runRiskNotifyTimer != null) {
+      clearTimeout(runRiskNotifyTimer);
+      runRiskNotifyTimer = null;
+    }
     // Date changed: the schedule cache belongs to the old date and the
     // parallel scan must start from an empty known-slate (the new poll awaits
     // the new schedule first), never scan the previous date's games.
@@ -2163,6 +2274,9 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
     // back to today) shows every entry logged on that date.
     restorePersistedLog();
     syncFeedLogFromServer();
+    // The live tail is per date: re-subscribe so the new date's entries are
+    // pushed too (the old stream is closed first — see startFeedLogStream).
+    startFeedLogStream();
   }
 
   function $ (sel) { return document.querySelector(sel); }
@@ -2325,6 +2439,32 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
    */
   function playRunRiskAlertSound() {
     playAlertSound();
+  }
+
+  /**
+   * Send the staged run-at-risk notifications now (no-op when none are
+   * staged) and disarm the coalescing timer. Both the coalescing timer and the
+   * end of a poll call this: whichever runs first sends the staged batch and
+   * empties it, so the other is a no-op — a batch can never be sent twice.
+   */
+  function flushRunRiskNotify() {
+    if (runRiskNotifyTimer != null) {
+      clearTimeout(runRiskNotifyTimer);
+      runRiskNotifyTimer = null;
+    }
+    if (!pendingRunRiskNotify.length) return;
+    const batch = pendingRunRiskNotify;
+    pendingRunRiskNotify = [];
+    notifyRunRisk(batch);
+  }
+
+  /** Arm the one-shot coalescing flush (idempotent while one is pending). */
+  function scheduleRunRiskNotify() {
+    if (runRiskNotifyTimer != null) return;
+    runRiskNotifyTimer = setTimeout(() => {
+      runRiskNotifyTimer = null;
+      flushRunRiskNotify();
+    }, RUN_RISK_NOTIFY_COALESCE_MS);
   }
 
   /**
@@ -2525,6 +2665,121 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
     return scheduleInFlight;
   }
 
+  /** Promise that resolves after `ms` (used only for the bounded team wait). */
+  function sleepMs(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Official team directory for `season`, awaited for at most TEAMS_WAIT_MS.
+   *
+   * Cosmetic data must never gate the scan: while this is awaited — and on
+   * essentially every poll it resolves from api.js's per-season promise cache
+   * on the first microtask — the playByPlay wave cannot start and
+   * requestInFlight stays true, so watcher-triggered scans are dropped.
+   * Bounding the wait means the worst case a slow /teams can add to a poll is
+   * TEAMS_WAIT_MS, not api.js's 8s+8s default; the directory still applies as
+   * soon as it arrives (applyTeamDirectory).
+   */
+  async function resolveTeamDirectory(season) {
+    if (!MLB.getTeams) return;
+    if (teamsDirectorySeason === season) return; // already applied: zero cost
+    if (teamsDirectoryAttemptedAt &&
+        Date.now() - teamsDirectoryAttemptedAt < TEAMS_RETRY_MS) return;
+    teamsDirectoryAttemptedAt = Date.now();
+    // Both outcomes are handled here, so a late rejection can never surface as
+    // an unhandled rejection after the race has already been won by the timer.
+    const attempt = Promise.resolve()
+      .then(() => MLB.getTeams(season))
+      .then((dir) => ({ dir }), (err) => ({ err }));
+    const raced = await Promise.race([
+      attempt,
+      sleepMs(TEAMS_WAIT_MS).then(() => ({ timedOut: true })),
+    ]);
+    if (raced && raced.dir) {
+      applyTeamDirectory(season, raced.dir);
+      return;
+    }
+    if (raced && raced.err) {
+      console.warn('team directory unavailable — abbreviations hidden this poll', raced.err);
+      return;
+    }
+    // Too slow to hold the poll for. Adopt it whenever it does land.
+    attempt.then((late) => {
+      if (late && late.dir) applyTeamDirectory(season, late.dir);
+    });
+  }
+
+  /**
+   * Adopt an official team directory (id -> { name, abbreviation, … }) and
+   * re-render with it. Called from the poll when it arrives inside
+   * TEAMS_WAIT_MS, and from resolveTeamDirectory's late path when it arrives
+   * after the poll has already moved on — in which case every tracked row's
+   * matchup label is re-stamped from the official names first, so nothing on
+   * screen keeps a fallback label.
+   */
+  function applyTeamDirectory(season, dir) {
+    teamsById = dir || {};
+    teamsDirectorySeason = season;
+    const byPk = new Map((games || []).map((g) => [g && g.gamePk, g]));
+    feedState.seen.forEach((entry) => {
+      const game = byPk.get(entry.gamePk);
+      if (!game) return;
+      const label = gameTeamsLabel(game, teamsById);
+      if (label) entry.matchupLabel = label;
+    });
+    render();
+  }
+
+  /**
+   * Out-of-band scan of the games a status flip just named — the fix for the
+   * one remaining multi-100ms tail in the feed's own detection path
+   * (2026-09-26).
+   *
+   * Why it exists: the status watcher fires at 250ms, but its flip handler
+   * calls load(), which is a NO-OP while a scan is already running (the
+   * requestInFlight guard) — so the row for a review that flips DURING a wave
+   * could only land when that whole wave finished, i.e. after the slowest game
+   * in it (per-game PBP_TIMEOUT_MS is 3000ms, and a single stalled game
+   * resolves or times out at that point). Speculatively waiting is what the
+   * user's report is about: the review is already live on MLB's side.
+   *
+   * This fetches ONLY the flipped game(s), immediately, outside the wave: one
+   * request per flip (not per game in the slate), so the banner/row/chime
+   * follow the 250ms status strip by one round trip no matter what the
+   * in-flight poll is doing. Games already being priority-scanned are skipped,
+   * so a flapping status cannot stack requests. The in-flight wave may also
+   * fetch the same game; its response is merged idempotently by
+   * `<gamePk>:<event id>` key (mergeFeedEvents/mergeScoringChanges and
+   * admitScoringEntries all dedupe), so the duplicate costs one request on a
+   * rare event and can never duplicate a row.
+   */
+  function kickPriorityScan(gamePks) {
+    if (!gamePks || !gamePks.length) return;
+    const wanted = new Set(gamePks);
+    const targets = candidateGames(games).filter((g) => wanted.has(g.gamePk));
+    if (!targets.length) return;
+    // This is its own detection wave, so it gets its own single chime: a
+    // review that flips mid-poll would otherwise stay silent, because the
+    // in-flight poll already spent its one alert. Counters from that poll are
+    // cleared first so an event that has already chimed cannot chime again.
+    pendingAlertableCount = 0;
+    pollAlertFired = false;
+    targets.forEach((game) => {
+      const pk = game.gamePk;
+      if (priorityScanInFlight.has(pk)) return;
+      priorityScanInFlight.add(pk);
+      ingestGame(game)
+        .then(() => {
+          // ingestGame already rendered its own updates + alerted; this keeps
+          // the footer stats honest if the page was otherwise idle.
+          renderStatusLine();
+        })
+        .catch(() => { /* the next poll retries; never surface a page error */ })
+        .finally(() => { priorityScanInFlight.delete(pk); });
+    });
+  }
+
   /**
    * Fetch + ingest one batch of games with the existing priority ordering.
    * Returns the number of games successfully ingested (a game that failed
@@ -2584,14 +2839,21 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
       // request fails, official full names still render from the schedule and
       // abbreviation chips simply stay hidden. (Cached in api.js after the
       // first poll, so this is a no-op wait on essentially every cycle.)
+      //
+      // LATENCY GUARD (2026-09-26): this lookup is COSMETIC (abbreviation
+      // chips), so it must never hold the poll. It is awaited for at most
+      // TEAMS_WAIT_MS — one short round trip is plenty for a first paint; a
+      // directory that is slower than that is applied the moment it lands
+      // (applyTeamDirectory → re-render) instead of stalling the scan. Without
+      // the bound, an api.js getJSON() default (timeout 8000ms, retries 1,
+      // 150ms backoff = up to ~16.2s on a stalled /teams) would keep
+      // requestInFlight true for that whole time: the 250ms status watcher
+      // would keep sweeping (its timer is independent) but every
+      // watcher-triggered scan would be dropped by the guard, delaying the
+      // full row — batter/pitcher, score impact, runs at risk — by seconds.
       const season = (games.find((g) => g && g.season) || {}).season
         || requestDate.slice(0, 4);
-      try {
-        teamsById = await MLB.getTeams(season);
-      } catch (dirErr) {
-        console.warn('team directory unavailable — abbreviations hidden this poll', dirErr);
-        teamsById = {};
-      }
+      await resolveTeamDirectory(season);
       if (requestDate !== dateStr) return;
 
       // Manager-challenge counters ride along on the schedule refresh
@@ -2636,12 +2898,12 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
       // the same cycle).
       syncRunRiskTracking();
       maybeAlertNow();
-      // Desktop notifications: once per poll, covering EVERY run that went
-      // at-risk this cycle (the chime already fired immediately above).
-      if (pendingRunRiskNotify.length) {
-        notifyRunRisk(pendingRunRiskNotify);
-        pendingRunRiskNotify = [];
-      }
+      // Desktop notifications: whatever is still staged goes out now. In
+      // practice the coalescing timer has already sent it (the notification
+      // leaves ~RUN_RISK_NOTIFY_COALESCE_MS after the first response carrying
+      // it, not after the slowest game); this keeps the same "one
+      // notification per wave" guarantee if a poll somehow ends first.
+      flushRunRiskNotify();
       isFirstLoad = false;
 
       // Periodic sync with server log to pick up entries logged by other browsers
@@ -2732,15 +2994,27 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
   function maybeAlertNow() {
     syncRunRiskTracking();
     if (pendingRunRiskAlerts.length) {
-      // Accumulate for the end-of-poll notification (dedup by event key).
+      // CONSUME the batch. syncRunRiskTracking() replaces this array only when
+      // a key newly becomes risky, so it used to survive every later call in
+      // the same poll; the dedup-by-key below then re-staged the same entries
+      // on each call. That was invisible while the only flush was the
+      // end-of-poll one, but with the coalescing flush it sent the SAME
+      // notification twice (caught by tools/review-watcher-test.mjs section
+      // 4d). Staging a batch exactly once fixes it at the source.
+      const stagedAlerts = pendingRunRiskAlerts;
+      pendingRunRiskAlerts = [];
+      // Dedup by event key against what is already staged.
       const keys = new Set(pendingRunRiskNotify.map((e) => buildEventKey(e.gamePk, e.review)));
-      pendingRunRiskAlerts.forEach((e) => {
+      stagedAlerts.forEach((e) => {
         const key = buildEventKey(e.gamePk, e.review);
         if (!keys.has(key)) {
           keys.add(key);
           pendingRunRiskNotify.push(e);
         }
       });
+      // The notification no longer waits for the slowest game: arm the short
+      // coalescing window now, next to the immediate chime.
+      scheduleRunRiskNotify();
       if (pollAlertFired) return;
       pollAlertFired = true;
       playRunRiskAlertSound();
@@ -2852,6 +3126,8 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
         SCORING_FINAL_RESCAN_MS,
         SCORING_RECENT_RESCAN_MS,
         SCORING_RECENT_FINAL_WINDOW_MS,
+        SCORING_HOT_RESCAN_MS,
+        SCORING_HOT_WINDOW_MS,
       );
       if (decision === 'skip') return true;
     }
@@ -3833,7 +4109,18 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
         // strip is touched: a full render() here could race the in-flight
         // scan's incremental row updates.
         renderActiveStrip();
+        // Was a full-slate scan already running? load() below is a no-op in
+        // that case (requestInFlight), so the flipped game(s) are fetched
+        // out of band right now instead of waiting for that wave to finish
+        // (up to PBP_TIMEOUT_MS on a stalled game) — see kickPriorityScan.
+        const waveInFlight = requestInFlight;
         load();
+        // Every changed game is worth fetching NOW — a review being CALLED
+        // (change.review, change.started) and one RESOLVING (change.ended, the
+        // ruling the user is waiting for) are both carried by that game's
+        // playByPlay, and candidateGames() inside kickPriorityScan filters out
+        // anything that is not Live/Final.
+        if (waveInFlight) kickPriorityScan(diff.changed.map((change) => change.gamePk));
       }
     } catch (err) {
       // Deliberately quiet: see the doc comment above.
@@ -3934,6 +4221,9 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
         // Catch up on anything that started while the tab was hidden — one
         // sweep now, then back to the watcher cadence.
         pollReviewStatus();
+        // A stream that gave up (endpoint absent, or a long outage) is retried
+        // when the tab comes back; a healthy one is left connected.
+        if (!feedLogUnsubscribe) startFeedLogStream();
       } else {
         // Flush the log on hide: a refresh or a closed tab must keep every
         // entry tracked so far.
@@ -3955,6 +4245,9 @@ function pruneFeedLogIndex(index, keepDateStr, maxDates) {
     restorePersistedLog();
     render();
     syncFeedLogFromServer();
+    // Live cross-session push: another browser's entries appear as they are
+    // written instead of on the next 15s pull. No-op on static hosting.
+    startFeedLogStream();
     load();
     // First sweep immediately rather than one cadence later: a page opened
     // mid-review must show the review on the first paint, and the sweep also

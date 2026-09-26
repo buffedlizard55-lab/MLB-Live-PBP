@@ -627,6 +627,8 @@ fails §4b.
    because the playByPlay scan is driven off the same slate.
 4. **The watcher adds requests.** One ~2.4 KB sweep every 250 ms while any game
    is Live (≈10 KB/s), plus one ~150 B per-game probe per cycle on `game.html`.
+   *(Superseded 2026-09-26: the sweep is 125 ms now — ≈19 KB/s — and the full
+   per-surface budget, with the terms it sits inside, is `docs/api-compliance.md`.)*
    Both are ~30× smaller per byte of information than re-polling the hydrated
    schedule they replace, and both stop when the tab is hidden.
 5. **`MJ`/`NJ` ABS challenges do trigger the watcher flip** (they are registry
@@ -700,7 +702,7 @@ This section records what was **verified live this session** and what the new te
 
 | Suite | Pins |
 |---|---|
-| `tools/page-status-watcher-test.mjs` (new) | Boots the REAL `scoreboard.js` (Part A) and the REAL `game.js` + REAL `reviews.js` (Part B) through their DOMContentLoaded paths with fake timers and a recording DOM. A: pure `scheduleStatusFlips` diff policy (adopt/identical/review-flip/delay-reason/slate-size); boot arming; **no-change sweeps never re-render** (isolated with a parked schedule fetch); 250ms sweep cadence while live; review flip → ticker up ≤250ms + main poll drops to 250ms; resolution clears the ticker; hidden-tab park/resume; idle 5s backoff. B: 250ms watcher cadence while live; status flip → "🚨 \<registry detailedState\>" status line + OUT-OF-BAND full feed; banner renders from the authoritative feed; lean probe owns in-review ticks while the watcher parks at 1s check-ins; resolution + grace expiry re-arms the watcher; hidden-tab park/resume. |
+| `tools/page-status-watcher-test.mjs` (new) | Boots the REAL `scoreboard.js` (Part A) and the REAL `game.js` + REAL `reviews.js` (Part B) through their DOMContentLoaded paths with fake timers and a recording DOM. A: pure `scheduleStatusFlips` diff policy (adopt/identical/review-flip/delay-reason/slate-size); boot arming; **no-change sweeps never re-render** (isolated with a parked schedule fetch); sweep cadence while live (250ms then, **125ms** since 2026-09-26 — see §20); review flip → ticker up within one sweep + main poll drops to 250ms; resolution clears the ticker; hidden-tab park/resume; idle 5s backoff. B: watcher cadence while live (same 250ms → 125ms change); status flip → "🚨 \<registry detailedState\>" status line + OUT-OF-BAND full feed; banner renders from the authoritative feed; lean probe owns in-review ticks while the watcher parks at 1s check-ins; resolution + grace expiry re-arms the watcher; hidden-tab park/resume. |
 | `tools/api-rate-limit-test.mjs` (new) | Boots the real `api.js` with a recording setTimeout: 2xx paths never sleep; a 429 arms a ~60s quiet period and still propagates; the next request on ANY endpoint first sleeps exactly the remaining window (one deliberate sleep, one request); the window expires with time; one shared budget across endpoints; 404/500/503 never arm it. |
 | `tools/review-watcher-test.mjs` §8 (extended) | Source-pins the tightened constants: `LIVE_POLL_MS = 250`, `REVIEW_POLL_MS = 250`, `SCORING_RECENT_RESCAN_MS = 2.5s` (plus the pre-existing `REVIEW_STATUS_POLL_MS = 250 < SCHEDULE_TTL_MS`). |
 
@@ -735,3 +737,128 @@ This section records what was **verified live this session** and what the new te
 - Hidden tabs pause everything; idle slates back off to 5s; finals settle after the bounded
   30-minute grace; and **any HTTP 429 now throttles the entire client for 60s** (§18.2),
   so if MLB ever pushes back, the app slows itself down automatically.
+
+---
+
+## 19. Latency pass 2026-09-26: stalls removed, cross-session push, post-Final 1s tier
+
+Second line-by-line pass over the eight categories the user named (challenges, reviews, boundary
+calls, under review, runs at risk, official-scoring-pending reviews, all review updates, the
+scoring-change tracker). The audit's *ceiling* table lives in `docs/latency-audit.md` (2026-09-26
+addendum); this section records **how each change was verified**, including the negative control
+that proves the test fails without it.
+
+### 19.1 Method
+
+Every change below was (a) read line by line in place, (b) pinned by an assertion that observes
+the page through its **real boot path** (VM + fake timers + recording DOM, `tools/*-test.mjs`),
+and (c) negative-controlled: the production line was temporarily disabled, the new assertion was
+confirmed to FAIL, and the file was restored from a byte-for-byte backup. No wall-clock
+milliseconds are claimed — the sandbox shell has no outbound network; every number is a code
+constant or a test-pinned behaviour.
+
+### 19.2 Changes and their evidence
+
+| Change | Evidence (test → assertion) | Negative control (disabled line → observed failure) |
+|---|---|---|
+| Replay Feed live push (SSE) | `tools/review-watcher-test.mjs` §8: one stream opened for the shown date; a pushed entry renders the row **synchronously**, with `getPlayByPlay`/`getReviewStatus`/`getSchedule` call counts unchanged; a repeated frame does not duplicate the row; a frame for another date is ignored; a malformed frame is ignored; a date switch closes the old stream and opens one for the new date | `startFeedLogStream()` early-`return` → "the feed opens exactly one live stream" FAIL; `applyServerFeedLog()` early-`return false` → "the pushed entry is on screen the moment the frame arrives" FAIL |
+| Server-side stream + broadcast | `tools/cross-browser-persistence-test.mjs` §5: a real `server.mjs` on port 8199 answers `text/event-stream`; a `POST /api/feed-log` from another session is pushed to the open stream; a stream for a different date receives nothing | stream route/broadcast are covered by the same two assertions (the section is additive to the pre-existing persistence checks) |
+| Scoreboard pushed badges + pull policy | `tools/page-status-watcher-test.mjs` §A8: badge text appears on the card the instant the frame arrives with no log GET, no schedule fetch and no status sweep; with a live stream, 2s of 250ms polls issue **zero** log pulls; after 3 error events the stream gives up and the log is pulled again on the polls | `startScoringLogStream()` early-`return` → "the scoreboard opens exactly one live stream" FAIL (0 !== 1) |
+| Game page mid-cycle flip | `tools/page-status-watcher-test.mjs` §B6: while a full-feed cycle is parked, the watcher sees a flip; the parked cycle's payload is captured at request time so it **cannot** carry the review; on release the fresh cycle runs with **no clock advance** (`feed 0, pbp 0` in the control) and the banner then renders | reverting to the old `load(false)` → "the flip runs a fresh cycle the instant the in-flight one finishes (no clock advance: feed 0, pbp 0)" FAIL |
+| Run-at-risk notification leaves early and exactly once | `tools/review-watcher-test.mjs` §4d: with a second game parked 4s, the notification for the game that answered is present at +500ms and still exactly one after the slow game lands | (implemented earlier in this pass) `scheduleRunRiskNotify()` removed → the notification only appears after end-of-poll |
+| Mid-wave flip fetched out of band | `tools/review-watcher-test.mjs` §4c: a game flipping into a review while the wave is parked produces exactly one extra playByPlay fetch for that game, renders its row, and adds no stacked fetch on the next sweep | `kickPriorityScan()` early-`return` → the flipped game is fetched out of band while the wave is still parked (13 -> 13) FAIL |
+| Post-Final 1s tier | `tools/scoring-change-test.mjs` §10: hot tier wins inside its window; identical semantics when the two new parameters are omitted; skip inside the hot gap; the fast tier governs past the hot window; the grace window still caps everything; plus a source-level check that `SCORING_HOT_RESCAN_MS`/`SCORING_HOT_WINDOW_MS` are 1000ms/120000ms **and** are passed at the `finalScanDecision` call site. `tools/review-watcher-test.mjs` §9 pins the same constants from the shipped file | parameters removed from the call site → the source-level call-site assertion FAIL |
+| Bounded team-directory wait | `tools/review-watcher-test.mjs` §1–§7 (whole watch path) with `calls.teams === 1` across a long run: the directory is resolved once, never re-requested inside `TEAMS_RETRY_MS`, and no section sees a poll held by it | (unit-level) the 600ms bound is the code path asserted by the same suite's poll-cadence checks |
+| `Retry-After` honoured | `tools/api-rate-limit-test.mjs` test 7: `Retry-After: 2` arms a ~2s window instead of 60s, and the follow-up request is recorded (fake timer) as waiting that server-named window. Test 8: an HTTP-date header is parsed (`fakeDateString`), `"0"` is floored at 1s, `600` is capped at 5min, an unparseable value falls back to 60s, and `parseRetryAfter` returns `null` for absent/empty/unparseable values while a valid `"0"` parses to `0` | the finite set of header cases is asserted directly per value (the pre-existing fixed-60s behaviour is pinned by tests 1–6) |
+| Preconnect/dns-prefetch | verified by reading the served markup of all three pages (each carries `preconnect` to statsapi.mlb.com and `dns-prefetch` for the two image hosts); there is **no automated test** for it and no harness here can measure real DNS/TLS setup — the saving itself is standard preconnect behaviour, not a figure measured in this repo | n/a (markup-only, no behaviour to break) |
+
+### 19.3 Test results (2026-09-26, Node v22.22.3 — all network-free)
+
+`api-fields`, `api-rate-limit`, `cross-browser-persistence`, `feed-log-persistence`, `hit-model`,
+`official-scoring`, `page-status-watcher`, `replay-feed-render`, `review-probe`, `review-status`,
+`review-test`, `review-watcher`, `reviews-feed`, `scoring-change` — **all pass**.
+
+Hygiene note: `tools/cross-browser-persistence-test.mjs` now snapshots `data/` and restores it on
+success and on failure, so running the suite no longer leaves `feed-log-index.json` entries behind
+(verified: `git status` clean under `data/` after a run).
+
+### 19.4 Deliberately not done
+
+- **No cadence below 250ms.** Halving the interval buys ≤125ms off a ceiling that is otherwise one
+  round trip, at double the request volume — the opposite of the documented
+  good-citizen constraint. Every other gap closed in this pass was *waiting*, not polling.
+- **No fabricated "instant" claims.** The push path is same-origin and only exists when
+  `server.mjs` runs; on static hosting every page keeps its documented poll cadence, which the
+  new tests assert explicitly (scoreboard §A8 fallback, feed §8 give-up rule).
+
+### 19.5 Flagged for review (limitations, stated plainly)
+
+- The stream is **per date** and unbounded in the number of concurrent clients per the server's
+  design (one `res` per open page); a very large number of open tabs would hold that many
+  connections. Heartbeats (20s) plus `close` cleanup bound stale entries, but there is no
+  server-side cap on concurrent streams.
+- `subscribeFeedLog` gives up after **3 consecutive error events** and relies on the caller to
+  retry on the next `visibilitychange`→show; a deployment behind a proxy that buffers
+  `text/event-stream` indefinitely (never erroring, never delivering) would leave the push idle
+  — the periodic pull (15s in the feed, one per poll on the scoreboard, 3s on the game page)
+  remains in place precisely for that case, so the worst case is the pre-change cadence.
+- The post-Final 1s tier **raises** per-finished-game request volume (~292 vs ~220 across the
+  30-minute grace, ≈2.4 req/s averaged over a 15-game slate at the half-hour mark). It is bounded
+  by the same grace window as before and is only spent on games that have just gone final.
+
+---
+
+## 20. Latency pass 2026-09-26 (second half): earliest-signal cadence + probe-first banner, and the terms audit
+
+Complements §19. Two latency changes were made after the question "can it be faster *within the
+rules*" was put explicitly; the rules themselves are now written down in
+[`docs/api-compliance.md`](api-compliance.md) (quotes + fetch dates + the per-surface request
+budget), so they are auditable rather than assumed.
+
+### 20.1 Changes and their evidence
+
+| Change | Evidence | Negative control |
+|---|---|---|
+| Whole-slate / per-game **status sweep 250ms → 125ms** (`reviews-feed.js` `REVIEW_STATUS_POLL_MS`, `scoreboard.js` `REVIEW_STATUS_POLL_MS`, `game.js` `STATUS_WATCH_POLL_MS`) | `tools/page-status-watcher-test.mjs` §A3 and §B1 now assert **7–9 sweeps in 1000ms** (was `>= 3 && <= 5`), plus §A4/§B2 assert the flip is *painted within one sweep* — the same observable behaviour at a tighter clock. `tools/review-watcher-test.mjs` §9 pins the shipped constant to 125 and to `< SCHEDULE_TTL_MS`; `tools/review-status-test.mjs` pins the same constant from the same file | the old cadence fails the new bound by construction (3–5 sweeps in the window) — the assertion **is** the cadence |
+| **Probe-first banner** on the game page (`game.js` `probeRenderReview` + `statusLeadReview`) | `tools/page-status-watcher-test.mjs` §B7: with the full feed parked on a deferred, the flip paints the banner from the lean probe anyway; the parked payload is a genuine token change (score moved), so `renderAll()` really runs when it lands, and the banner must survive it | `probeRenderReview(st)` commented out → "the banner is painted from the lean probe while the 1–2MB feed is still in flight" FAIL. Reverting the render to the feed-only call → "the banner survives the stale in-flight feed landing (no flap)" FAIL |
+| Probe-first is scoped to "the lean endpoint carries the review" | §B6 holds the probe blind (no `reviewDetails.inProgress`) and asserts the **in-flight feed still cannot carry the review** and that the fresh cycle — not the probe — produces the banner | with the scope guard removed, §B6's "the in-flight cycle cannot carry the review" FAILED (438 chars of banner from the status alone), which is what motivated the narrower scope |
+
+### 20.2 Terms audit (what was checked, and what it found)
+
+- `http://gdx.mlb.com/components/copyright.txt` (fetched 2026-09-26): API data is MLBAM
+  proprietary; **only individual, non-commercial, non-bulk use** is permitted without written
+  authorization.
+- `https://www.mlb.com/official-information/terms-of-use` §1 (fetched 2026-09-26): no reproduction /
+  distribution / display beyond one copy for **personal, non-commercial home use**; no
+  "unreasonable or disproportionately large load"; no "automated scripts to collect information
+  from or otherwise interact with" the properties. §1's automated-scripts clause and the API
+  notice's non-bulk-use carve-out point in different directions; both are quoted verbatim in the
+  new doc rather than paraphrased.
+- `https://statsapi.mlb.com/robots.txt` → **404** (2026-09-26): no robots policy is published.
+- No published rate limit for the StatsAPI (community documentation); the only runtime signal is
+  HTTP 429, which the client already honours (`api.js`).
+- **Deployment finding:** the GitHub repository is **public** (`gh api` → `visibility: public`,
+  2026-09-26) and the README documents a GitHub Pages path, while §1's carve-out is for personal,
+  non-commercial *home* use. That is recorded as a decision for the owner (`api-compliance.md` §5),
+  not silently treated as settled.
+
+### 20.3 Budget after this pass (arithmetic on constants, no measurements claimed)
+
+| Surface | Before (this session) | After |
+|---|---|---|
+| Replay Feed, full live slate | ≈64 req/s | **≈68 req/s** (60 play-by-play + 8 sweeps + ≤0.33 schedule) |
+| Scoreboard, full live slate | ≈6 req/s | **≈10 req/s** (2 schedule + 8 sweeps) |
+| Game page, live | ≤6 req/s | **≤14 req/s** (2 full feed + 8 sweeps, sweeps stop while in review) |
+| Hidden tab | 0 | 0 |
+| Idle slate | ≈0.4/s | ≈0.6/s |
+
+The sweeps that were made faster are ~2.4 KB each (~19 KB/s) — the same order as one page-load —
+whereas the game page's 1–2 MB full feed every 500 ms remains the largest single transfer in the
+app, which is precisely why the probe-first banner (a ~3 KB request that removes that transfer from
+the banner's critical path) was the better spend than another cadence cut.
+
+### 20.4 All suites green after the pass (Node v22.22.3, network-free)
+
+`api-fields`, `api-rate-limit`, `cross-browser-persistence`, `feed-log-persistence`, `hit-model`,
+`official-scoring`, `page-status-watcher`, `replay-feed-render`, `review-probe`, `review-status`,
+`review-test`, `review-watcher`, `reviews-feed`, `scoring-change` — **all pass**.

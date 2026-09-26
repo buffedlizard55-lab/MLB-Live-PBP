@@ -15,6 +15,10 @@
  *      - index.html: Scoreboard displays "✏️ 1 Scoring Change" indicator badge
  *   4. Multi-client idempotent merging: two browsers observing different games
  *      both persist their entries to the server without clobbering each other.
+ *   5. Live push (2026-09-26): a connected Server-Sent Events stream receives
+ *      the written entry the moment it is persisted, instead of waiting for the
+ *      next periodic pull — this is what makes another browser's review/
+ *      challenge/scoring-change entry appear in milliseconds.
  * ==========================================================================*/
 
 import assert from 'node:assert/strict';
@@ -36,6 +40,21 @@ const feedLogSource = fs.readFileSync(path.join(REPO_DIR, 'assets/js/feed-log.js
 const TEST_PORT = 8199;
 const TEST_DATE = '2026-08-30';
 const TEST_GAME_PK = 822766;
+
+// The server persists into data/. Snapshot it so this test leaves the
+// repository exactly as it found it (it writes and merges real files).
+const DATA_DIR = path.join(REPO_DIR, 'data');
+const dataSnapshot = new Map(
+  fs.readdirSync(DATA_DIR).map((f) => [f, fs.readFileSync(path.join(DATA_DIR, f), 'utf8')]),
+);
+function restoreDataDir() {
+  try {
+    fs.readdirSync(DATA_DIR).forEach((f) => {
+      if (!dataSnapshot.has(f)) fs.unlinkSync(path.join(DATA_DIR, f));
+    });
+    dataSnapshot.forEach((content, f) => fs.writeFileSync(path.join(DATA_DIR, f), content));
+  } catch (_) {}
+}
 
 console.log('Starting server on port', TEST_PORT);
 const serverProc = spawn('node', ['server.mjs'], {
@@ -272,21 +291,93 @@ async function run() {
   console.log('  ✓ Server merged multiple client updates without data loss');
 
   // Clean up temporary test files
-  try {
-    const tmpLog = path.join(REPO_DIR, 'data', 'feed-log-2026-09-15.json');
-    if (fs.existsSync(tmpLog)) fs.unlinkSync(tmpLog);
-  } catch (_) {}
+  restoreDataDir();
+
+  /* ==========================================================================
+   * 5. Live push over SSE: is a written entry delivered to a connected page
+   *    without that page asking for it?
+   * ========================================================================*/
+  console.log('\n--- 5. Server-Sent Events live push ---');
+
+  const STREAM_DATE = '2026-09-16';
+  const frames = await new Promise((resolve, reject) => {
+    const req = http.get(
+      `http://127.0.0.1:${TEST_PORT}/api/feed-log/stream?date=${STREAM_DATE}`,
+      (res) => {
+        assert.equal(res.statusCode, 200, 'stream endpoint answers 200');
+        assert.match(res.headers['content-type'], /text\/event-stream/,
+          'stream endpoint answers with text/event-stream');
+        let buf = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          buf += chunk;
+          if (buf.includes('event: feed-log') && buf.includes('999903')) {
+            res.destroy();
+            resolve(buf);
+          }
+        });
+      });
+    req.on('error', reject);
+    // Write an entry for that date, as a DIFFERENT browser session would.
+    setTimeout(() => {
+      fetch(`http://127.0.0.1:${TEST_PORT}/api/feed-log`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          v: 1,
+          date: STREAM_DATE,
+          savedAt: Date.now(),
+          entries: [{ gamePk: 999903, review: { id: 'challenge-7', typeKey: 'challenge' }, firstSeen: 1, lastSeen: 2 }],
+          order: ['999903:challenge-7'],
+          snapshots: {}, irregularities: {}, grace: {}, settled: [],
+        }),
+      }).then((res) => assert.equal(res.status, 200)).catch(reject);
+    }, 250);
+    setTimeout(() => reject(new Error('no pushed frame within 4s')), 4000);
+  });
+  assert.ok(frames.includes('event: connected'), 'stream announces itself on connect');
+  assert.ok(frames.includes('event: feed-log'), 'the written entry is pushed to the open stream');
+  const pushed = JSON.parse(/event: feed-log\ndata: (.*)\n/.exec(frames)[1]);
+  assert.equal(pushed.date, STREAM_DATE, 'the pushed payload carries the written date');
+  assert.ok(pushed.entries.some((e) => e.gamePk === 999903), 'the pushed payload carries the new entry');
+  console.log('  ✓ A written entry is pushed to an open stream without polling');
+
+  // A stream for another date must NOT receive this write.
+  const otherDateFrames = await new Promise((resolve, reject) => {
+    let buf = '';
+    const req = http.get(
+      `http://127.0.0.1:${TEST_PORT}/api/feed-log/stream?date=2026-09-17`,
+      (res) => { res.setEncoding('utf8'); res.on('data', (c) => { buf += c; }); });
+    req.on('error', reject);
+    setTimeout(() => {
+      fetch(`http://127.0.0.1:${TEST_PORT}/api/feed-log`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ v: 1, date: STREAM_DATE, savedAt: Date.now(), entries: [], order: [], snapshots: {}, irregularities: {}, grace: {}, settled: [] }),
+      }).then(() => setTimeout(() => { req.destroy(); resolve(buf); }, 300)).catch(reject);
+    }, 250);
+  });
+  assert.ok(otherDateFrames.includes('event: connected'), 'the other date stream connects');
+  assert.ok(!otherDateFrames.includes('event: feed-log'),
+    'a write for a different date is not pushed across streams');
+  console.log('  ✓ Streams are per date (no cross-date push)');
+
+  // Clean up temporary test files
+  restoreDataDir();
 
   console.log('\nAll cross-browser persistence tests passed successfully!');
 }
 
 run()
   .then(() => {
+    restoreDataDir();
     serverProc.kill('SIGTERM');
     process.exit(0);
   })
   .catch((err) => {
     console.error('Test failure:', err);
+    // Never leave test-written data behind, even on failure.
+    restoreDataDir();
     serverProc.kill('SIGTERM');
     process.exit(1);
   });

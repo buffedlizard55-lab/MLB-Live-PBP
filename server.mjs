@@ -184,6 +184,46 @@ function mergeFeedLogPayloads(existing, incoming, dateStr) {
   };
 }
 
+/* --------------------------------------------------------------- push (SSE)
+ * Live tail of the shared feed log. Polling it (GET /api/feed-log) leaves a
+ * window of up to the poll interval between "another browser/session wrote an
+ * entry" and "this page sees it" — 15s in the shipped client. A Server-Sent
+ * Events stream pushes each accepted write to every connected page
+ * immediately, so the Replay Feed's rows and the scoreboard's scoring-change
+ * chips appear as soon as ANY browser observed them, with no polling at all
+ * (the client keeps its ordinary poll as a fallback when a stream cannot be
+ * established — e.g. the static GitHub Pages deployment, where this endpoint
+ * does not exist).
+ */
+const sseClients = new Set(); // { res, date }
+
+function sseWrite(res, chunk) {
+  try {
+    return res.write(chunk);
+  } catch (_) {
+    return false;
+  }
+}
+
+/** Push one merged log payload to every stream watching that date. */
+function broadcastFeedLog(dateStr, payload) {
+  if (!sseClients.size) return 0;
+  let body;
+  try {
+    body = JSON.stringify(payload);
+  } catch (err) {
+    console.warn(`[server] could not serialize the feed log for push:`, err);
+    return 0;
+  }
+  const frame = `event: feed-log\ndata: ${body}\n\n`;
+  let sent = 0;
+  sseClients.forEach((client) => {
+    if (client.date !== dateStr) return;
+    if (sseWrite(client.res, frame)) sent += 1;
+  });
+  return sent;
+}
+
 function writeLogToDisk(dateStr, payload) {
   const filePath = getLogFilePath(dateStr);
   if (!filePath) return false;
@@ -235,6 +275,47 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // GET /api/feed-log/stream?date=YYYY-MM-DD — Server-Sent Events tail of the log.
+  if (pathname === '/api/feed-log/stream' && req.method === 'GET') {
+    const dateStr = reqUrl.searchParams.get('date');
+    if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+      sendError(res, 400, 'date query parameter in YYYY-MM-DD format is required');
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      // Proxies (and some dev servers) buffer responses by default; these two
+      // headers ask them not to, so frames are flushed as they are written.
+      'X-Accel-Buffering': 'no',
+      'Access-Control-Allow-Origin': '*',
+    });
+    // Ask the browser's EventSource to reconnect after 3s, and tell the client
+    // the date this stream is for (so a late/duplicate frame is ignorable).
+    sseWrite(res, `retry: 3000\nevent: connected\ndata: {"date":"${dateStr}"}\n\n`);
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
+    const client = { res, date: dateStr };
+    sseClients.add(client);
+    // Heartbeat: keeps intermediaries from timing the connection out and lets
+    // a dead peer be noticed without waiting for a write.
+    const heartbeat = setInterval(() => { sseWrite(res, ': hb\n\n'); }, 20000);
+    if (typeof heartbeat.unref === 'function') heartbeat.unref();
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      sseClients.delete(client);
+    };
+    req.on('close', cleanup);
+    req.on('error', cleanup);
+    res.on('close', cleanup);
+    // An initial snapshot, so a page that connects while another browser is
+    // active adopts the current log immediately (the client merges it
+    // idempotently, exactly like its ordinary GET).
+    const current = readLogFromDisk(dateStr);
+    if (current) sseWrite(res, `event: feed-log\ndata: ${JSON.stringify(current)}\n\n`);
+    return;
+  }
+
   // GET /api/feed-log?date=YYYY-MM-DD or /api/log?date=YYYY-MM-DD
   if ((pathname === '/api/feed-log' || pathname === '/api/log') && req.method === 'GET') {
     const dateStr = reqUrl.searchParams.get('date');
@@ -283,11 +364,18 @@ const server = http.createServer((req, res) => {
         }
         const saved = writeLogToDisk(payload.date, payload);
         if (saved) {
+          // Push the merged log to every open page for this date BEFORE the
+          // POST response: the write is already durable, so another session's
+          // page can show the new entry while this one is still being
+          // acknowledged. (The posting page also receives it; its merge is
+          // idempotent and produces no re-render.)
+          const pushed = broadcastFeedLog(payload.date, saved);
           sendJSON(res, 200, {
             ok: true,
             date: payload.date,
             savedAt: saved.savedAt,
             entriesCount: saved.entries.length,
+            pushed,
           });
         } else {
           sendError(res, 500, 'Failed to save feed log to disk');

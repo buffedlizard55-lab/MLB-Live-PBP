@@ -108,16 +108,24 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
   adjustments. It appears in the live at-bat card, the Props & Matchup tab, and
   completed PBP rows.
 - Auto-refreshes: on a live game page the full feed lands every **500ms**, while
-  a dedicated **250ms status watcher** catches a brand-new challenge/review the
-  instant MLB flips the official game status (and while a review is in flight
-  the page probes the lean play-by-play endpoint every **250ms**, pulling the
-  full feed only when the review state flips). The Replay Feed scans every live
-  game's play-by-play every **250ms** and sweeps the whole slate's official
-  status every **250ms**. The scoreboard keeps its 500ms hydrated-schedule poll
-  and adds the same **250ms status sweep** for the review ticker. Works on
-  desktop and mobile.
+  a dedicated **125ms status watcher** catches a brand-new challenge/review the
+  instant MLB flips the official game status — and paints the review banner from
+  the lean probe (~3 KB) while the 1–2MB full feed is still downloading (and
+  while a review is in flight the page probes the lean play-by-play endpoint
+  every **250ms**, pulling the full feed only when the review state flips). The
+  Replay Feed scans every live game's play-by-play every **250ms** and sweeps the
+  whole slate's official status every **125ms**; a game that flips into a review
+  *during* a scan is fetched out of band instead of waiting for that scan to
+  finish. The scoreboard keeps its 500ms hydrated-schedule poll and adds the same
+  **125ms status sweep** for the review ticker. When the persistence server is running, a **live push**
+  (server-sent events) delivers every tracked entry recorded by another tab or
+  browser as soon as it is written — the Replay Feed is the only writer of that
+  log, and its write is coalesced at ≤1/s — while the periodic pull stays as the
+  fallback (and for static hosting). Post-Final scorer rulings are re-scanned every **1s** for the
+  first two minutes, then 2.5s to five minutes, then 15s inside a bounded
+  30-minute grace. Works on desktop and mobile.
 - **"Under review" is detected from the official game status, not from play
-  text.** All three surfaces run a dedicated **250ms review-status watcher**
+  text.** All three surfaces run a dedicated **125ms review-status watcher**
   (`GET /api/v1/schedule` with a `fields` projection and no hydrations — the
   whole slate's `gamePk` + `status` in ~2.4 KB, ~1/8th the size of the schedule
   the rest of the page uses); the Replay Feed and the scoreboard use it for
@@ -125,7 +133,7 @@ mlb.com uses, re-implemented from scratch in vanilla HTML/CSS/JS.
   projection on the same cadence. MLB flips `status.statusCode` the instant a
   review is **called**, while the play description is written when it
   **resolves** — so this cuts the worst-case wait from ~3s (the schedule cache)
-  to ~250ms plus one round trip, and it surfaces the official review reason
+  to ~125ms plus one round trip, and it surfaces the official review reason
   ("Tag play", "Home run", "Pitch Result", …) before any play text exists.
   Detection reads the API's own status registry (`GET /api/v1/gameStatus`:
   `M*` manager challenge, `N*` umpire review, `IH` instant replay, `MJ`/`NJ`
@@ -289,21 +297,28 @@ node tools/reviews-feed-test.mjs               # all-games Replay Feed diff help
 node tools/replay-feed-render-test.mjs         # end-to-end Replay Feed render (captured live payloads)
 node tools/review-probe-test.mjs               # in-review lean-probe signature (game.js)
 node tools/review-status-test.mjs              # official gameStatus registry + review detection (all 4 copies)
-node tools/review-watcher-test.mjs             # 250ms review-status watcher, driven through the real boot path
-node tools/page-status-watcher-test.mjs        # 250ms watchers on the game page + scoreboard, real boot path
-node tools/api-rate-limit-test.mjs             # HTTP-429 self-throttle (60s quiet period) in the API client
+node tools/review-watcher-test.mjs             # 125ms review-status watcher + mid-wave flip + live log push (real boot path)
+node tools/page-status-watcher-test.mjs        # 125ms watchers on game page + scoreboard, probe-first banner, pushed badges
+node tools/api-rate-limit-test.mjs             # HTTP-429 self-throttle (Retry-After aware, 60s default)
 node tools/official-scoring-test.mjs           # official-scorer pending rulings
 node tools/api-fields-test.mjs                 # playByPlay `fields` projection coverage
 node tools/scoring-change-test.mjs             # official scoring-change tracker (hit ↔ error ↔ out)
 node tools/feed-log-persistence-test.mjs       # replay feed log: every entry survives refresh/revisit
-node tools/cross-browser-persistence-test.mjs  # cross-browser & across-the-website persistence verification
+node tools/cross-browser-persistence-test.mjs  # cross-browser persistence + the server's live SSE push
 ```
 
 Every entry tracked (challenges, reviews, scoring-pending rulings, scoring
 changes) is persistent across the website:
 - **Across browsers & sessions**: saved to the backend disk store (`data/feed-log-<date>.json`)
   via `POST /api/feed-log` and cached in `localStorage`, so opening the website on
-  another browser immediately restores all tracked entries and baselines.
+  another browser immediately restores all tracked entries and baselines. Every accepted
+  write is also pushed to the other open pages over
+  `GET /api/feed-log/stream?date=<date>` (server-sent events, ~3s reconnect hint,
+  20s heartbeat), so a challenge, review, pending ruling or scoring change recorded in
+  one browser (a Replay Feed must be open somewhere — it is the only writer) shows up
+  in the others as soon as that write lands, instead of on their next poll; the
+  periodic pull remains the fallback when the stream is unavailable (static
+  hosting, no `EventSource`, blocked connection).
 - **Across the website**:
   - `reviews.html`: renders the All feed and dedicated ✏️ Scoring Changes tab.
   - `game.html`: dedicated **Challenges & Reviews** tab displays official scoring changes
@@ -366,20 +381,37 @@ GitHub Actions**.
 - The MLB StatsAPI is **unofficial and may change without notice**. The client is
   written defensively (fallbacks for every endpoint and missing fields) and the app
   degrades gracefully if a field disappears.
+- **Terms & budget:** the binding rules for this data, the request rate of every
+  polling surface, and the code paths that enforce them are written down in
+  [`docs/api-compliance.md`](docs/api-compliance.md) — including the two clauses
+  that pull in different directions (the API's own notice permits "individual,
+  non-commercial, non-bulk use"; MLB.com's Terms of Use §1 forbids automated
+  collection and any display beyond personal, non-commercial home use) and the
+  open question of public deployment. There is no published rate limit for the
+  StatsAPI and no written authorization either way.
 - Be a good citizen: the app needs **no API key** (the StatsAPI is keyless and
   open-CORS) and it self-limits — every page pauses when the tab is hidden,
   backs off on preview/final games, bounds post-Final re-scans to a 30-minute
-  grace window, and (since 2026-09-05) the shared client self-throttles for
-  60 seconds if the API ever answers **HTTP 429**, so it can never hammer a
-  host that has asked it to slow down. The Replay Feed scans live games'
+  grace window, and the shared client honours **HTTP 429** with a quiet period
+  (the server's own `Retry-After` when it sends one, clamped to 1s–5min;
+  otherwise 60 seconds), so it can never hammer a host that has asked it to
+  slow down. The live push is server-side (same-origin `EventSource`) and adds
+  no requests to MLB's API. The Replay Feed scans live games'
   playByPlay (the light, `fields`-projected endpoint — no boxscore/rosters)
   every 250ms, subtracts scan time from the next wait, fetches in-review games
   first, and only re-renders when a review event actually changes. Worst case
   on a full ~15-game slate that is ~60 playByPlay requests/s plus ~4 tiny
-  status sweeps/s (~64 req/s, single client) — far below "thousands of requests
-  per second", and the same cadence the page already used whenever any review
-  was in flight. The StatsAPI is
+  status sweeps/s (~68 req/s, single client, since the sweep went 250ms → 125ms)
+  — far below "thousands of requests per second", and the same cadence the page
+  already used whenever any review was in flight. The 1s post-Final tier adds
+  ~70 requests per finished game
+  across its 30-minute grace (~292 total, up from ~220) — bounded, and only for
+  games that have just gone final. The StatsAPI is
   pull-only — a shorter poll only reduces how long a landed event sits unseen.
+- This is a **personal, non-commercial project** (no ads, no analytics, no data resale — see the
+  request budget and the governing terms in [`docs/api-compliance.md`](docs/api-compliance.md)).
+  It lives in a public repository and is served from GitHub Pages; that is hosting, not a service
+  offered to others.
 - Review/challenge data shapes were verified against the live API on 2026-08-19
   (schedule `hydrate=review`, `reviewDetails` codes `MJ`/`MA`/`MF`, and
   `gameData.absChallenges`); see `docs/verification-report.md`.
